@@ -1,0 +1,81 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+cache_path = "cache"
+
+# Pinned to match Uniswap v4. `v4-core/src/PoolManager.sol` and every contract in
+# v4-periphery/src declare `pragma solidity 0.8.26` - an exact pin, not a caret
+# range. A test that deploys the real PoolManager therefore shares a compilation
+# unit with it, and no version can satisfy `=0.8.26` and `^0.8.30` at once. Since
+# the core artifact of this repo IS a v4 hook, the project compiles at v4's
+# version rather than splitting compilers across a codebase that mines CREATE2
+# salts. Our own sources declare `^0.8.26` so they stay forward-compatible.
+solc_version = "0.8.26"
+optimizer = true
+# Ethereum L1 enforces EIP-170: a 24,576 byte runtime code limit. EIP-7907, which
+# would have raised it to 64 KB, was REMOVED from Fusaka, so the limit stands.
+# Robinhood Chain (Nitro) allowed 96 KB and this was set to 1_000_000, which
+# optimizes runtime gas at the cost of bytecode size. On L1 that trade is
+# backwards: the launcher is the contract most at risk of blowing the limit, and
+# Uniswap's own v4 PoolManager ships at 24,009 bytes. Low runs = smaller code.
+# Raise this ONLY with `forge build --sizes` in front of you.
+optimizer_runs = 200
+# The hook and launcher both push the stack hard. via-ir is required, not optional.
+via_ir = true
+
+# Cancun is the ceiling Uniswap v4 needs (EIP-1153 transient storage) and is fully
+# live on Ethereum mainnet and Sepolia. Mainnet is past Fusaka so "prague"/"osaka"
+# would also compile and run here, but there is nothing in v4 or this codebase that
+# needs a post-Cancun opcode, and staying on Cancun keeps the same artifacts valid
+# if this is ever redeployed to an L2 that lags mainnet.
+evm_version = "cancun"
+
+# Deterministic CREATE2 addresses: a comment change must not move a mined salt.
+bytecode_hash = "none"
+cbor_metadata = false
+
+ffi = false
+
+remappings = [
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "forge-std/=lib/forge-std/src/",
+    "@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/",
+    "v4-core/=lib/v4-periphery/lib/v4-core/src/",
+    "v4-periphery/=lib/v4-periphery/",
+    "permit2/=lib/v4-periphery/lib/permit2/",
+    "solmate/=lib/v4-periphery/lib/v4-core/lib/solmate/",
+    "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+]
+
+[profile.default.fuzz]
+runs = 1_000
+
+[profile.default.invariant]
+runs = 256
+depth = 64
+fail_on_revert = false
+
+[profile.ci.fuzz]
+runs = 10_000
+
+[fmt]
+line_length = 110
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+
+[rpc_endpoints]
+# Ethereum L1 is the target. Set MAINNET_RPC_URL / SEPOLIA_RPC_URL in the
+# environment; the publicnode fallbacks are rate-limited and fine for reads only.
+mainnet = "${MAINNET_RPC_URL}"
+sepolia = "${SEPOLIA_RPC_URL}"
+mainnet_public = "https://ethereum-rpc.publicnode.com"
+sepolia_public = "https://ethereum-sepolia-rpc.publicnode.com"
+
+[etherscan]
+# Etherscan V2 uses ONE key across all chains, keyed by chainid.
+mainnet = {key = "${ETHERSCAN_API_KEY}", chain = 1}
+sepolia = {key = "${ETHERSCAN_API_KEY}", chain = 11155111}

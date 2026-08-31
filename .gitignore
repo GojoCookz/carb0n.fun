@@ -1,0 +1,23 @@
+# Foundry build output
+out/
+cache/
+
+# Broadcast logs.
+# `broadcast/**/dry-run/` and the matching `cache/` entries are where forge script
+# writes what it calls "Sensitive values" - these can contain the private key used
+# for a run. Never commit them.
+broadcast/
+!broadcast/**/run-latest.json
+broadcast/**/dry-run/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
