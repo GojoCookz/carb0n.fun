@@ -70,6 +70,9 @@ contract LiveTest is Script {
         pair.mint(me, 1_000e18);
 
         uint256 pairBefore = pair.balanceOf(me);
+        // The PoolManager is a SINGLETON: its balance is every pool on the network combined, so
+        // it already holds pair currency from earlier launches. Only the delta means anything.
+        uint256 mgrPairBefore = pair.balanceOf(Addresses.SEPOLIA_POOL_MANAGER);
 
         // --- 1. LAUNCH, supplying no pair currency -------------------------------------------
         (address token, PoolId id) = launcher.launch(
@@ -99,7 +102,10 @@ contract LiveTest is Script {
         PoolKey memory key = _key(token);
         IPoolManager mgr = IPoolManager(Addresses.SEPOLIA_POOL_MANAGER);
 
-        require(pair.balanceOf(address(mgr)) == 0, "pool opened holding pair currency");
+        require(
+            pair.balanceOf(address(mgr)) == mgrPairBefore,
+            "the launch put pair currency into the pool - single-sided broken"
+        );
         require(LaunchToken(token).balanceOf(address(mgr)) > 0, "pool did not receive the supply");
 
         // --- 2. BUY --------------------------------------------------------------------------
@@ -145,9 +151,37 @@ contract LiveTest is Script {
         require(hook.checkGraduation(id), "crossing did not latch");
         require(hook.checkGraduation(id), "second call must stay true");
 
+        // --- 7. THE DIVIDEND ACTUALLY LANDS IN A WALLET --------------------------------------
+        //
+        // Accrual is not payment. Everything above proves a holder is OWED something; this proves
+        // they can take it, on a live network, and that what arrives is the PAIR currency rather
+        // than more of the token they already hold - which is the entire product claim.
+        uint256 owed = dist.withdrawableOf(me);
+        require(owed > 0, "holder accrued nothing to claim");
+
+        uint256 pairBeforeClaim = pair.balanceOf(me);
+        uint256 tokenBeforeClaim = LaunchToken(token).balanceOf(me);
+
+        dist.withdraw();
+
+        require(
+            pair.balanceOf(me) - pairBeforeClaim == owed,
+            "withdraw did not pay exactly what was owed, in the pair currency"
+        );
+        require(
+            LaunchToken(token).balanceOf(me) == tokenBeforeClaim,
+            "the claim moved launch tokens - dividends must never be paid in the token"
+        );
+        require(dist.withdrawableOf(me) == 0, "balance not cleared after withdraw");
+
+        // The push path, which nobody has ever run on a live network either. Permissionless and
+        // gas-bounded; a second call with nothing owed must be a harmless no-op.
+        dist.processBatch(10);
+
         vm.stopBroadcast();
 
         console.log("=== LIVE TEST PASSED on Sepolia ===");
+        console.log("dividend claimed ", owed);
         console.log("token            ", token);
         console.log("pair spent to launch  0  (single-sided)");
         console.log("fees charged     ", hook.totalFeesTaken(id));
