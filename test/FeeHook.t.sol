@@ -190,9 +190,16 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         vm.stopPrank();
     }
 
+    /// @dev Swaps, then sweeps.
+    ///
+    ///      Since single-sided seeding, a fee is taken inside the swap as an ERC-6909 CLAIM and
+    ///      redeemed for real tokens by `sweep()` afterwards - a fresh pool holds no pair currency
+    ///      for `take()` to draw on. Sweeping here keeps every test below about the economics
+    ///      rather than about the plumbing; `test_feesAccrueAsClaimsUntilSwept` is the one that
+    ///      pins the unswept state deliberately.
     function _swap(address who, bool zeroForOne, int256 amountSpecified) internal returns (BalanceDelta) {
         vm.prank(who);
-        return swapRouter.swap(
+        BalanceDelta delta = swapRouter.swap(
             key,
             SwapParams({
                 zeroForOne: zeroForOne,
@@ -202,6 +209,36 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
+        hook.sweep(key);
+        return delta;
+    }
+
+    /// @dev The behaviour change made explicit: a trade charges the fee immediately, but the value
+    ///      sits as a claim on the PoolManager until somebody sweeps. Anyone may.
+    function test_feesAccrueAsClaimsUntilSwept() public {
+        vm.prank(alice);
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: _buyIsZeroForOne(),
+                amountSpecified: -1e18,
+                sqrtPriceLimitX96: _buyIsZeroForOne()
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        assertEq(hook.pendingFees(poolId), (uint256(1e18) * FEE_BPS) / 10_000, "charged on the trade");
+        assertEq(pair.balanceOf(address(dist)), 0, "but not yet delivered");
+
+        // Permissionless: a stranger with no position can redeem it for everyone.
+        vm.prank(bob);
+        hook.sweep(key);
+
+        assertEq(hook.pendingFees(poolId), 0, "claim redeemed");
+        assertGt(pair.balanceOf(address(dist)), 0, "and the holders' share landed");
     }
 
     /// @dev Buy the launch token with `amountIn` of the pair currency (exact input).

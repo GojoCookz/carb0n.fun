@@ -71,9 +71,9 @@ contract LauncherForkTest is Test {
     uint256 internal constant SUPPLY = 1_000_000_000e18;
     /// @dev 20 XMR. Against a token whose ENTIRE supply is 7,000, a seed has to be small to be
     ///      realistic - this is deliberately a plausible launch, not a round number.
-    uint256 internal constant PAIR_SEED = 20e18;
-    /// @dev 2x the opening market cap. The pool opens with all supply against `PAIR_SEED`, so the
-    ///      opening market cap in pair units is exactly `PAIR_SEED` = 20 WXMR.
+    uint256 internal constant OPENING_MCAP = 20e18;
+    /// @dev 2x the opening market cap. The pool opens with all supply against `OPENING_MCAP`, so the
+    ///      opening market cap in pair units is exactly `OPENING_MCAP` = 20 WXMR.
     uint256 internal constant GRADUATION_THRESHOLD = 40e18;
 
     bool internal forked;
@@ -158,7 +158,7 @@ contract LauncherForkTest is Test {
             symbol: "MSTONK",
             supply: SUPPLY,
             pair: Addresses.MAINNET_WXMR,
-            pairSeed: PAIR_SEED,
+            openingMarketCap: OPENING_MCAP,
             graduationThreshold: GRADUATION_THRESHOLD,
             feeBps: 300,
             creatorBps: 2000,
@@ -198,6 +198,8 @@ contract LauncherForkTest is Test {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
+        // Fees are ERC-6909 claims until swept.
+        hook.sweep(k);
     }
 
     // ===========================================================================================
@@ -215,7 +217,12 @@ contract LauncherForkTest is Test {
 
         (uint160 sqrtPriceX96,,,) = manager.getSlot0(id);
         assertGt(sqrtPriceX96, 0, "pool is initialised on the deployed PoolManager");
-        assertGt(manager.getLiquidity(id), 0, "and has live liquidity");
+
+        // NOT `getLiquidity`, which reports liquidity ACTIVE at the current tick. A single-sided
+        // position sits entirely to one side of the opening price by construction, so at the
+        // opening tick itself the active figure is legitimately zero and the first trade crosses
+        // into the range. What matters is that the position exists and holds the supply.
+        assertGt(manager.getPositionLiquidity(id, _positionKey(token)), 0, "the position is real");
     }
 
     function test_fork_launcherRetainsNothing() public onlyForked {
@@ -227,12 +234,9 @@ contract LauncherForkTest is Test {
 
     /// @dev The lock, verified against the real singleton's own position accounting.
     function test_fork_liquidityIsLockedInTheLauncher() public onlyForked {
-        (, PoolId id) = _launch();
+        (address token, PoolId id) = _launch();
 
-        bytes32 positionKey = Position.calculatePositionKey(
-            address(launcher), TickMath.minUsableTick(60), TickMath.maxUsableTick(60), bytes32(0)
-        );
-        assertGt(manager.getPositionLiquidity(id, positionKey), 0, "launcher owns the position");
+        assertGt(manager.getPositionLiquidity(id, _positionKey(token)), 0, "launcher owns the position");
     }
 
     /// @dev A real swap through the real PoolManager, paying a fee in real WXMR to a real holder.
@@ -274,6 +278,20 @@ contract LauncherForkTest is Test {
         return launcher.launch(_params());
     }
 
+    /// @dev The single-sided position runs from the opening tick to whichever edge holds only the
+    ///      launch token, so the key depends on which side the token sorted onto.
+    function _positionKey(address token) internal view returns (bytes32) {
+        PoolKey memory k = _key(token);
+        (, int24 openingTick,,) = manager.getSlot0(k.toId());
+        bool tokenIsCurrency0 = token < Addresses.MAINNET_WXMR;
+
+        (int24 lower, int24 upper) = tokenIsCurrency0
+            ? (openingTick, TickMath.maxUsableTick(60))
+            : (TickMath.minUsableTick(60), openingTick);
+
+        return Position.calculatePositionKey(address(launcher), lower, upper, bytes32(0));
+    }
+
     // ===========================================================================================
     // Graduation, against real infrastructure
     // ===========================================================================================
@@ -301,7 +319,7 @@ contract LauncherForkTest is Test {
         (, PoolId id) = _launch();
 
         assertApproxEqRel(
-            hook.marketCapOf(id), PAIR_SEED, 1e15, "opening market cap is the seed, in WXMR units"
+            hook.marketCapOf(id), OPENING_MCAP, 1e16, "opening market cap is what was asked for, snapped to a tick"
         );
         assertLt(hook.marketCapOf(id), GRADUATION_THRESHOLD, "and it opens below the bar");
     }
@@ -393,7 +411,7 @@ contract LauncherForkTest is Test {
         emit log_named_decimal_uint("WXMR in the main V2 pool", r0, 18);
         emit log_named_decimal_uint("WETH in the main V2 pool", r1, 18);
         emit log_named_decimal_uint("total WXMR supply       ", wxmr.totalSupply(), 18);
-        emit log_named_decimal_uint("this launch's seed      ", PAIR_SEED, 18);
+        emit log_named_decimal_uint("this launch's seed      ", OPENING_MCAP, 18);
 
         // Order-of-magnitude guards. These pin that the pair is still small and still alive; they
         // are not a price assertion and must not become one.

@@ -118,8 +118,10 @@ contract FeeHook is HookBase {
     address public immutable launcher;
 
     mapping(PoolId => PoolConfig) public poolConfig;
-    /// @notice Fees collected per pool, in the pair currency. Diagnostics only.
+    /// @notice Fees charged per pool over all time, in the pair currency. Diagnostics only.
     mapping(PoolId => uint256) public totalFeesTaken;
+    /// @notice Fees charged but not yet swept, held as ERC-6909 claims on the PoolManager.
+    mapping(PoolId => uint256) public pendingFees;
     /// @notice Graduation threshold and latch, per pool.
     /// @dev A SEPARATE mapping from `poolConfig` on purpose. `_beforeSwap` and `_afterSwap` load
     ///      `poolConfig` into memory on every single trade; folding three more words into that
@@ -130,6 +132,9 @@ contract FeeHook is HookBase {
     event PoolConfigured(
         PoolId indexed poolId, address distributor, Currency pairCurrency, uint16 feeBps, address creator
     );
+    /// @notice Charged inside a swap and held as a claim. The real trading rate lives here.
+    event FeeAccrued(PoolId indexed poolId, uint256 amount, uint256 pending);
+    /// @notice Redeemed and paid out. Emitted on `sweep`, not on the trade that earned it.
     event FeeTaken(PoolId indexed poolId, uint256 total, uint256 toHolders, uint256 toCreator);
     event GraduationConfigured(
         PoolId indexed poolId, address indexed token, uint256 threshold, uint256 supply
@@ -418,8 +423,7 @@ contract FeeHook is HookBase {
         uint256 fee = (pairIn * cfg.feeBps) / BPS;
         if (fee == 0) return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
 
-        poolManager.take(cfg.pairCurrency, address(this), fee);
-        _routeFee(id, cfg, fee);
+        _accrue(id, cfg, fee);
 
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(int128(uint128(fee)), 0), 0);
     }
@@ -458,20 +462,76 @@ contract FeeHook is HookBase {
         uint256 fee = (pairIn * cfg.feeBps) / BPS;
         if (fee == 0) return (IHooks.afterSwap.selector, 0);
 
-        // Claim the fee from the PoolManager into this contract, then forward it. Skipping the
-        // take() here is what produces CurrencyNotSettled and bricks the pool.
-        poolManager.take(cfg.pairCurrency, address(this), fee);
-        _routeFee(id, cfg, fee);
+        // Claim the fee from the PoolManager, then return the matching delta. Skipping the claim
+        // here is what produces CurrencyNotSettled and bricks the pool.
+        _accrue(id, cfg, fee);
 
         return (IHooks.afterSwap.selector, int128(uint128(fee)));
     }
 
-    /// @dev Splits a collected fee between creator and holders and forwards both. Shared by the two
-    ///      charging legs so they can never drift apart.
+    /// @notice Take the fee as an ERC-6909 claim and record it. Shared by both charging legs so
+    ///         they can never drift apart.
+    ///
+    /// @dev **This must be `mint`, not `take`, and that is forced by single-sided seeding.**
+    ///
+    ///      `poolManager.take()` moves real ERC-20 out of the singleton, so it requires the
+    ///      singleton to actually hold that currency at that instant. It did, back when a launch
+    ///      seeded both sides of the pool. A single-sided launch puts in only the launch token, so
+    ///      a fresh pool holds ZERO pair currency — and `beforeSwap` runs before the trader has
+    ///      settled their input. `take()` there reverts on an ERC-20 transfer the manager cannot
+    ///      make, which bricks every buy on a new pool.
+    ///
+    ///      `mint()` takes the same value as an ERC-6909 claim instead. It needs no balance, it is
+    ///      cheaper than `take()` per Uniswap's own docs, and the claim is redeemed later by
+    ///      `sweep()` once the pool genuinely holds the currency.
+    ///
+    ///      The cost of this, stated plainly: fees are no longer delivered inside the swap. They
+    ///      accrue exactly and are paid out on a sweep. Holders earn on every trade either way —
+    ///      only the moment the tokens move changes.
+    function _accrue(PoolId id, PoolConfig memory cfg, uint256 fee) internal {
+        poolManager.mint(address(this), cfg.pairCurrency.toId(), fee);
+
+        pendingFees[id] += fee;
+        totalFeesTaken[id] += fee;
+        emit FeeAccrued(id, fee, pendingFees[id]);
+    }
+
+    /// @notice Redeem accrued claims for real tokens and pay the creator and the holders.
+    /// @dev Permissionless and idempotent: anyone may call it, and it is a no-op with nothing
+    ///      pending. It is deliberately OUTSIDE the swap path, so a hostile creator, a blocklisted
+    ///      distributor or a paused pair currency can never revert somebody else's trade.
+    function sweep(PoolKey calldata key) external returns (uint256 swept) {
+        PoolId id = key.toId();
+        PoolConfig memory cfg = poolConfig[id];
+        if (!cfg.configured) revert NotConfigured();
+
+        swept = pendingFees[id];
+        if (swept == 0) return 0;
+        pendingFees[id] = 0;
+
+        poolManager.unlock(abi.encode(id, cfg, swept));
+    }
+
+    /// @dev The redemption, inside the manager's unlock cycle. `burn` turns the claim back into a
+    ///      credit and `take` converts that credit into ERC-20, so the two net to zero and the
+    ///      cycle settles.
+    function unlockCallback(bytes calldata raw) external returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        (PoolId id, PoolConfig memory cfg, uint256 amount) =
+            abi.decode(raw, (PoolId, PoolConfig, uint256));
+
+        poolManager.burn(address(this), cfg.pairCurrency.toId(), amount);
+        poolManager.take(cfg.pairCurrency, address(this), amount);
+        _routeFee(id, cfg, amount);
+
+        return "";
+    }
+
+    /// @dev Splits a swept fee between creator and holders and forwards both.
     ///
     ///      Sends are raw calls: a hostile or blocklisted creator must not be able to revert the
-    ///      swap. A failed payout strands the tokens on this contract rather than trapping every
-    ///      trader in the pool.
+    ///      sweep for everyone else. A failed payout strands the tokens on this contract rather
+    ///      than trapping the rest of the distribution.
     function _routeFee(PoolId id, PoolConfig memory cfg, uint256 fee) internal {
         uint256 toCreator = (fee * cfg.creatorBps) / BPS;
         uint256 toHolders = fee - toCreator;
@@ -484,7 +544,6 @@ contract FeeHook is HookBase {
             }
         }
 
-        totalFeesTaken[id] += fee;
         emit FeeTaken(id, fee, toHolders, toCreator);
     }
 

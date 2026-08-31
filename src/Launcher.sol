@@ -82,9 +82,15 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     /// @param symbol           token symbol
     /// @param supply           fixed total supply, all of it seeded into the pool
     /// @param pair             the pair currency; must be approved in `PairRegistry`
-    /// @param pairSeed         how much pair currency the creator adds as opening liquidity
+    /// @param openingMarketCap the market cap the pool opens at, in PAIR-CURRENCY units.
+    ///
+    ///        **The creator supplies NO pair currency.** This is a number, not a deposit. The
+    ///        pool is seeded single-sided with the whole supply from this price upward, and the
+    ///        pair side fills up as people buy. Asking a creator "how much ETH will you put in"
+    ///        gates launching on capital and is the wrong question; "what should it open at" is
+    ///        the decision they actually want to make.
     /// @param graduationThreshold market cap, in PAIR-CURRENCY units, at which this launch is
-    ///                         signalled as mature. Must exceed `pairSeed` - see `_validate`.
+    ///                         signalled as mature. Must exceed `openingMarketCap`.
     /// @param feeBps           total trading fee, capped by `FeeHook.MAX_FEE_BPS`
     /// @param creatorBps       creator's cut of the fee; the remainder goes to holders
     /// @param maxWalletBps     buy cap as a share of supply, or 0 to disable
@@ -99,7 +105,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         string symbol;
         uint256 supply;
         address pair;
-        uint256 pairSeed;
+        uint256 openingMarketCap;
         uint256 graduationThreshold;
         uint16 feeBps;
         uint16 creatorBps;
@@ -118,7 +124,9 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         PoolKey key;
         address token;
         uint256 tokenSeed;
-        uint256 pairSeed;
+        /// @dev The tick the pool was initialised at. The single-sided position starts here
+        ///      exactly, so there is no dead zone between the opening price and the liquidity.
+        int24 openingTick;
         uint256 devBuyPairAmount;
         address creator;
         bool tokenIsCurrency0;
@@ -142,7 +150,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         address indexed pair,
         PoolId poolId,
         uint256 supply,
-        uint256 pairSeed,
+        uint256 openingMarketCap,
         uint16 feeBps
     );
 
@@ -174,7 +182,8 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     // -----------------------------------------------------------------------------------------
 
     /// @notice Create a token, open its pool, seed it, and lock the liquidity. One transaction.
-    /// @dev The caller must have approved this contract for `pairSeed + devBuyPairAmount` of `pair`.
+    /// @dev The caller supplies NO opening liquidity. They must approve this contract for
+    ///      `devBuyPairAmount` of `pair` only, and for nothing at all if they skip the dev buy.
     function launch(LaunchParams calldata p) external nonReentrant returns (address token, PoolId poolId) {
         _validate(p);
 
@@ -197,15 +206,19 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
                 })
             );
 
-        // 2. Pull the creator's pair currency. Measure what ARRIVED - a fee-on-transfer pair would
-        //    deliver less than requested and seeding the difference would revert deep inside the
-        //    unlock cycle with an unreadable error.
-        uint256 pull = p.pairSeed + p.devBuyPairAmount;
-        uint256 balBefore = IERC20(p.pair).balanceOf(address(this));
-        IERC20(p.pair).safeTransferFrom(msg.sender, address(this), pull);
-        uint256 received = IERC20(p.pair).balanceOf(address(this)) - balBefore;
-        uint256 devBuy = Math.min(p.devBuyPairAmount, received);
-        uint256 pairSeed = received - devBuy;
+        // 2. Pull ONLY the dev buy, if there is one.
+        //
+        //    The creator supplies no opening liquidity. The pool is seeded single-sided with the
+        //    whole supply, so launching costs gas and nothing else - the pair side of the book is
+        //    built by the people who buy. Measure what ARRIVED rather than what was asked for: a
+        //    fee-on-transfer pair delivers less, and spending the difference would revert deep
+        //    inside the unlock cycle with an unreadable error.
+        uint256 devBuy = 0;
+        if (p.devBuyPairAmount != 0) {
+            uint256 balBefore = IERC20(p.pair).balanceOf(address(this));
+            IERC20(p.pair).safeTransferFrom(msg.sender, address(this), p.devBuyPairAmount);
+            devBuy = IERC20(p.pair).balanceOf(address(this)) - balBefore;
+        }
 
         // 3. Build the pool key. Either currency ordering is valid - the hook handles both, proven
         //    by `FeeHookTokenIsCurrency0Test` / `FeeHookTokenIsCurrency1Test` - so the salt is a
@@ -238,16 +251,21 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         // as it was. A maturity notification has no business widening that surface.
         feeHook.configureGraduation(key, p.graduationThreshold, p.supply);
 
-        poolManager.initialize(key, _openingSqrtPrice(p.supply, pairSeed, tokenIsCurrency0));
+        // 5. Snap the opening price to a tick the pool can actually hold a position at, then open
+        //    there. Snapping BEFORE initialising is what removes the dead zone: if we opened at
+        //    the raw price and started the position at the next aligned tick, the first buyer
+        //    would cross a gap with no liquidity in it.
+        int24 openingTick = _openingTick(p.supply, p.openingMarketCap, tokenIsCurrency0, p.tickSpacing);
+        poolManager.initialize(key, TickMath.getSqrtPriceAtTick(openingTick));
 
-        // 5. Seed, dev-buy and settle, all inside one unlock.
+        // 6. Seed, dev-buy and settle, all inside one unlock.
         poolManager.unlock(
             abi.encode(
                 SeedData({
                     key: key,
                     token: token,
                     tokenSeed: p.supply,
-                    pairSeed: pairSeed,
+                    openingTick: openingTick,
                     devBuyPairAmount: devBuy,
                     creator: msg.sender,
                     tokenIsCurrency0: tokenIsCurrency0
@@ -267,7 +285,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         );
         launchIndexPlusOne[token] = launches.length;
 
-        emit Launched(token, msg.sender, p.pair, poolId, p.supply, pairSeed, p.feeBps);
+        emit Launched(token, msg.sender, p.pair, poolId, p.supply, p.openingMarketCap, p.feeBps);
     }
 
     function _validate(LaunchParams calldata p) internal view {
@@ -276,38 +294,53 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         // banner renders a fallback.
         if (p.metadata.imageCid == bytes32(0)) revert ImageRequired();
         if (p.supply < 1e18) revert SupplyTooLow();
-        if (p.pairSeed == 0) revert SeedTooLow();
+
         if (p.maxWalletBps != 0 && p.maxWalletBps < MIN_MAX_WALLET_BPS) {
             revert MaxWalletTooSmall(p.maxWalletBps);
         }
 
-        // The pool opens with the ENTIRE supply seeded against `pairSeed`, and the opening price is
-        // exactly that ratio - so the opening market cap, measured in pair units, is exactly
-        // `pairSeed`. A graduation threshold at or below it means the token is born graduated,
-        // which turns the signal into noise on day one. This is the only bound worth enforcing:
-        // how far above the opening a launch sets its bar is the creator's call, not ours.
-        if (p.graduationThreshold <= p.pairSeed) {
-            revert GraduationThresholdTooLow(p.graduationThreshold, p.pairSeed);
+        if (p.openingMarketCap == 0) revert SeedTooLow();
+
+        // A graduation threshold at or below the opening means the token is born graduated, which
+        // turns the signal into noise on day one. How far above the opening the bar sits is the
+        // creator's call, not ours.
+        if (p.graduationThreshold <= p.openingMarketCap) {
+            revert GraduationThresholdTooLow(p.graduationThreshold, p.openingMarketCap);
         }
 
-        uint256 devCap = (p.pairSeed * MAX_DEV_BUY_BPS) / BPS;
+        // The dev buy is bounded by the OPENING MARKET CAP now that there is no seed to measure
+        // against. Buying 10% of the opening cap moves the price about 23% on a single-sided
+        // book, which is a real position without being the whole float.
+        uint256 devCap = (p.openingMarketCap * MAX_DEV_BUY_BPS) / BPS;
         if (p.devBuyPairAmount > devCap) revert DevBuyTooLarge(p.devBuyPairAmount, devCap);
         // `feeBps` and `creatorBps` are validated by `FeeHook.configurePool`, which owns those caps.
     }
 
-    /// @dev Opening price is the ratio of the two seeded amounts, so the pool opens exactly where
-    ///      the creator's own liquidity says it should.
+    /// @dev The tick the pool opens at, derived from the market cap the creator asked for.
     ///
-    ///      `sqrtPriceX96 = sqrt(amount1 / amount0) * 2^96`, computed as
-    ///      `sqrt(mulDiv(amount1, 2^192, amount0))`. The `2^192` goes INSIDE the square root:
-    ///      doing it as `sqrt(amount1/amount0) * 2^96` on integers truncates the ratio to zero for
-    ///      any pair where the token is cheaper than the pair asset, which is every launch.
-    function _openingSqrtPrice(uint256 supply, uint256 pairSeed, bool tokenIsCurrency0)
+    ///      Price of one token, in pair units, is `marketCap / supply`. In v4 terms that is the
+    ///      currency1-per-currency0 ratio, oriented by which side the token sorted onto:
+    ///
+    ///      ```
+    ///      sqrtPriceX96 = sqrt(amount1 / amount0) * 2^96
+    ///                   = sqrt(mulDiv(amount1, 2^192, amount0))
+    ///      ```
+    ///
+    ///      The `2^192` goes INSIDE the square root. Doing it as `sqrt(a1/a0) * 2^96` on integers
+    ///      truncates the ratio to zero for any pair where the token is cheaper than the pair
+    ///      asset, which is every launch.
+    ///
+    ///      The result is then SNAPPED to a usable tick, because a position can only start on a
+    ///      tick-spacing boundary. Snapping the opening price rather than the position start is
+    ///      what keeps the first buyer from crossing an empty gap, and it means the price shown
+    ///      in the UI before signing is the price the pool actually opens at.
+    function _openingTick(uint256 supply, uint256 marketCap, bool tokenIsCurrency0, int24 tickSpacing)
         internal
         pure
-        returns (uint160)
+        returns (int24)
     {
-        (uint256 amount0, uint256 amount1) = tokenIsCurrency0 ? (supply, pairSeed) : (pairSeed, supply);
+        (uint256 amount0, uint256 amount1) =
+            tokenIsCurrency0 ? (supply, marketCap) : (marketCap, supply);
 
         uint256 ratioX192 = FullMath.mulDiv(amount1, FixedPoint96.Q96 * FixedPoint96.Q96, amount0);
         uint256 sqrtPrice = Math.sqrt(ratioX192);
@@ -315,7 +348,22 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         if (sqrtPrice < TickMath.MIN_SQRT_PRICE || sqrtPrice >= TickMath.MAX_SQRT_PRICE) {
             revert OpeningPriceOutOfRange();
         }
-        return uint160(sqrtPrice);
+
+        int24 tick = TickMath.getTickAtSqrtPrice(uint160(sqrtPrice));
+
+        // Round toward the side the liquidity will sit on, so the aligned tick is always a legal
+        // boundary for a single-sided position and never lands inside it.
+        //   token is currency0 -> position runs UPWARD from here, so round UP
+        //   token is currency1 -> position runs DOWNWARD from here, so round DOWN
+        int24 aligned = (tick / tickSpacing) * tickSpacing;
+        if (tick < 0 && tick % tickSpacing != 0) aligned -= tickSpacing; // floor for negatives
+        if (tokenIsCurrency0 && aligned < tick) aligned += tickSpacing;
+
+        int24 minTick = TickMath.minUsableTick(tickSpacing);
+        int24 maxTick = TickMath.maxUsableTick(tickSpacing);
+        if (aligned <= minTick || aligned >= maxTick) revert OpeningPriceOutOfRange();
+
+        return aligned;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -337,24 +385,42 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         return "";
     }
 
+    /// @dev **Single-sided.** The whole supply goes in as one position starting at the opening
+    ///      tick and running away from the current price, so the pool holds only the launch token
+    ///      and none of the pair currency. Two consequences, and they are the point:
+    ///
+    ///        1. **Launching costs nothing but gas.** There is no pair currency to bring.
+    ///        2. **The opening price is a floor.** The pool cannot pay out below it, because below
+    ///           it there is nothing on the other side to pay with. The first buyer is the first
+    ///           person to move the price - there is no resting bid to sell into.
+    ///
+    ///      Which direction the position runs is decided by concentrated-liquidity geometry, not
+    ///      by preference: a range entirely ABOVE the current price holds only currency0, and a
+    ///      range entirely BELOW it holds only currency1. So the token's side dictates it.
+    ///
+    ///      The honest cost of this shape is documented on the token page: near the floor the
+    ///      pair-side depth is thin, and a sell larger than the pool's holdings is refused
+    ///      outright rather than partially filled.
     function _seedLiquidity(SeedData memory d) internal {
-        int24 lower = TickMath.minUsableTick(d.key.tickSpacing);
-        int24 upper = TickMath.maxUsableTick(d.key.tickSpacing);
+        int24 lower;
+        int24 upper;
+        uint128 liquidity;
 
-        // `PoolManager` exposes no getters - pool state is read through `extsload`, which is what
-        // `StateLibrary` wraps. Hand-rolling the slot derivation here would duplicate a constant
-        // (`POOLS_SLOT = 6`) that lives in someone else's contract.
-        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(d.key.toId());
-        (uint256 amount0, uint256 amount1) =
-            d.tokenIsCurrency0 ? (d.tokenSeed, d.pairSeed) : (d.pairSeed, d.tokenSeed);
-
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(lower),
-            TickMath.getSqrtPriceAtTick(upper),
-            amount0,
-            amount1
-        );
+        if (d.tokenIsCurrency0) {
+            // Token is currency0 -> the position must sit ABOVE the price to be all-token.
+            lower = d.openingTick;
+            upper = TickMath.maxUsableTick(d.key.tickSpacing);
+            liquidity = LiquidityAmounts.getLiquidityForAmount0(
+                TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), d.tokenSeed
+            );
+        } else {
+            // Token is currency1 -> the position must sit BELOW the price to be all-token.
+            lower = TickMath.minUsableTick(d.key.tickSpacing);
+            upper = d.openingTick;
+            liquidity = LiquidityAmounts.getLiquidityForAmount1(
+                TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), d.tokenSeed
+            );
+        }
 
         // The position is opened in THIS contract's name and there is no code path anywhere that
         // passes a negative liquidityDelta. That is the lock.

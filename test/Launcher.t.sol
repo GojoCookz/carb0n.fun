@@ -50,7 +50,7 @@ contract LauncherTest is Test {
     address internal holder = address(0xB0B);
 
     uint256 internal constant SUPPLY = 1_000_000_000e18;
-    uint256 internal constant PAIR_SEED = 100e18;
+    uint256 internal constant OPENING_MCAP = 100e18;
 
     function setUp() public {
         manager = new PoolManager(address(this));
@@ -93,9 +93,9 @@ contract LauncherTest is Test {
             symbol: "HOOD",
             supply: SUPPLY,
             pair: address(pair),
-            pairSeed: PAIR_SEED,
+            openingMarketCap: OPENING_MCAP,
             // 5x the opening market cap. `pairSeed` IS the opening market cap in pair units.
-            graduationThreshold: PAIR_SEED * 5,
+            graduationThreshold: OPENING_MCAP * 5,
             feeBps: 300,
             creatorBps: 2000,
             maxWalletBps: 200, // 2%
@@ -142,6 +142,8 @@ contract LauncherTest is Test {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
+        // Fees are ERC-6909 claims until swept; sweep so these tests stay about economics.
+        hook.sweep(k);
     }
 
     // ===========================================================================================
@@ -154,7 +156,10 @@ contract LauncherTest is Test {
 
         assertEq(LaunchToken(token).totalSupply(), SUPPLY, "supply minted");
         assertGt(LaunchToken(token).balanceOf(address(manager)), 0, "pool was seeded with the token");
-        assertGt(pair.balanceOf(address(manager)), 0, "pool was seeded with the pair currency");
+        // SINGLE-SIDED: the creator supplies no pair currency, so the pool opens holding none of
+        // it. The pair side of the book is built entirely by the people who buy, which is what
+        // makes the opening price a floor and launching free.
+        assertEq(pair.balanceOf(address(manager)), 0, "pool opens with no pair currency at all");
 
         // A stranger buys. This is the first trade the pool has ever seen. Sized under the 2% cap:
         // at the seeded ratio, 1 pair buys ~1% of supply.
@@ -197,7 +202,7 @@ contract LauncherTest is Test {
         supply = bound(supply, 1_000_000e18, 100_000_000_000e18);
 
         Launcher.LaunchParams memory p = _params();
-        p.pairSeed = seed;
+        p.openingMarketCap = seed;
         p.supply = supply;
         // The threshold is validated against the seed, so it has to move with it.
         p.graduationThreshold = seed * 5;
@@ -215,9 +220,16 @@ contract LauncherTest is Test {
         (address token, PoolId id) = _launch(_params());
         PoolKey memory k = _key(token);
 
-        bytes32 positionKey = Position.calculatePositionKey(
-            address(launcher), TickMath.minUsableTick(60), TickMath.maxUsableTick(60), bytes32(0)
-        );
+        // The position is single-sided now, so it runs from the opening tick to one edge rather
+        // than spanning the whole range. Read the tick the pool actually opened at.
+        (, int24 openingTick,,) = IPoolManager(address(manager)).getSlot0(id);
+        bool tokenIsCurrency0 = token < address(pair);
+        (int24 lower, int24 upper) = tokenIsCurrency0
+            ? (openingTick, TickMath.maxUsableTick(60))
+            : (TickMath.minUsableTick(60), openingTick);
+
+        bytes32 positionKey =
+            Position.calculatePositionKey(address(launcher), lower, upper, bytes32(0));
         uint128 liq = IPoolManager(address(manager)).getPositionLiquidity(id, positionKey);
         assertGt(liq, 0, "the launcher holds the position");
         assertGt(IPoolManager(address(manager)).getLiquidity(id), 0, "the pool has active liquidity");
@@ -272,7 +284,7 @@ contract LauncherTest is Test {
 
     function test_revertsOnZeroSeed() public {
         Launcher.LaunchParams memory p = _params();
-        p.pairSeed = 0;
+        p.openingMarketCap = 0;
 
         vm.prank(creator);
         vm.expectRevert(Launcher.SeedTooLow.selector);
@@ -292,12 +304,12 @@ contract LauncherTest is Test {
     /// @dev We revert rather than silently trimming. Silent adjustment is how users get surprised.
     function test_devBuyOverCapReverts() public {
         Launcher.LaunchParams memory p = _params();
-        p.devBuyPairAmount = (PAIR_SEED * 1001) / 10_000; // just over 10%
+        p.devBuyPairAmount = (OPENING_MCAP * 1001) / 10_000; // just over 10%
 
         vm.prank(creator);
         vm.expectRevert(
             abi.encodeWithSelector(
-                Launcher.DevBuyTooLarge.selector, p.devBuyPairAmount, (PAIR_SEED * 1000) / 10_000
+                Launcher.DevBuyTooLarge.selector, p.devBuyPairAmount, (OPENING_MCAP * 1000) / 10_000
             )
         );
         launcher.launch(p);
@@ -309,7 +321,7 @@ contract LauncherTest is Test {
 
     function test_devBuyDeliversTokensToTheCreator() public {
         Launcher.LaunchParams memory p = _params();
-        p.devBuyPairAmount = PAIR_SEED / 20; // 5%
+        p.devBuyPairAmount = OPENING_MCAP / 20; // 5%
 
         (address token,) = _launch(p);
 
@@ -317,27 +329,39 @@ contract LauncherTest is Test {
         assertEq(LaunchToken(token).balanceOf(address(launcher)), 0, "and the launcher kept none");
     }
 
-    /// @dev **Regression guard for a fee that used to vanish.** The dev buy is the first trade, and
-    ///      the hook distributes its fee before the buyer's tokens land - so `totalShares` is zero
-    ///      at that instant. `Distributor.distribute` used to return early and strand the fee with
-    ///      nothing recording it. It must be carried instead.
-    function test_devBuyFeeIsCarriedUntilThereIsAHolder() public {
+    /// @dev **Regression guard for a fee that used to vanish.** `Distributor.distribute` once
+    ///      returned early when `totalShares` was zero and stranded the fee with nothing recording
+    ///      it. The invariant under test is that a charged fee is NEVER dropped - it is either
+    ///      carried until there is somebody to pay, or distributed to whoever already holds.
+    ///
+    ///      Which of those two happens moved when fees became claims. It used to be carried
+    ///      always: the hook routed the dev buy's fee mid-launch, before the creator's tokens had
+    ///      been delivered, so `totalShares` was genuinely zero at that instant. Sweeping happens
+    ///      after the launch completes, by which point the creator is a real holder - so the same
+    ///      fee now distributes. Both paths are correct; neither may lose a wei.
+    function test_devBuyFeeIsNeverDropped() public {
         Launcher.LaunchParams memory p = _params();
-        p.devBuyPairAmount = PAIR_SEED / 20;
+        p.devBuyPairAmount = OPENING_MCAP / 20;
 
         (address token,) = _launch(p);
         Distributor dist = LaunchToken(token).distributor();
 
-        uint256 carried = dist.pendingPayouts();
-        assertGt(carried, 0, "the first fee was carried, not dropped");
-        assertEq(dist.totalDistributed(), 0, "nothing distributed yet - there were no holders");
-        assertEq(pair.balanceOf(address(dist)), carried, "and the tokens are really there");
+        uint256 charged = hook.pendingFees(_key(token).toId());
+        assertGt(charged, 0, "the dev buy really was charged, as a claim");
+        assertEq(pair.balanceOf(address(dist)), 0, "and nothing has moved yet");
 
-        // The next trade creates a holder and releases the carry.
-        _buy(trader, token, 1e18);
+        hook.sweep(_key(token));
 
-        assertEq(dist.pendingPayouts(), 0, "carry released once a holder exists");
-        assertGe(dist.totalDistributed(), carried, "the carried fee was included");
+        assertEq(hook.pendingFees(_key(token).toId()), 0, "claim redeemed in full");
+        assertGt(
+            dist.totalDistributed() + dist.pendingPayouts(),
+            0,
+            "the fee was accounted for - carried or distributed, never dropped"
+        );
+        assertGt(pair.balanceOf(address(dist)), 0, "and the tokens really reached the ledger");
+
+        // The creator bought, so they are a holder and the fee is theirs to claim.
+        assertGt(dist.withdrawableOf(creator), 0, "the holder can actually claim it");
     }
 
     // ===========================================================================================
@@ -428,14 +452,14 @@ contract LauncherTest is Test {
         (uint160 sqrtPriceX96,,,) = IPoolManager(address(manager)).getSlot0(id);
 
         bool tokenIsCurrency0 = token < address(pair);
-        (uint256 amount0, uint256 amount1) = tokenIsCurrency0 ? (SUPPLY, PAIR_SEED) : (PAIR_SEED, SUPPLY);
+        (uint256 amount0, uint256 amount1) = tokenIsCurrency0 ? (SUPPLY, OPENING_MCAP) : (OPENING_MCAP, SUPPLY);
 
         // price = (sqrtPriceX96 / 2^96)^2 should equal amount1/amount0. Compare in a scaled integer
         // space to avoid asserting on floating point.
         uint256 priceScaled = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96) * 1e18) >> 192;
         uint256 expectedScaled = (amount1 * 1e18) / amount0;
 
-        assertApproxEqRel(priceScaled, expectedScaled, 1e15, "opening price must match the seed ratio");
+        assertApproxEqRel(priceScaled, expectedScaled, 1e16, "opening price must match the market cap asked for (snapped to a tick)");
         assertGt(sqrtPriceX96, TickMath.MIN_SQRT_PRICE, "and be a usable price");
     }
 }

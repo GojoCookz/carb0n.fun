@@ -55,13 +55,13 @@ abstract contract GraduationHarness is Test {
 
     uint256 internal constant SUPPLY = 1_000_000_000e18;
     /// @dev The pool opens with the ENTIRE supply against this, and the opening price is exactly
-    ///      that ratio - so the opening market cap, in pair units, is exactly `PAIR_SEED`.
-    uint256 internal constant PAIR_SEED = 100e18;
+    ///      that ratio - so the opening market cap, in pair units, is exactly `OPENING_MCAP`.
+    uint256 internal constant OPENING_MCAP = 100e18;
     /// @dev 5x the opening market cap.
     uint256 internal constant THRESHOLD = 500e18;
 
     /// @dev A buy big enough to take the price past 5x. The curve behaves as constant product with
-    ///      reserves (SUPPLY, PAIR_SEED), so paying `x` moves the price by `(1 + 0.97x/seed)^2` -
+    ///      reserves (SUPPLY, OPENING_MCAP), so paying `x` moves the price by `(1 + 0.97x/seed)^2` -
     ///      the 0.97 being the 3% the hook skims before the input reaches the curve. 200 gives
     ///      ~8.6x, which is comfortably clear of the threshold without relying on exact curve math.
     uint256 internal constant BUY_PAST_THRESHOLD = 200e18;
@@ -120,7 +120,7 @@ abstract contract GraduationHarness is Test {
             symbol: "HOOD",
             supply: SUPPLY,
             pair: address(pair),
-            pairSeed: PAIR_SEED,
+            openingMarketCap: OPENING_MCAP,
             graduationThreshold: THRESHOLD,
             feeBps: 300,
             creatorBps: 2000,
@@ -188,6 +188,8 @@ abstract contract GraduationHarness is Test {
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
+        // Fees are ERC-6909 claims until swept.
+        hook.sweep(_key(token));
     }
 
     /// @dev An ordinary exact-input buy - the shape a router sends.
@@ -214,8 +216,8 @@ abstract contract GraduationHarness is Test {
     // Market cap: the conversion from sqrtPriceX96 to a number in pair units
     // ===========================================================================================
 
-    /// @dev **The anchor test.** The pool is seeded with the whole supply against `PAIR_SEED` and
-    ///      opens at exactly that ratio, so market cap = supply x (seed/supply) = `PAIR_SEED`
+    /// @dev **The anchor test.** The pool is seeded with the whole supply against `OPENING_MCAP` and
+    ///      opens at exactly that ratio, so market cap = supply x (seed/supply) = `OPENING_MCAP`
     ///      EXACTLY - a known value, not a value copied out of the implementation.
     ///
     ///      Running it in both orientations is what makes it worth writing: an inverted branch would
@@ -224,7 +226,7 @@ abstract contract GraduationHarness is Test {
         (, PoolId id) = _launch();
 
         assertApproxEqRel(
-            hook.marketCapOf(id), PAIR_SEED, 1e15, "opening market cap must be the pair seed"
+            hook.marketCapOf(id), OPENING_MCAP, 1e16, "opening market cap must be the market cap asked for (snapped to a tick)"
         );
     }
 
@@ -361,11 +363,11 @@ abstract contract GraduationHarness is Test {
     /// @dev A threshold at or below the opening market cap means the token is born graduated.
     function test_launchRevertsWhenTheThresholdIsAtTheOpeningMarketCap() public {
         Launcher.LaunchParams memory p = _params();
-        p.graduationThreshold = PAIR_SEED;
+        p.graduationThreshold = OPENING_MCAP;
 
         vm.prank(creator);
         vm.expectRevert(
-            abi.encodeWithSelector(Launcher.GraduationThresholdTooLow.selector, PAIR_SEED, PAIR_SEED)
+            abi.encodeWithSelector(Launcher.GraduationThresholdTooLow.selector, OPENING_MCAP, OPENING_MCAP)
         );
         launcher.launch(p);
     }
@@ -376,7 +378,7 @@ abstract contract GraduationHarness is Test {
 
         vm.prank(creator);
         vm.expectRevert(
-            abi.encodeWithSelector(Launcher.GraduationThresholdTooLow.selector, uint256(0), PAIR_SEED)
+            abi.encodeWithSelector(Launcher.GraduationThresholdTooLow.selector, uint256(0), OPENING_MCAP)
         );
         launcher.launch(p);
     }
@@ -384,13 +386,13 @@ abstract contract GraduationHarness is Test {
     /// @dev One wei above the opening is legal. How far above the bar sits is the creator's call.
     function test_aThresholdOneWeiAboveTheOpeningIsAccepted() public {
         Launcher.LaunchParams memory p = _params();
-        p.graduationThreshold = PAIR_SEED + 1;
+        p.graduationThreshold = OPENING_MCAP + 1;
 
         vm.prank(creator);
         (, PoolId id) = launcher.launch(p);
 
         (uint256 threshold,,,,,) = hook.graduation(id);
-        assertEq(threshold, PAIR_SEED + 1);
+        assertEq(threshold, OPENING_MCAP + 1);
     }
 
     // ===========================================================================================
@@ -504,7 +506,7 @@ abstract contract GraduationHarness is Test {
     function test_progressStartsAtTheOpeningRatioAndCapsAtFull() public {
         (address token, PoolId id) = _launch();
 
-        // Opening market cap is PAIR_SEED against a 5x threshold: 2,000 bps.
+        // Opening market cap is OPENING_MCAP against a 5x threshold: 2,000 bps.
         assertApproxEqAbs(hook.graduationProgressBps(id), 2_000, 5, "opens at a fifth of the bar");
 
         _buy(trader, token, BUY_UNDER_THRESHOLD);
@@ -576,7 +578,7 @@ abstract contract GraduationHarness is Test {
         thresholdMul = bound(thresholdMul, 2, 1_000);
 
         Launcher.LaunchParams memory p = _params();
-        p.pairSeed = seed;
+        p.openingMarketCap = seed;
         p.graduationThreshold = seed * thresholdMul;
 
         vm.prank(creator);
