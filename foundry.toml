@@ -69,10 +69,25 @@ int_types = "long"
 
 [rpc_endpoints]
 # Ethereum L1 is the target. Set MAINNET_RPC_URL / SEPOLIA_RPC_URL in the
-# environment; the publicnode fallbacks are rate-limited and fine for reads only.
+# environment; the public fallbacks are rate-limited and fine for reads only.
 mainnet = "${MAINNET_RPC_URL}"
 sepolia = "${SEPOLIA_RPC_URL}"
-mainnet_public = "https://ethereum-rpc.publicnode.com"
+
+# `LauncherFork.t.sol` pins a block, which makes every one of its state reads an
+# ARCHIVE request. Most "public" endpoints serve head fine and refuse archive:
+#   ethereum-rpc.publicnode.com  403 "Archive requests require a personal token"
+#   rpc.ankr.com/eth             -32000 Unauthorized
+#   1rpc.io/eth                  -32000 historical state not available
+#   eth.rpc.blxrbdn.com          -32000 historical state not available
+#   eth.llamarpc.com             521
+# The three below were each verified to return storage at the pinned block
+# (25,875,500) on 2026-09. Three of them, because a pinned fork test that dies
+# when one free provider changes its policy is a test everyone learns to ignore
+# - `LauncherForkTest` probes each in turn and skips only if all three refuse.
+mainnet_public = "https://eth.drpc.org"
+mainnet_archive_alt = "https://eth-pokt.nodies.app"
+mainnet_archive_alt2 = "https://eth.merkle.io"
+
 sepolia_public = "https://ethereum-sepolia-rpc.publicnode.com"
 
 [etherscan]

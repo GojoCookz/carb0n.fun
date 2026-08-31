@@ -83,6 +83,8 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     /// @param supply           fixed total supply, all of it seeded into the pool
     /// @param pair             the pair currency; must be approved in `PairRegistry`
     /// @param pairSeed         how much pair currency the creator adds as opening liquidity
+    /// @param graduationThreshold market cap, in PAIR-CURRENCY units, at which this launch is
+    ///                         signalled as mature. Must exceed `pairSeed` - see `_validate`.
     /// @param feeBps           total trading fee, capped by `FeeHook.MAX_FEE_BPS`
     /// @param creatorBps       creator's cut of the fee; the remainder goes to holders
     /// @param maxWalletBps     buy cap as a share of supply, or 0 to disable
@@ -98,6 +100,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         uint256 supply;
         address pair;
         uint256 pairSeed;
+        uint256 graduationThreshold;
         uint16 feeBps;
         uint16 creatorBps;
         uint16 maxWalletBps;
@@ -149,6 +152,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     error SeedTooLow();
     error DevBuyTooLarge(uint256 given, uint256 cap);
     error MaxWalletTooSmall(uint16 given);
+    error GraduationThresholdTooLow(uint256 given, uint256 openingMarketCap);
     error OnlyPoolManager();
     error LauncherRetainedFunds();
     error OpeningPriceOutOfRange();
@@ -229,6 +233,11 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
             p.creatorBps
         );
 
+        // Graduation is a separate call rather than two more arguments on `configurePool`, so the
+        // signature of the function that governs every fee this pool will ever charge stays exactly
+        // as it was. A maturity notification has no business widening that surface.
+        feeHook.configureGraduation(key, p.graduationThreshold, p.supply);
+
         poolManager.initialize(key, _openingSqrtPrice(p.supply, pairSeed, tokenIsCurrency0));
 
         // 5. Seed, dev-buy and settle, all inside one unlock.
@@ -270,6 +279,15 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         if (p.pairSeed == 0) revert SeedTooLow();
         if (p.maxWalletBps != 0 && p.maxWalletBps < MIN_MAX_WALLET_BPS) {
             revert MaxWalletTooSmall(p.maxWalletBps);
+        }
+
+        // The pool opens with the ENTIRE supply seeded against `pairSeed`, and the opening price is
+        // exactly that ratio - so the opening market cap, measured in pair units, is exactly
+        // `pairSeed`. A graduation threshold at or below it means the token is born graduated,
+        // which turns the signal into noise on day one. This is the only bound worth enforcing:
+        // how far above the opening a launch sets its bar is the creator's call, not ours.
+        if (p.graduationThreshold <= p.pairSeed) {
+            revert GraduationThresholdTooLow(p.graduationThreshold, p.pairSeed);
         }
 
         uint256 devCap = (p.pairSeed * MAX_DEV_BUY_BPS) / BPS;

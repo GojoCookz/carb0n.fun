@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
@@ -48,6 +48,9 @@ contract LauncherForkTest is Test {
 
     /// @dev Pinned 2026-09. Chosen a little behind head so the public RPC reliably has the state.
     uint256 internal constant FORK_BLOCK = 25_875_500;
+    /// @dev The same block as a JSON-RPC quantity, for the archive probe below. `setUp` asserts the
+    ///      two agree so they cannot drift.
+    string internal constant FORK_BLOCK_HEX = "0x18ad42c";
 
     /// @notice The real Uniswap V2 WXMR/WETH pair, created 2021-01-06.
     /// @dev Resolved from the V2 factory's `getPair(WXMR, WETH)` rather than pasted from a UI.
@@ -69,17 +72,44 @@ contract LauncherForkTest is Test {
     /// @dev 20 XMR. Against a token whose ENTIRE supply is 7,000, a seed has to be small to be
     ///      realistic - this is deliberately a plausible launch, not a round number.
     uint256 internal constant PAIR_SEED = 20e18;
+    /// @dev 2x the opening market cap. The pool opens with all supply against `PAIR_SEED`, so the
+    ///      opening market cap in pair units is exactly `PAIR_SEED` = 20 WXMR.
+    uint256 internal constant GRADUATION_THRESHOLD = 40e18;
 
     bool internal forked;
 
-    function setUp() public {
-        try vm.createFork("mainnet_public", FORK_BLOCK) returns (uint256 forkId) {
-            vm.selectFork(forkId);
-            forked = true;
-        } catch {
-            forked = false;
-            return;
+    /// @dev **A pinned fork makes every state read an ARCHIVE request**, and most free endpoints
+    ///      serve head happily while refusing history - `ethereum-rpc.publicnode.com`, which this
+    ///      suite used to point at, now answers archive reads with a 403 asking for an account.
+    ///
+    ///      The failure mode is nasty because Foundry CACHES fork state on disk: the tests keep
+    ///      passing on the machine that first ran them and fail for everyone else, and adding one
+    ///      new assertion that touches one uncached slot is enough to break them locally too.
+    ///
+    ///      So each candidate is PROBED with a real archive read before the fork is created.
+    ///      `vm.createFork` succeeding proves only that the endpoint exists.
+    function _selectArchiveFork() internal returns (bool) {
+        string[3] memory candidates = ["mainnet_public", "mainnet_archive_alt", "mainnet_archive_alt2"];
+        string memory probe = string.concat(
+            '["0x000000000004444c5dc75cB358380D2e3dE08A90","0x0","', FORK_BLOCK_HEX, '"]'
+        );
+
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            try vm.rpc(candidates[i], "eth_getStorageAt", probe) returns (bytes memory) {
+                try vm.createFork(candidates[i], FORK_BLOCK) returns (uint256 forkId) {
+                    vm.selectFork(forkId);
+                    return true;
+                } catch {}
+            } catch {}
         }
+        return false;
+    }
+
+    function setUp() public {
+        require(FORK_BLOCK == 0x18ad42c, "FORK_BLOCK and FORK_BLOCK_HEX disagree");
+
+        forked = _selectArchiveFork();
+        if (!forked) return;
 
         manager = IPoolManager(Addresses.MAINNET_POOL_MANAGER);
         wxmr = IERC20(Addresses.MAINNET_WXMR);
@@ -129,6 +159,7 @@ contract LauncherForkTest is Test {
             supply: SUPPLY,
             pair: Addresses.MAINNET_WXMR,
             pairSeed: PAIR_SEED,
+            graduationThreshold: GRADUATION_THRESHOLD,
             feeBps: 300,
             creatorBps: 2000,
             maxWalletBps: 200,
@@ -241,6 +272,106 @@ contract LauncherForkTest is Test {
     function _launch() internal returns (address token, PoolId id) {
         vm.prank(creator);
         return launcher.launch(_params());
+    }
+
+    // ===========================================================================================
+    // Graduation, against real infrastructure
+    // ===========================================================================================
+    //
+    // Graduation is a SIGNAL, not a mechanism: nothing migrates, the LP was locked at block 0, and
+    // the latch gates nothing of value. What the fork adds over the local suite is that the market
+    // cap is read out of the REAL PoolManager's `slot0` - `getSlot0` goes through `extsload`, which
+    // derives a storage slot from a `POOLS_SLOT` constant that lives in Uniswap's contract, not
+    // ours. A local PoolManager we compiled ourselves cannot catch a drift in that.
+
+    /// @dev Launches with the max-wallet cap off, because clearing a graduation threshold means
+    ///      buying a large slice of the float in one trade and a 2% cap would block it.
+    function _launchGraduating() internal returns (address token, PoolId id) {
+        Launcher.LaunchParams memory p = _params();
+        p.maxWalletBps = 0;
+        p.salt = bytes32(uint256(2));
+
+        vm.prank(creator);
+        return launcher.launch(p);
+    }
+
+    /// @dev The pool opens with the whole supply against 20 real WXMR, so its opening market cap is
+    ///      exactly 20 WXMR - a number known from the launch parameters, not from the implementation.
+    function test_fork_openingMarketCapIsThePairSeedInRealWxmr() public onlyForked {
+        (, PoolId id) = _launch();
+
+        assertApproxEqRel(
+            hook.marketCapOf(id), PAIR_SEED, 1e15, "opening market cap is the seed, in WXMR units"
+        );
+        assertLt(hook.marketCapOf(id), GRADUATION_THRESHOLD, "and it opens below the bar");
+    }
+
+    /// @dev Below the threshold nothing fires, however many times it is checked.
+    function test_fork_belowThresholdDoesNotFire() public onlyForked {
+        (address token, PoolId id) = _launchGraduating();
+
+        assertFalse(hook.checkGraduation(id), "fresh launch is not graduated");
+
+        _buy(trader, token, 1e18); // ~1.1x: nowhere near 2x
+        assertLt(hook.marketCapOf(id), GRADUATION_THRESHOLD, "still under the bar");
+        assertFalse(hook.checkGraduation(id), "so it must not latch");
+        assertFalse(hook.hasGraduated(id));
+    }
+
+    /// @dev Crossing fires exactly once, a second call is a no-op, and falling back does not
+    ///      un-latch. All four cases in one narrative, because they are one story.
+    function test_fork_crossingLatchesOnceAndNeverUnlatches() public onlyForked {
+        (address token, PoolId id) = _launchGraduating();
+
+        // 12 WXMR against a 20 WXMR seed clears 2x with room to spare, after the hook's 3%.
+        _buy(trader, token, 12e18);
+        assertGe(hook.marketCapOf(id), GRADUATION_THRESHOLD, "the buy cleared the bar");
+
+        vm.recordLogs();
+        assertTrue(hook.checkGraduation(id), "crossing latches");
+        assertEq(_countGraduatedLogs(vm.getRecordedLogs()), 1, "exactly one Graduated event");
+        assertTrue(hook.hasGraduated(id));
+
+        // Second call: same answer, no second event.
+        vm.recordLogs();
+        assertTrue(hook.checkGraduation(id), "idempotent");
+        assertEq(_countGraduatedLogs(vm.getRecordedLogs()), 0, "and silent");
+
+        // Now dump the whole position back into the pool. Sells are uncharged, so this is the
+        // cheapest possible way to push the price back under the bar.
+        uint256 held = LaunchToken(token).balanceOf(trader);
+        vm.prank(trader);
+        LaunchToken(token).approve(address(swapRouter), type(uint256).max);
+
+        PoolKey memory k = _key(token);
+        bool sellIsZeroForOne = Currency.unwrap(k.currency0) == token;
+        vm.prank(trader);
+        swapRouter.swap(
+            k,
+            SwapParams({
+                zeroForOne: sellIsZeroForOne,
+                amountSpecified: -int256(held),
+                sqrtPriceLimitX96: sellIsZeroForOne
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        assertLt(hook.marketCapOf(id), GRADUATION_THRESHOLD, "price collapsed back under the bar");
+
+        vm.recordLogs();
+        assertTrue(hook.checkGraduation(id), "one way: it stays graduated");
+        assertEq(_countGraduatedLogs(vm.getRecordedLogs()), 0, "and emits nothing on the way down");
+        assertEq(hook.graduationProgressBps(id), 10_000, "the bar stays full");
+    }
+
+    function _countGraduatedLogs(Vm.Log[] memory logs) internal pure returns (uint256 n) {
+        bytes32 topic = keccak256("Graduated(bytes32,address,uint256,uint256,uint256)");
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == topic) ++n;
+        }
     }
 
     // ===========================================================================================

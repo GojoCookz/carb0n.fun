@@ -94,6 +94,8 @@ contract LauncherTest is Test {
             supply: SUPPLY,
             pair: address(pair),
             pairSeed: PAIR_SEED,
+            // 5x the opening market cap. `pairSeed` IS the opening market cap in pair units.
+            graduationThreshold: PAIR_SEED * 5,
             feeBps: 300,
             creatorBps: 2000,
             maxWalletBps: 200, // 2%
@@ -197,6 +199,8 @@ contract LauncherTest is Test {
         Launcher.LaunchParams memory p = _params();
         p.pairSeed = seed;
         p.supply = supply;
+        // The threshold is validated against the seed, so it has to move with it.
+        p.graduationThreshold = seed * 5;
 
         (address token,) = _launch(p);
 
