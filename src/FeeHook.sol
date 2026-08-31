@@ -11,6 +11,7 @@ import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-cor
 import {SwapParams} from "v4-core/types/PoolOperation.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -77,6 +78,11 @@ contract FeeHook is HookBase {
     /// @param creator      receives the creator share
     /// @param creatorBps   creator's cut of `feeBps`; the remainder goes to holders
     /// @param configured   guards against a pool being initialised without config
+    /// @param feeBps     the BUY rate, charged in the pair currency
+    /// @param sellFeeBps the SELL rate, charged in the launch token and converted on sweep. Set
+    ///                   independently of the buy rate; zero means sells are free.
+    /// @param burnBps    share of each swept fee that buys the launch token back from its own pool
+    ///                   and sends it to the burn address
     struct PoolConfig {
         address distributor;
         Currency pairCurrency;
@@ -84,6 +90,8 @@ contract FeeHook is HookBase {
         address creator;
         uint16 creatorBps;
         bool configured;
+        uint16 sellFeeBps;
+        uint16 burnBps;
     }
 
     /// @notice Per-pool graduation state. Written once by the launcher, latched once by anyone.
@@ -113,6 +121,9 @@ contract FeeHook is HookBase {
     uint16 public constant MAX_FEE_BPS = 1000;
     /// @notice Basis point denominator.
     uint16 public constant BPS = 10_000;
+    /// @notice Where bought-back supply goes. Already excluded in `Distributor`'s constructor,
+    ///         so burned tokens never accrue dividends to nobody.
+    address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     /// @notice The only address allowed to register a pool config. Set once at deploy.
     address public immutable launcher;
@@ -120,8 +131,12 @@ contract FeeHook is HookBase {
     mapping(PoolId => PoolConfig) public poolConfig;
     /// @notice Fees charged per pool over all time, in the pair currency. Diagnostics only.
     mapping(PoolId => uint256) public totalFeesTaken;
-    /// @notice Fees charged but not yet swept, held as ERC-6909 claims on the PoolManager.
+    /// @notice Pair-currency fees charged but not yet swept, held as ERC-6909 claims.
     mapping(PoolId => uint256) public pendingFees;
+    /// @notice LAUNCH-TOKEN fees from sells, held as claims until `sweep` converts them.
+    mapping(PoolId => uint256) public pendingTokenFees;
+    /// @notice Launch tokens bought back and burned per pool. Diagnostics only.
+    mapping(PoolId => uint256) public totalBurned;
     /// @notice Graduation threshold and latch, per pool.
     /// @dev A SEPARATE mapping from `poolConfig` on purpose. `_beforeSwap` and `_afterSwap` load
     ///      `poolConfig` into memory on every single trade; folding three more words into that
@@ -130,10 +145,18 @@ contract FeeHook is HookBase {
     mapping(PoolId => GraduationConfig) public graduation;
 
     event PoolConfigured(
-        PoolId indexed poolId, address distributor, Currency pairCurrency, uint16 feeBps, address creator
+        PoolId indexed poolId,
+        address distributor,
+        Currency pairCurrency,
+        uint16 feeBps,
+        uint16 sellFeeBps,
+        uint16 burnBps,
+        address creator
     );
     /// @notice Charged inside a swap and held as a claim. The real trading rate lives here.
-    event FeeAccrued(PoolId indexed poolId, uint256 amount, uint256 pending);
+    event FeeAccrued(PoolId indexed poolId, Currency currency, uint256 amount, bool isBuy);
+    /// @notice Launch tokens bought back from the pool and destroyed, during a sweep.
+    event Burned(PoolId indexed poolId, uint256 pairSpent, uint256 tokensBurned);
     /// @notice Redeemed and paid out. Emitted on `sweep`, not on the trade that earned it.
     event FeeTaken(PoolId indexed poolId, uint256 total, uint256 toHolders, uint256 toCreator);
     event GraduationConfigured(
@@ -189,6 +212,20 @@ contract FeeHook is HookBase {
     /// @notice Register a pool's fee split before its pool is initialised.
     /// @dev Callable only by the launcher, and only once per pool. Immutable afterwards: a fee
     ///      split that can be changed after people have bought is a rug with extra steps.
+    /// @notice Everything a pool's fee needs, in one struct.
+    /// @dev A struct rather than eight loose arguments because `Launcher.launch` sits on the stack
+    ///      ceiling: encoding a `PoolKey` plus seven scalars at that call site is what tips it into
+    ///      a Yul stack-too-deep that via-ir cannot resolve. One struct is two words to pass.
+    struct FeeSetup {
+        address distributor;
+        Currency pairCurrency;
+        uint16 feeBps;
+        uint16 sellFeeBps;
+        uint16 burnBps;
+        address creator;
+        uint16 creatorBps;
+    }
+
     function configurePool(
         PoolKey calldata key,
         address distributor,
@@ -197,24 +234,49 @@ contract FeeHook is HookBase {
         address creator,
         uint16 creatorBps
     ) external {
+        configurePoolFull(
+            key,
+            FeeSetup({
+                distributor: distributor,
+                pairCurrency: pairCurrency,
+                feeBps: feeBps,
+                sellFeeBps: 0,
+                burnBps: 0,
+                creator: creator,
+                creatorBps: creatorBps
+            })
+        );
+    }
+
+    /// @notice The full form: separate buy and sell rates, plus a buyback-and-burn share.
+    /// @dev `configurePool` is the same thing with sells free and no burn, kept so the simple path
+    ///      stays readable at the call site.
+    function configurePoolFull(PoolKey calldata key, FeeSetup memory s) public {
         if (msg.sender != launcher) revert OnlyLauncher();
-        if (feeBps > MAX_FEE_BPS) revert FeeTooHigh(feeBps);
-        if (creatorBps > BPS) revert CreatorShareTooHigh(creatorBps);
-        if (distributor == address(0) || creator == address(0)) revert ZeroAddress();
+        if (s.feeBps > MAX_FEE_BPS) revert FeeTooHigh(s.feeBps);
+        if (s.sellFeeBps > MAX_FEE_BPS) revert FeeTooHigh(s.sellFeeBps);
+        if (s.creatorBps > BPS) revert CreatorShareTooHigh(s.creatorBps);
+        // Creator share and burn share both come OUT of the fee, so together they cannot exceed it.
+        if (uint256(s.creatorBps) + s.burnBps > BPS) revert CreatorShareTooHigh(s.creatorBps);
+        if (s.distributor == address(0) || s.creator == address(0)) revert ZeroAddress();
 
         PoolId id = key.toId();
         if (poolConfig[id].configured) revert AlreadyConfigured();
 
         poolConfig[id] = PoolConfig({
-            distributor: distributor,
-            pairCurrency: pairCurrency,
-            feeBps: feeBps,
-            creator: creator,
-            creatorBps: creatorBps,
-            configured: true
+            distributor: s.distributor,
+            pairCurrency: s.pairCurrency,
+            feeBps: s.feeBps,
+            creator: s.creator,
+            creatorBps: s.creatorBps,
+            configured: true,
+            sellFeeBps: s.sellFeeBps,
+            burnBps: s.burnBps
         });
 
-        emit PoolConfigured(id, distributor, pairCurrency, feeBps, creator);
+        emit PoolConfigured(
+            id, s.distributor, s.pairCurrency, s.feeBps, s.sellFeeBps, s.burnBps, s.creator
+        );
     }
 
     // -------------------------------------------------------------------------------------------
@@ -395,6 +457,17 @@ contract FeeHook is HookBase {
     ///      the unspent input is refunded to the trader but the fee on it is not. Moving the charge
     ///      to `afterSwap` would fix that and reintroduce the zero-fee hole this exists to close;
     ///      the partial-fill case is rare and the overcharge is bounded by `feeBps`.
+    ///      **Both directions are charged here on an exact-input swap**, because for exact input
+    ///      the specified currency IS the input currency whichever way the trade runs:
+    ///
+    ///      ```
+    ///        buy  exact-in   input = pair   -> charge feeBps     in the PAIR currency
+    ///        sell exact-in   input = token  -> charge sellFeeBps in the LAUNCH TOKEN
+    ///      ```
+    ///
+    ///      A sell cannot be charged in the pair currency - the trader is not paying any in - so
+    ///      the sell fee accrues in launch tokens and `sweep` converts it. That conversion is only
+    ///      possible because `sweep` runs outside the swap.
     function _beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         internal
         override
@@ -402,36 +475,46 @@ contract FeeHook is HookBase {
     {
         PoolId id = key.toId();
         PoolConfig memory cfg = poolConfig[id];
-        if (!cfg.configured || cfg.feeBps == 0) {
+        if (!cfg.configured) {
             return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
 
-        // Exact-output swaps specify the OUTPUT, so the pair currency is never the specified side
-        // on a buy. Those are handled in `_afterSwap`.
+        // Exact-output swaps specify the OUTPUT, so the input currency is never the specified
+        // side. Those are handled in `_afterSwap`.
         if (params.amountSpecified >= 0) {
             return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
         }
 
-        // A buy pays the pair currency in. The payer's side is currency0 when `zeroForOne`, so this
-        // is a buy exactly when the pair sits on the side being paid.
+        // A buy pays the pair currency in. The payer's side is currency0 when `zeroForOne`, so
+        // this is a buy exactly when the pair sits on the side being paid.
         bool pairIsCurrency0 = Currency.unwrap(cfg.pairCurrency) == Currency.unwrap(key.currency0);
-        if (params.zeroForOne != pairIsCurrency0) {
-            return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-        }
+        bool isBuy = params.zeroForOne == pairIsCurrency0;
 
-        uint256 pairIn = uint256(-params.amountSpecified);
-        uint256 fee = (pairIn * cfg.feeBps) / BPS;
+        uint16 rate = isBuy ? cfg.feeBps : cfg.sellFeeBps;
+        if (rate == 0) return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+
+        uint256 amountIn = uint256(-params.amountSpecified);
+        uint256 fee = (amountIn * rate) / BPS;
         if (fee == 0) return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
 
-        _accrue(id, cfg, fee);
+        Currency feeCurrency = isBuy
+            ? cfg.pairCurrency
+            : (pairIsCurrency0 ? key.currency1 : key.currency0);
+
+        _accrue(id, feeCurrency, isBuy, fee);
 
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(int128(uint128(fee)), 0), 0);
     }
 
-    /// @dev Charges the EXACT-OUTPUT BUY leg, where the pair currency is the UNSPECIFIED side.
+    /// @dev Charges the EXACT-OUTPUT leg, where the INPUT currency is the unspecified side.
     ///
     ///      The returned int128 is a delta on the unspecified currency. Positive means the hook is
-    ///      owed. We take exactly that amount in the same call so the unlock cycle balances.
+    ///      owed. We claim exactly that much in the same call so the unlock cycle balances.
+    ///
+    ///      ```
+    ///        buy  exact-out   unspecified = pair   -> charge feeBps     in the PAIR currency
+    ///        sell exact-out   unspecified = token  -> charge sellFeeBps in the LAUNCH TOKEN
+    ///      ```
     function _afterSwap(
         address,
         PoolKey calldata key,
@@ -441,30 +524,33 @@ contract FeeHook is HookBase {
     ) internal override returns (bytes4, int128) {
         PoolId id = key.toId();
         PoolConfig memory cfg = poolConfig[id];
-        if (!cfg.configured || cfg.feeBps == 0) return (IHooks.afterSwap.selector, 0);
+        if (!cfg.configured) return (IHooks.afterSwap.selector, 0);
 
         bool pairIsCurrency0 = Currency.unwrap(cfg.pairCurrency) == Currency.unwrap(key.currency0);
 
-        // The pool's delta on the pair currency. Negative = the POOL received pair currency,
-        // which is a buy of the launch token. That is the only leg we charge.
-        int128 pairDelta = pairIsCurrency0 ? delta.amount0() : delta.amount1();
-        if (pairDelta >= 0) return (IHooks.afterSwap.selector, 0);
-
-        // Only chargeable when the pair currency is the UNSPECIFIED side, because this return value
-        // can only adjust the unspecified currency. When the pair IS the specified side the swap is
-        // an exact-input buy and `_beforeSwap` already charged it - this guard is what stops the
+        // Only chargeable when the INPUT currency is the UNSPECIFIED side, because this return
+        // value can only adjust the unspecified currency. When the input is the specified side the
+        // swap is exact-input and `_beforeSwap` already charged it - this guard is what stops the
         // two legs double-charging the same trade.
         bool exactInput = params.amountSpecified < 0;
-        bool specifiedIsCurrency0 = exactInput == params.zeroForOne;
-        if (specifiedIsCurrency0 == pairIsCurrency0) return (IHooks.afterSwap.selector, 0);
+        if (exactInput) return (IHooks.afterSwap.selector, 0);
 
-        uint256 pairIn = uint256(uint128(-pairDelta));
-        uint256 fee = (pairIn * cfg.feeBps) / BPS;
+        // A buy pays the pair currency in.
+        bool isBuy = params.zeroForOne == pairIsCurrency0;
+        uint16 rate = isBuy ? cfg.feeBps : cfg.sellFeeBps;
+        if (rate == 0) return (IHooks.afterSwap.selector, 0);
+
+        // The pool's delta on the INPUT currency. Negative = the pool received it.
+        bool inputIsCurrency0 = params.zeroForOne;
+        int128 inDelta = inputIsCurrency0 ? delta.amount0() : delta.amount1();
+        if (inDelta >= 0) return (IHooks.afterSwap.selector, 0);
+
+        uint256 amountIn = uint256(uint128(-inDelta));
+        uint256 fee = (amountIn * rate) / BPS;
         if (fee == 0) return (IHooks.afterSwap.selector, 0);
 
-        // Claim the fee from the PoolManager, then return the matching delta. Skipping the claim
-        // here is what produces CurrencyNotSettled and bricks the pool.
-        _accrue(id, cfg, fee);
+        Currency feeCurrency = inputIsCurrency0 ? key.currency0 : key.currency1;
+        _accrue(id, feeCurrency, isBuy, fee);
 
         return (IHooks.afterSwap.selector, int128(uint128(fee)));
     }
@@ -488,12 +574,19 @@ contract FeeHook is HookBase {
     ///      The cost of this, stated plainly: fees are no longer delivered inside the swap. They
     ///      accrue exactly and are paid out on a sweep. Holders earn on every trade either way —
     ///      only the moment the tokens move changes.
-    function _accrue(PoolId id, PoolConfig memory cfg, uint256 fee) internal {
-        poolManager.mint(address(this), cfg.pairCurrency.toId(), fee);
+    function _accrue(PoolId id, Currency feeCurrency, bool isBuy, uint256 fee) internal {
+        poolManager.mint(address(this), feeCurrency.toId(), fee);
 
-        pendingFees[id] += fee;
-        totalFeesTaken[id] += fee;
-        emit FeeAccrued(id, fee, pendingFees[id]);
+        if (isBuy) {
+            pendingFees[id] += fee;
+            totalFeesTaken[id] += fee;
+        } else {
+            // A sell is charged in LAUNCH TOKENS. It is tracked separately because it has to be
+            // converted to the pair currency before holders can be paid in it, and that conversion
+            // is a swap - which cannot happen inside the swap that produced it.
+            pendingTokenFees[id] += fee;
+        }
+        emit FeeAccrued(id, feeCurrency, fee, isBuy);
     }
 
     /// @notice Redeem accrued claims for real tokens and pay the creator and the holders.
@@ -502,27 +595,106 @@ contract FeeHook is HookBase {
     ///      distributor or a paused pair currency can never revert somebody else's trade.
     function sweep(PoolKey calldata key) external returns (uint256 swept) {
         PoolId id = key.toId();
-        PoolConfig memory cfg = poolConfig[id];
-        if (!cfg.configured) revert NotConfigured();
+        if (!poolConfig[id].configured) revert NotConfigured();
 
-        swept = pendingFees[id];
-        if (swept == 0) return 0;
+        uint256 pairAmount = pendingFees[id];
+        uint256 tokenAmount = pendingTokenFees[id];
+        if (pairAmount == 0 && tokenAmount == 0) return 0;
+
         pendingFees[id] = 0;
+        pendingTokenFees[id] = 0;
 
-        poolManager.unlock(abi.encode(id, cfg, swept));
+        poolManager.unlock(abi.encode(key, pairAmount, tokenAmount));
+        return pairAmount;
     }
 
-    /// @dev The redemption, inside the manager's unlock cycle. `burn` turns the claim back into a
-    ///      credit and `take` converts that credit into ERC-20, so the two net to zero and the
-    ///      cycle settles.
+    /// @dev The redemption, inside the manager's unlock cycle. Three steps, in this order:
+    ///
+    ///        1. **Convert sell fees.** Launch tokens taken from sellers are swapped for the pair
+    ///           currency through the token's own pool. `Hooks.noSelfCall` means the PoolManager
+    ///           skips this hook's callbacks when the hook itself is the caller, so this internal
+    ///           swap is not charged a fee and cannot recurse.
+    ///        2. **Buy back and burn.** `burnBps` of the total buys the launch token from its own
+    ///           pool and sends it to the dead address.
+    ///        3. **Route the rest** to the creator and the holders.
+    ///
+    ///      `burn` turns a claim back into a credit and `take` converts that credit into ERC-20,
+    ///      so every delta opened here is closed before the cycle ends.
     function unlockCallback(bytes calldata raw) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
-        (PoolId id, PoolConfig memory cfg, uint256 amount) =
-            abi.decode(raw, (PoolId, PoolConfig, uint256));
+        (PoolKey memory key, uint256 pairAmount, uint256 tokenAmount) =
+            abi.decode(raw, (PoolKey, uint256, uint256));
 
-        poolManager.burn(address(this), cfg.pairCurrency.toId(), amount);
-        poolManager.take(cfg.pairCurrency, address(this), amount);
-        _routeFee(id, cfg, amount);
+        PoolId id = key.toId();
+        PoolConfig memory cfg = poolConfig[id];
+        bool pairIsCurrency0 = Currency.unwrap(cfg.pairCurrency) == Currency.unwrap(key.currency0);
+        Currency tokenCurrency = pairIsCurrency0 ? key.currency1 : key.currency0;
+
+        // ORDER MATTERS. A claim is not a credit: `burn` is what converts one into the other, and
+        // a swap can only spend a credit. Burning every claim FIRST, then swapping, then taking
+        // what is left is the only sequence where each delta is opened after it can be covered.
+        // Doing the buyback before burning its claim opens a pair debt nothing pays, which is
+        // exactly the `CurrencyNotSettled` this ordering exists to avoid.
+
+        // 1. Redeem the pair-currency claims into a credit.
+        if (pairAmount != 0) {
+            poolManager.burn(address(this), cfg.pairCurrency.toId(), pairAmount);
+        }
+
+        // 2. Sell fees arrived in launch tokens. Redeem them and swap them for the pair currency,
+        //    which lands as more pair credit. `Hooks.noSelfCall` means the manager skips this
+        //    hook's own callbacks here, so this internal swap is untaxed and cannot recurse.
+        uint256 totalPair = pairAmount;
+        if (tokenAmount != 0) {
+            poolManager.burn(address(this), tokenCurrency.toId(), tokenAmount);
+            BalanceDelta d = poolManager.swap(
+                key,
+                SwapParams({
+                    // Selling the launch token: pay token in, receive pair out.
+                    zeroForOne: !pairIsCurrency0,
+                    amountSpecified: -int256(tokenAmount),
+                    sqrtPriceLimitX96: !pairIsCurrency0
+                        ? TickMath.MIN_SQRT_PRICE + 1
+                        : TickMath.MAX_SQRT_PRICE - 1
+                }),
+                ""
+            );
+            int128 gained = pairIsCurrency0 ? d.amount0() : d.amount1();
+            if (gained > 0) totalPair += uint256(uint128(gained));
+        }
+
+        if (totalPair == 0) return "";
+
+        // 3. Buy the launch token back with a share of that credit and destroy it.
+        uint256 toBurn = (totalPair * cfg.burnBps) / BPS;
+        if (toBurn != 0) {
+            totalPair -= toBurn;
+            BalanceDelta d = poolManager.swap(
+                key,
+                SwapParams({
+                    // Buying the launch token: pay pair in, receive token out.
+                    zeroForOne: pairIsCurrency0,
+                    amountSpecified: -int256(toBurn),
+                    sqrtPriceLimitX96: pairIsCurrency0
+                        ? TickMath.MIN_SQRT_PRICE + 1
+                        : TickMath.MAX_SQRT_PRICE - 1
+                }),
+                ""
+            );
+            int128 bought = pairIsCurrency0 ? d.amount1() : d.amount0();
+            if (bought > 0) {
+                uint256 burned = uint256(uint128(bought));
+                poolManager.take(tokenCurrency, DEAD, burned);
+                totalBurned[id] += burned;
+                emit Burned(id, toBurn, burned);
+            }
+        }
+
+        // 4. Whatever credit remains becomes real ERC-20 and is paid out.
+        if (totalPair != 0) {
+            poolManager.take(cfg.pairCurrency, address(this), totalPair);
+            _routeFee(id, cfg, totalPair);
+        }
 
         return "";
     }

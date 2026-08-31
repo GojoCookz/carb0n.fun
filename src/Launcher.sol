@@ -108,6 +108,8 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         uint256 openingMarketCap;
         uint256 graduationThreshold;
         uint16 feeBps;
+        uint16 sellFeeBps;
+        uint16 burnBps;
         uint16 creatorBps;
         uint16 maxWalletBps;
         int24 tickSpacing;
@@ -184,27 +186,11 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     /// @notice Create a token, open its pool, seed it, and lock the liquidity. One transaction.
     /// @dev The caller supplies NO opening liquidity. They must approve this contract for
     ///      `devBuyPairAmount` of `pair` only, and for nothing at all if they skip the dev buy.
-    function launch(LaunchParams calldata p) external nonReentrant returns (address token, PoolId poolId) {
+    function launch(LaunchParams memory p) external nonReentrant returns (address token, PoolId poolId) {
         _validate(p);
 
         // 1. Clone and initialise the token. All supply is minted here, to be seeded immediately.
-        token = Clones.cloneDeterministic(tokenImplementation, p.salt);
-        LaunchToken(token)
-            .initialize(
-                LaunchToken.InitParams({
-                    name_: p.name,
-                    symbol_: p.symbol,
-                    supply: p.supply,
-                    recipient: address(this),
-                    payoutToken: p.pair,
-                    controller: address(feeHook),
-                    poolManager_: address(poolManager),
-                    maxWallet_: p.maxWalletBps == 0 ? 0 : (p.supply * p.maxWalletBps) / BPS,
-                    minPushPayout: p.minPushPayout,
-                    minShareForQueue: p.minShareForQueue,
-                    metadata: p.metadata
-                })
-            );
+        token = _cloneAndInit(p);
 
         // 2. Pull ONLY the dev buy, if there is one.
         //
@@ -237,19 +223,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
 
         // 4. Configure the hook BEFORE initialising the pool. `FeeHook.beforeInitialize` reverts on
         //    an unconfigured pool, which is what stops strangers attaching pools to our hook.
-        feeHook.configurePool(
-            key,
-            address(LaunchToken(token).distributor()),
-            Currency.wrap(p.pair),
-            p.feeBps,
-            msg.sender,
-            p.creatorBps
-        );
-
-        // Graduation is a separate call rather than two more arguments on `configurePool`, so the
-        // signature of the function that governs every fee this pool will ever charge stays exactly
-        // as it was. A maturity notification has no business widening that surface.
-        feeHook.configureGraduation(key, p.graduationThreshold, p.supply);
+        _configureHook(key, p, token);
 
         // 5. Snap the opening price to a tick the pool can actually hold a position at, then open
         //    there. Snapping BEFORE initialising is what removes the dead zone: if we opened at
@@ -288,7 +262,51 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         emit Launched(token, msg.sender, p.pair, poolId, p.supply, p.openingMarketCap, p.feeBps);
     }
 
-    function _validate(LaunchParams calldata p) internal view {
+    /// @dev Clone and initialise the token. Lifted out of `launch` for stack room: the init struct
+    ///      alone is eleven fields, and holding it alongside the pool key and the launch params
+    ///      pushes the frame past what via-ir can allocate.
+    function _cloneAndInit(LaunchParams memory p) internal returns (address token) {
+        token = Clones.cloneDeterministic(tokenImplementation, p.salt);
+        LaunchToken(token).initialize(
+            LaunchToken.InitParams({
+                name_: p.name,
+                symbol_: p.symbol,
+                supply: p.supply,
+                recipient: address(this),
+                payoutToken: p.pair,
+                controller: address(feeHook),
+                poolManager_: address(poolManager),
+                maxWallet_: p.maxWalletBps == 0 ? 0 : (p.supply * p.maxWalletBps) / BPS,
+                minPushPayout: p.minPushPayout,
+                minShareForQueue: p.minShareForQueue,
+                metadata: p.metadata
+            })
+        );
+    }
+
+    /// @dev Both hook registrations, lifted out of `launch` purely for stack room. `LaunchParams`
+    ///      is 17 fields and `launch` already holds the key, the token, the ordering flag and the
+    ///      dev buy; inlining these two calls pushes it past what even via-ir can allocate.
+    function _configureHook(PoolKey memory key, LaunchParams memory p, address token) internal {
+        feeHook.configurePoolFull(
+            key,
+            FeeHook.FeeSetup({
+                distributor: address(LaunchToken(token).distributor()),
+                pairCurrency: Currency.wrap(p.pair),
+                feeBps: p.feeBps,
+                sellFeeBps: p.sellFeeBps,
+                burnBps: p.burnBps,
+                creator: msg.sender,
+                creatorBps: p.creatorBps
+            })
+        );
+
+        // Separate from the fee config so the signature governing every fee this pool will ever
+        // charge is not widened by a maturity notification.
+        feeHook.configureGraduation(key, p.graduationThreshold, p.supply);
+    }
+
+    function _validate(LaunchParams memory p) internal view {
         if (!pairRegistry.isApproved(p.pair)) revert PairNotApproved(p.pair);
         // Image is required, banner is not. A token with no image is unlistable; a token with no
         // banner renders a fallback.

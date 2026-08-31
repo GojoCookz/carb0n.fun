@@ -81,6 +81,16 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
     /// @notice Set by the concrete subclass. Decides which side of the pool the launch token is on.
     function _tokenIsCurrency0() internal pure virtual returns (bool);
 
+    /// @notice Sells are free by default, which is what every existing test below assumes.
+    function _sellFeeBps() internal pure virtual returns (uint16) {
+        return 0;
+    }
+
+    /// @notice No buyback by default.
+    function _burnBps() internal pure virtual returns (uint16) {
+        return 0;
+    }
+
     /// @dev Buying the launch token means paying the PAIR currency and receiving the token.
     ///      `zeroForOne` therefore depends entirely on which side the token sorted onto.
     function _buyIsZeroForOne() internal pure returns (bool) {
@@ -121,7 +131,18 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         });
         poolId = key.toId();
 
-        hook.configurePool(key, address(dist), Currency.wrap(address(pair)), FEE_BPS, creator, CREATOR_BPS);
+        hook.configurePoolFull(
+            key,
+            FeeHook.FeeSetup({
+                distributor: address(dist),
+                pairCurrency: Currency.wrap(address(pair)),
+                feeBps: FEE_BPS,
+                sellFeeBps: _sellFeeBps(),
+                burnBps: _burnBps(),
+                creator: creator,
+                creatorBps: CREATOR_BPS
+            })
+        );
         manager.initialize(key, TickMath.getSqrtPriceAtTick(0));
 
         _seedLiquidity();
@@ -524,7 +545,13 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         uint256 creatorGot = pair.balanceOf(creator) - creatorBefore;
 
         assertGt(total, 0, "fee must have been taken at all");
-        assertApproxEqAbs(creatorGot, (total * CREATOR_BPS) / 10_000, 1, "creator gets exactly its bps");
+
+        // The burn wedge is spent BEFORE the creator/holder split, so the creator's share is a
+        // share of what survives it. With no burn armed this is just `total`.
+        uint256 afterBurn = (total * (10_000 - _burnBps())) / 10_000;
+        assertApproxEqAbs(
+            creatorGot, (afterBurn * CREATOR_BPS) / 10_000, 2, "creator gets exactly its bps"
+        );
     }
 
     /// @dev The hook is a conduit, not a treasury. Anything it retains is stranded forever - it has
@@ -652,5 +679,114 @@ contract FeeHookTokenIsCurrency1Test is FeeHookHarness {
     function test_orientationIsWhatThisSuiteClaims() public view {
         assertEq(Currency.unwrap(key.currency0), address(pair));
         assertEq(Currency.unwrap(key.currency1), address(token));
+    }
+}
+
+/// @notice The same world, but with a SELL TAX and a BUYBACK-AND-BURN wedge armed.
+///
+/// @dev These are the two features single-sided seeding unlocked. A sell pays launch tokens in, so
+///      its fee cannot be taken in the pair currency - there is none coming in. It is taken in the
+///      token instead and converted during `sweep`, which is only possible because `sweep` runs
+///      outside the swap. The burn wedge then spends a share of the swept pair currency buying the
+///      token back from its own pool and destroying it.
+abstract contract FeeHookWedgeHarness is FeeHookHarness {
+    function _sellFeeBps() internal pure override returns (uint16) {
+        return 500; // 5% on the way out
+    }
+
+    function _burnBps() internal pure override returns (uint16) {
+        return 2000; // 20% of every swept fee buys back and burns
+    }
+
+    function test_sellIsChargedInTheLaunchToken() public {
+        _buyExactIn(alice, 10e18);
+        uint256 held = token.balanceOf(alice);
+
+        vm.prank(alice);
+        token.approve(address(swapRouter), type(uint256).max);
+
+        uint256 pendingBefore = hook.pendingTokenFees(poolId);
+        vm.prank(alice);
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: !_buyIsZeroForOne(),
+                amountSpecified: -int256(held / 2),
+                sqrtPriceLimitX96: !_buyIsZeroForOne()
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        assertEq(
+            hook.pendingTokenFees(poolId) - pendingBefore,
+            ((held / 2) * 500) / 10_000,
+            "the sell fee is exactly 5% of the tokens sold, in tokens"
+        );
+    }
+
+    /// @dev The conversion. Tokens taken from sellers come out the other side as pair currency in
+    ///      the holders' ledger - which is the whole promise of paying dividends in the pair.
+    function test_sellTaxBecomesPairCurrencyForHolders() public {
+        _buyExactIn(alice, 20e18);
+        _giveTokens(bob, 1_000_000e18); // a holder who is owed the proceeds
+
+        uint256 held = token.balanceOf(alice);
+        vm.prank(alice);
+        token.approve(address(swapRouter), type(uint256).max);
+        vm.prank(alice);
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: !_buyIsZeroForOne(),
+                amountSpecified: -int256(held / 2),
+                sqrtPriceLimitX96: !_buyIsZeroForOne()
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        assertGt(hook.pendingTokenFees(poolId), 0, "charged in tokens");
+        uint256 ledgerBefore = pair.balanceOf(address(dist));
+
+        hook.sweep(key);
+
+        assertEq(hook.pendingTokenFees(poolId), 0, "token claim converted");
+        assertGt(
+            pair.balanceOf(address(dist)),
+            ledgerBefore,
+            "and it arrived as PAIR currency, not as more of the token"
+        );
+    }
+
+    /// @dev The burn wedge. Supply only ever goes down, and the tokens land at the dead address
+    ///      rather than being held by anyone.
+    function test_burnWedgeBuysBackAndDestroys() public {
+        uint256 deadBefore = token.balanceOf(address(0xdEaD));
+
+        _buyExactIn(alice, 20e18); // _swap sweeps, so the burn runs inside this call
+
+        assertGt(hook.totalBurned(poolId), 0, "a buyback happened");
+        assertEq(
+            token.balanceOf(address(0xdEaD)) - deadBefore,
+            hook.totalBurned(poolId),
+            "every burned token is at the dead address"
+        );
+    }
+}
+
+contract FeeHookWedgeTokenIsCurrency0Test is FeeHookWedgeHarness {
+    function _tokenIsCurrency0() internal pure override returns (bool) {
+        return true;
+    }
+}
+
+contract FeeHookWedgeTokenIsCurrency1Test is FeeHookWedgeHarness {
+    function _tokenIsCurrency0() internal pure override returns (bool) {
+        return false;
     }
 }

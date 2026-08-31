@@ -94,3 +94,4 @@ sepolia_public = "https://ethereum-sepolia-rpc.publicnode.com"
 # Etherscan V2 uses ONE key across all chains, keyed by chainid.
 mainnet = {key = "${ETHERSCAN_API_KEY}", chain = 1}
 sepolia = {key = "${ETHERSCAN_API_KEY}", chain = 11155111}
+

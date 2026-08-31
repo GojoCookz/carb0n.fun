@@ -161,6 +161,8 @@ contract LauncherForkTest is Test {
             openingMarketCap: OPENING_MCAP,
             graduationThreshold: GRADUATION_THRESHOLD,
             feeBps: 300,
+            sellFeeBps: 0,
+            burnBps: 0,
             creatorBps: 2000,
             maxWalletBps: 200,
             tickSpacing: 60,

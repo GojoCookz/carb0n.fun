@@ -97,6 +97,8 @@ contract LauncherTest is Test {
             // 5x the opening market cap. `pairSeed` IS the opening market cap in pair units.
             graduationThreshold: OPENING_MCAP * 5,
             feeBps: 300,
+            sellFeeBps: 0,
+            burnBps: 0,
             creatorBps: 2000,
             maxWalletBps: 200, // 2%
             tickSpacing: 60,
