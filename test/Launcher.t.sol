@@ -99,6 +99,8 @@ contract LauncherTest is Test {
             feeBps: 300,
             sellFeeBps: 0,
             burnBps: 0,
+            vestDuration: 0,
+            vestCliff: 0,
             creatorBps: 2000,
             maxWalletBps: 200, // 2%
             tickSpacing: 60,

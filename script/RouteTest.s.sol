@@ -109,6 +109,8 @@ contract RouteTest is Script {
                 feeBps: 300,
                 sellFeeBps: 500,
                 burnBps: 2000,
+                vestDuration: 0,
+                vestCliff: 0,
                 creatorBps: 2000,
                 maxWalletBps: 0,
                 tickSpacing: SPACING,

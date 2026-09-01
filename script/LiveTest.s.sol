@@ -85,7 +85,9 @@ contract LiveTest is Script {
                 graduationThreshold: THRESHOLD,
                 feeBps: 300, // 3% buys
                 sellFeeBps: 500, // 5% sells
-                burnBps: 2000, // 20% of each swept fee is burned
+                burnBps: 2000,
+                vestDuration: 0,
+                vestCliff: 0, // 20% of each swept fee is burned
                 creatorBps: 2000,
                 maxWalletBps: 0,
                 tickSpacing: 60,

@@ -125,6 +125,8 @@ abstract contract GraduationHarness is Test {
             feeBps: 300,
             sellFeeBps: 0,
             burnBps: 0,
+            vestDuration: 0,
+            vestCliff: 0,
             creatorBps: 2000,
             // Disabled. Reaching a graduation threshold means buying a large slice of the float,
             // and a max-wallet cap would make every test here a max-wallet test instead.

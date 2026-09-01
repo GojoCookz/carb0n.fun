@@ -23,6 +23,7 @@ import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol"
 
 import {FeeHook} from "./FeeHook.sol";
 import {LaunchToken} from "./LaunchToken.sol";
+import {VestingVault} from "./VestingVault.sol";
 import {PairRegistry} from "./PairRegistry.sol";
 import {LaunchMetadata} from "./types/LaunchMetadata.sol";
 
@@ -69,6 +70,9 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     /// @notice Smallest max-wallet cap a launch may set, as a share of supply.
     /// @dev Below this the cap stops being anti-whale and becomes a transfer blocker.
     uint16 public constant MIN_MAX_WALLET_BPS = 10; // 0.1%
+    /// @notice Shortest dev-buy vest the launcher will accept. Matches VestingVault.MIN_DURATION;
+    ///         anything briefer is theatre rather than a lock.
+    uint64 public constant MIN_VEST_DURATION = 7 days;
     uint16 public constant BPS = 10_000;
 
     /// @notice Full-range positions use the widest ticks the spacing allows.
@@ -110,6 +114,14 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         uint16 feeBps;
         uint16 sellFeeBps;
         uint16 burnBps;
+
+        /// @dev Seconds the dev buy vests over. ZERO routes it straight to the creator's wallet
+        ///      and keeps the 10% cap. Non-zero routes it into a vault and REMOVES the cap: the
+        ///      schedule, published on chain in this transaction, replaces the cap as the thing
+        ///      protecting buyers.
+        uint64 vestDuration;
+        /// @dev Seconds before anything unlocks at all. Must not exceed the duration.
+        uint64 vestCliff;
         uint16 creatorBps;
         uint16 maxWalletBps;
         int24 tickSpacing;
@@ -132,6 +144,10 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         uint256 devBuyPairAmount;
         address creator;
         bool tokenIsCurrency0;
+
+        uint64 vestCliff;
+
+        uint64 vestDuration;
     }
 
     struct LaunchRecord {
@@ -145,6 +161,10 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     LaunchRecord[] public launches;
     /// @notice token address => 1-based index into `launches`. Zero means "not ours".
     mapping(address token => uint256) public launchIndexPlusOne;
+    /// @notice token => its vesting vault, or `address(0)` if the dev buy was not vested.
+    /// @dev The public answer to "did the creator lock anything". Zero is a real answer, not a
+    ///      missing one, which is why the absence of a lock must be as visible as its presence.
+    mapping(address token => address) public vaultOf;
 
     event Launched(
         address indexed token,
@@ -156,6 +176,34 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         uint16 feeBps
     );
 
+    /// @notice A dev buy was locked. Emitted in the LAUNCH transaction, which is the whole point -
+
+
+    ///         the schedule is public from the block the token exists.
+
+
+    event VaultCreated(
+
+
+        address indexed token,
+
+
+        address indexed vault,
+
+
+        address indexed beneficiary,
+
+
+        uint64 vestCliff,
+
+
+        uint64 vestDuration
+
+
+    );
+
+
+
     error PairNotApproved(address pair);
     error ImageRequired();
     error SupplyTooLow();
@@ -163,6 +211,9 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     error DevBuyTooLarge(uint256 given, uint256 cap);
     error MaxWalletTooSmall(uint16 given);
     error GraduationThresholdTooLow(uint256 given, uint256 openingMarketCap);
+    error VestRequiresDevBuy();
+    error VestTooShort(uint64 given);
+    error VestCliffExceedsDuration();
     error OnlyPoolManager();
     error LauncherRetainedFunds();
     error OpeningPriceOutOfRange();
@@ -225,6 +276,17 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         //    an unconfigured pool, which is what stops strangers attaching pools to our hook.
         _configureHook(key, p, token);
 
+        // Create the vault BEFORE the unlock cycle, so the dev buy inside it has somewhere to go
+        // and the schedule is announced in this same transaction. A buyer reading the launch can
+        // therefore see the lock before the token has ever traded.
+        if (p.vestDuration != 0) {
+            VestingVault vault = new VestingVault(
+                token, address(LaunchToken(token).distributor()), msg.sender
+            );
+            vaultOf[token] = address(vault);
+            emit VaultCreated(token, address(vault), msg.sender, p.vestCliff, p.vestDuration);
+        }
+
         // 5. Snap the opening price to a tick the pool can actually hold a position at, then open
         //    there. Snapping BEFORE initialising is what removes the dead zone: if we opened at
         //    the raw price and started the position at the next aligned tick, the first buyer
@@ -242,7 +304,9 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
                     openingTick: openingTick,
                     devBuyPairAmount: devBuy,
                     creator: msg.sender,
-                    tokenIsCurrency0: tokenIsCurrency0
+                    tokenIsCurrency0: tokenIsCurrency0,
+                    vestCliff: p.vestCliff,
+                    vestDuration: p.vestDuration
                 })
             )
         );
@@ -326,11 +390,26 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
             revert GraduationThresholdTooLow(p.graduationThreshold, p.openingMarketCap);
         }
 
-        // The dev buy is bounded by the OPENING MARKET CAP now that there is no seed to measure
-        // against. Buying 10% of the opening cap moves the price about 23% on a single-sided
-        // book, which is a real position without being the whole float.
-        uint256 devCap = (p.openingMarketCap * MAX_DEV_BUY_BPS) / BPS;
-        if (p.devBuyPairAmount > devCap) revert DevBuyTooLarge(p.devBuyPairAmount, devCap);
+        // THE DEV BUY CAP APPLIES ONLY TO THE UNVESTED PATH.
+        //
+        // Tokens paid straight to the creator's wallet are capped at 10% of the opening market
+        // cap, because an undisclosed position that size can be dumped the minute trading opens
+        // and buyers have no way to see it coming.
+        //
+        // A vested dev buy is UNCAPPED. The cap and the vault protect against the same thing by
+        // different means: the cap limits how much can be dumped, the vault makes the size and
+        // the schedule public in this very transaction and forbids ever shortening it. A creator
+        // holding 30% on a published 365-day linear release is a different proposition from one
+        // holding 30% nobody was told about. `VestRequiresDevBuy` stops a vest being requested
+        // with nothing to put in it.
+        if (p.vestDuration == 0) {
+            uint256 devCap = (p.openingMarketCap * MAX_DEV_BUY_BPS) / BPS;
+            if (p.devBuyPairAmount > devCap) revert DevBuyTooLarge(p.devBuyPairAmount, devCap);
+        } else {
+            if (p.devBuyPairAmount == 0) revert VestRequiresDevBuy();
+            if (p.vestDuration < MIN_VEST_DURATION) revert VestTooShort(p.vestDuration);
+            if (p.vestCliff > p.vestDuration) revert VestCliffExceedsDuration();
+        }
         // `feeBps` and `creatorBps` are validated by `FeeHook.configurePool`, which owns those caps.
     }
 
@@ -473,10 +552,21 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         _settleDelta(d.key.currency0, delta.amount0());
         _settleDelta(d.key.currency1, delta.amount1());
 
-        // Hand the creator their tokens. They are subject to the same max-wallet cap as anyone -
-        // the launcher is exempt, the creator is not.
+        // Hand over the tokens. Straight to the creator, or into a vault they cannot empty early.
+        // Either way they are subject to the same max-wallet cap as anyone - the launcher is
+        // exempt, the creator is not.
         uint256 bought = IERC20(d.token).balanceOf(address(this));
-        if (bought != 0) IERC20(d.token).safeTransfer(d.creator, bought);
+        if (bought == 0) return;
+
+        address vault = vaultOf[d.token];
+        if (vault == address(0)) {
+            IERC20(d.token).safeTransfer(d.creator, bought);
+        } else {
+            IERC20(d.token).safeTransfer(vault, bought);
+            VestingVault(vault).addSchedule(
+                uint128(bought), uint64(block.timestamp), d.vestCliff, d.vestDuration
+            );
+        }
     }
 
     /// @dev Positive delta = the manager owes us, so take it. Negative = we owe, so settle it.
