@@ -125,6 +125,12 @@ contract FeeHook is HookBase {
     ///         so burned tokens never accrue dividends to nobody.
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
+    /// @notice Paid to whoever calls `sweep`, out of the amount swept. 0.5%.
+    /// @dev Sweeping costs gas and benefits holders rather than the caller, so without a bounty
+    ///      the job depends on altruism and simply does not get done. This makes it a job a bot
+    ///      takes the moment it clears their gas, which is what turns accrual into payment.
+    uint16 public constant SWEEP_BOUNTY_BPS = 50;
+
     /// @notice The only address allowed to register a pool config. Set once at deploy.
     address public immutable launcher;
 
@@ -137,6 +143,9 @@ contract FeeHook is HookBase {
     mapping(PoolId => uint256) public pendingTokenFees;
     /// @notice Launch tokens bought back and burned per pool. Diagnostics only.
     mapping(PoolId => uint256) public totalBurned;
+    /// @notice Pair-currency backlog at which a swap will opportunistically pay holders.
+    ///         Zero disables the automatic path entirely, leaving only `sweep`.
+    mapping(PoolId => uint256) public autoSweepThreshold;
     /// @notice Graduation threshold and latch, per pool.
     /// @dev A SEPARATE mapping from `poolConfig` on purpose. `_beforeSwap` and `_afterSwap` load
     ///      `poolConfig` into memory on every single trade; folding three more words into that
@@ -157,6 +166,10 @@ contract FeeHook is HookBase {
     event FeeAccrued(PoolId indexed poolId, Currency currency, uint256 amount, bool isBuy);
     /// @notice Launch tokens bought back from the pool and destroyed, during a sweep.
     event Burned(PoolId indexed poolId, uint256 pairSpent, uint256 tokensBurned);
+    /// @notice An automatic sweep was attempted and failed. The claim stays queued for `sweep`.
+    event AutoSweepSkipped(PoolId indexed poolId, uint256 pending);
+    /// @notice Paid to whoever called `sweep`, out of what they swept.
+    event SweepBounty(PoolId indexed poolId, address indexed caller, uint256 amount);
     /// @notice Redeemed and paid out. Emitted on `sweep`, not on the trade that earned it.
     event FeeTaken(PoolId indexed poolId, uint256 total, uint256 toHolders, uint256 toCreator);
     event GraduationConfigured(
@@ -340,6 +353,12 @@ contract FeeHook is HookBase {
         });
 
         emit GraduationConfigured(id, token, threshold, supply);
+
+        // Auto-sweep once the backlog reaches 0.1% of the graduation bar. Tied to the threshold
+        // rather than to a constant because the right number is entirely relative to the pool: a
+        // fixed figure is dust on a large launch and unreachable on a small one. A launch that
+        // never crosses it still gets paid - `sweep` is always available and pays a bounty.
+        autoSweepThreshold[id] = threshold / 1000;
     }
 
     /// @notice Latch a pool as graduated if its market cap has reached the threshold.
@@ -552,7 +571,61 @@ contract FeeHook is HookBase {
         Currency feeCurrency = inputIsCurrency0 ? key.currency0 : key.currency1;
         _accrue(id, feeCurrency, isBuy, fee);
 
+        _tryAutoSweep(id, key, cfg);
+
         return (IHooks.afterSwap.selector, int128(uint128(fee)));
+    }
+
+    /// @dev Opportunistic payout, attempted once the pair-currency backlog is worth the gas.
+    ///
+    ///      **It can never revert the trade.** The whole attempt is a self-call inside
+    ///      `try/catch`, so a paused pair currency, a blocklisted distributor or a hostile creator
+    ///      makes the sweep a no-op and the swap continues. That isolation is the entire reason
+    ///      this is an external self-call rather than an internal one - Trail of Bits' rule is to
+    ///      keep non-essential code out of the user's flow, and a dividend is non-essential to
+    ///      somebody else's swap.
+    ///
+    ///      It deliberately handles ONLY the pair-currency claims. Converting sell fees and
+    ///      running the buyback both need a swap, and swapping the same pool from inside its own
+    ///      `afterSwap` re-enters a pool whose state is mid-update. Those stay on the manual path.
+    function _tryAutoSweep(PoolId id, PoolKey calldata key, PoolConfig memory cfg) internal {
+        uint256 threshold = autoSweepThreshold[id];
+        if (threshold == 0 || pendingFees[id] < threshold) return;
+
+        try this.autoRedeem(id, key, cfg) {}
+        catch {
+            // Left pending on purpose. `sweep` will collect it later and the trade is unaffected.
+            emit AutoSweepSkipped(id, pendingFees[id]);
+        }
+    }
+
+    /// @dev The auto path's body. External so the `try/catch` above gets a real revert boundary,
+    ///      and gated to this contract so nobody else can drive it.
+    function autoRedeem(PoolId id, PoolKey calldata key, PoolConfig memory cfg) external {
+        if (msg.sender != address(this)) revert NotPoolManager();
+
+        uint256 amount = pendingFees[id];
+        if (amount == 0) return;
+
+        // RESERVE THE BURN SHARE. The buyback needs a swap and the auto path cannot swap, so if
+        // this paid out the whole balance the burn wedge would silently never fire on any pool
+        // busy enough for auto-sweep to handle its volume - the wedge would look armed and do
+        // nothing. The burn share stays queued as a claim for the next manual `sweep` to spend.
+        uint256 reservedForBurn = (amount * cfg.burnBps) / BPS;
+        uint256 payout = amount - reservedForBurn;
+        pendingFees[id] = reservedForBurn;
+        if (payout == 0) return;
+
+        // We are already inside the manager's unlock cycle here, so this must NOT call `unlock`
+        // again - `burn` and `take` go direct. `take` draws on reserves earlier trades already
+        // settled; if the singleton is short, the catch above puts the claim back in the queue.
+        poolManager.burn(address(this), cfg.pairCurrency.toId(), payout);
+        poolManager.take(cfg.pairCurrency, address(this), payout);
+        _routeFee(id, cfg, payout);
+
+        // `key` is unused beyond identifying the pool, but taking it keeps this signature aligned
+        // with `sweep` so the two paths are obviously the same operation.
+        key;
     }
 
     /// @notice Take the fee as an ERC-6909 claim and record it. Shared by both charging legs so
@@ -604,7 +677,7 @@ contract FeeHook is HookBase {
         pendingFees[id] = 0;
         pendingTokenFees[id] = 0;
 
-        poolManager.unlock(abi.encode(key, pairAmount, tokenAmount));
+        poolManager.unlock(abi.encode(key, pairAmount, tokenAmount, msg.sender));
         return pairAmount;
     }
 
@@ -622,8 +695,8 @@ contract FeeHook is HookBase {
     ///      so every delta opened here is closed before the cycle ends.
     function unlockCallback(bytes calldata raw) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
-        (PoolKey memory key, uint256 pairAmount, uint256 tokenAmount) =
-            abi.decode(raw, (PoolKey, uint256, uint256));
+        (PoolKey memory key, uint256 pairAmount, uint256 tokenAmount, address sweepCaller) =
+            abi.decode(raw, (PoolKey, uint256, uint256, address));
 
         PoolId id = key.toId();
         PoolConfig memory cfg = poolConfig[id];
@@ -690,10 +763,23 @@ contract FeeHook is HookBase {
             }
         }
 
-        // 4. Whatever credit remains becomes real ERC-20 and is paid out.
+        // 4. Whatever credit remains becomes real ERC-20, pays the caller their bounty, and the
+        //    rest goes to the creator and the holders.
         if (totalPair != 0) {
             poolManager.take(cfg.pairCurrency, address(this), totalPair);
-            _routeFee(id, cfg, totalPair);
+
+            uint256 bounty = (totalPair * SWEEP_BOUNTY_BPS) / BPS;
+            if (bounty != 0 && sweepCaller != address(0)) {
+                totalPair -= bounty;
+                // Raw send: a caller that cannot receive must not strand everyone else's payout.
+                if (_trySend(Currency.unwrap(cfg.pairCurrency), sweepCaller, bounty)) {
+                    emit SweepBounty(id, sweepCaller, bounty);
+                } else {
+                    totalPair += bounty;
+                }
+            }
+
+            if (totalPair != 0) _routeFee(id, cfg, totalPair);
         }
 
         return "";

@@ -143,6 +143,11 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
                 creatorBps: CREATOR_BPS
             })
         );
+        // A real launch always registers graduation alongside the fee, and that is where the
+        // auto-sweep threshold is armed. Configuring only the fee here left this harness in a
+        // state `Launcher` can never produce, which is how the auto path went untested.
+        hook.configureGraduation(key, 1_000_000e18, SUPPLY);
+
         manager.initialize(key, TickMath.getSqrtPriceAtTick(0));
 
         _seedLiquidity();
@@ -232,6 +237,74 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         );
         hook.sweep(key);
         return delta;
+    }
+
+    /// @dev The bounty is what makes sweeping a job somebody takes rather than a favour. It comes
+    ///      out of the swept amount, before the creator/holder split, and it goes to whoever
+    ///      called - which is deliberately allowed to be a complete stranger.
+    function test_sweepPaysItsCallerABounty() public {
+        vm.prank(alice);
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: _buyIsZeroForOne(),
+                amountSpecified: -5e18,
+                sqrtPriceLimitX96: _buyIsZeroForOne()
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        uint256 pending = hook.pendingFees(poolId);
+        assertGt(pending, 0, "nothing to sweep");
+
+        // Bob holds no position and did not trade. He should still be paid for doing the work.
+        uint256 bobBefore = pair.balanceOf(bob);
+        vm.prank(bob);
+        hook.sweep(key);
+
+        // The burn wedge is spent first, so the bounty is a share of what survives it.
+        uint256 afterBurn = (pending * (10_000 - _burnBps())) / 10_000;
+        assertApproxEqAbs(
+            pair.balanceOf(bob) - bobBefore,
+            (afterBurn * hook.SWEEP_BOUNTY_BPS()) / 10_000,
+            2,
+            "caller was not paid exactly the bounty"
+        );
+    }
+
+    /// @dev The automatic path. Once the backlog clears the threshold a trade pays holders on its
+    ///      way through, with nobody having to call anything.
+    function test_autoSweepFiresOnceTheBacklogIsWorthIt() public {
+        assertGt(hook.autoSweepThreshold(poolId), 0, "auto sweep must be armed at launch");
+
+        // Manual first buy, so the backlog exists without the harness sweeping it away.
+        vm.prank(alice);
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: _buyIsZeroForOne(),
+                amountSpecified: -int256(hook.autoSweepThreshold(poolId) * 500),
+                sqrtPriceLimitX96: _buyIsZeroForOne()
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        // An exact-OUTPUT buy runs the afterSwap leg, which is where the auto path is attempted.
+        uint256 ledgerBefore = pair.balanceOf(address(dist));
+        _giveTokens(bob, 1_000_000e18);
+        _buyExactOut(alice, 100_000e18);
+
+        assertGt(
+            pair.balanceOf(address(dist)),
+            ledgerBefore,
+            "holders were not paid without anyone calling sweep"
+        );
     }
 
     /// @dev The behaviour change made explicit: a trade charges the fee immediately, but the value
@@ -543,14 +616,25 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
 
         uint256 total = hook.totalFeesTaken(poolId);
         uint256 creatorGot = pair.balanceOf(creator) - creatorBefore;
+        uint256 holdersGot = pair.balanceOf(address(dist));
 
         assertGt(total, 0, "fee must have been taken at all");
+        assertGt(creatorGot, 0, "creator was paid nothing");
 
-        // The burn wedge is spent BEFORE the creator/holder split, so the creator's share is a
-        // share of what survives it. With no burn armed this is just `total`.
-        uint256 afterBurn = (total * (10_000 - _burnBps())) / 10_000;
-        assertApproxEqAbs(
-            creatorGot, (afterBurn * CREATOR_BPS) / 10_000, 2, "creator gets exactly its bps"
+        // Assert the SPLIT, not a reconstructed absolute. Three things now come off a fee before
+        // it is divided - the burn wedge, the sweep bounty, and a burn share reserved by an
+        // automatic sweep for a later manual one - and which of them applied depends on how many
+        // trades took the auto path versus the manual path. Reconstructing that arithmetic in a
+        // test just re-implements the contract and asserts it against itself.
+        //
+        // What must hold on every path is the RATIO: of everything that reaches the two of them,
+        // the creator's cut is exactly `creatorBps`. That is the promise made at launch.
+        uint256 distributed = creatorGot + holdersGot;
+        assertApproxEqRel(
+            (creatorGot * 10_000) / distributed,
+            CREATOR_BPS,
+            1e15, // 0.1%
+            "creator and holders were not split at the configured rate"
         );
     }
 
