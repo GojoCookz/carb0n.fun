@@ -53,10 +53,10 @@ import {Addresses} from "./Addresses.sol";
 contract RouteTest is Script {
     using Planner for Plan;
 
-    address constant LAUNCHER = 0x81d5690Aa98651cE9D68F82E5396a2E37e25029E;
-    address constant FEE_HOOK = 0xd67E790d3Be6161C50d9D27b84aE78eE8e2eE0cC;
-    address constant TWETH = 0xfa86d558cd291a8458339Ed66B80c1BB043Bdd5A;
-    address constant TWXMR = 0x033cb8D1E8b7F69360358B5595ea335283f675fF;
+    address constant LAUNCHER = 0x1af6714DfA8f6F2786F336be9DFd7b037a140a16;
+    address constant FEE_HOOK = 0x9f3f9dEfCc97422D2C9C62b30B7Db5bF09b9E0cc;
+    address constant TWETH = 0x3aB74F7A7572ab3677F4FF0B22F0f37e18F157DE;
+    address constant TWXMR = 0xD6d5542D7ff53dc14471AE0f1d5Ec7241821bBC6;
 
     uint256 constant SUPPLY = 1_000_000_000e18;
     int24 constant SPACING = 60;

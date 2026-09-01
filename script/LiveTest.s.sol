@@ -43,9 +43,9 @@ contract LiveTest is Script {
     using StateLibrary for IPoolManager;
 
     // Filled from the deploy that precedes this run.
-    address constant LAUNCHER = 0x81d5690Aa98651cE9D68F82E5396a2E37e25029E;
-    address constant FEE_HOOK = 0xd67E790d3Be6161C50d9D27b84aE78eE8e2eE0cC;
-    address constant TWXMR = 0x033cb8D1E8b7F69360358B5595ea335283f675fF;
+    address constant LAUNCHER = 0x1af6714DfA8f6F2786F336be9DFd7b037a140a16;
+    address constant FEE_HOOK = 0x9f3f9dEfCc97422D2C9C62b30B7Db5bF09b9E0cc;
+    address constant TWXMR = 0xD6d5542D7ff53dc14471AE0f1d5Ec7241821bBC6;
 
     uint256 constant SUPPLY = 1_000_000_000e18;
     uint256 constant OPENING_MCAP = 5e18; // 5 tWXMR
