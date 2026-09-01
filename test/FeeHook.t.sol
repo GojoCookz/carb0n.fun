@@ -144,7 +144,8 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
                 sellFeeBps: _sellFeeBps(),
                 burnBps: _burnBps(),
                 creator: creator,
-                creatorBps: CREATOR_BPS
+                creatorBps: CREATOR_BPS,
+                rewardCurrency: Currency.wrap(address(0))
             })
         );
         // A real launch always registers graduation alongside the fee, and that is where the
@@ -175,7 +176,9 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
             symbol_: "HOOD",
             supply: SUPPLY,
             recipient: address(this), // launcher / initial recipient
-            payoutToken: pairAddr, // dividends paid in the PAIR asset
+            payoutToken: pairAddr,
+                rewardToken: address(0),
+                converter: address(0), // dividends paid in the PAIR asset
             controller: address(hook),
             poolManager_: address(manager),
             maxWallet_: 0, // the cap has its own suite

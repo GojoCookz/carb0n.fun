@@ -32,7 +32,7 @@ contract PlatformFeeTest is FeeHookHarness {
     /// At the harness's own rate, the platform's share of the fee is exactly the flat volume rate
     /// divided by that fee. This is the arithmetic the whole design rests on.
     function test_platformShareIsDerivedFromTheFeeRate() public view {
-        (,, uint16 feeBps,,,,,, uint16 platformShareBps) = hook.poolConfig(poolId);
+        (,, uint16 feeBps,,,,,, uint16 platformShareBps,) = hook.poolConfig(poolId);
 
         uint256 expected = (uint256(hook.PLATFORM_VOLUME_BPS()) * hook.BPS()) / feeBps;
         assertEq(platformShareBps, expected, "platform share was not derived from the fee rate");
@@ -58,14 +58,15 @@ contract PlatformFeeTest is FeeHookHarness {
             sellFeeBps: 0,
             burnBps: 0,
             creator: creator,
-            creatorBps: 5000
+            creatorBps: 5000,
+            rewardCurrency: Currency.wrap(address(0))
         });
 
         PoolKey memory k = key;
         k.tickSpacing = 61; // a pool that has never been configured
         hook.configurePoolFull(k, s);
 
-        (,,,,,,,, uint16 platformShareBps) = hook.poolConfig(k.toId());
+        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(k.toId());
 
         // Rounding is toward zero on an integer division, so the platform is never overpaid.
         uint256 volumeBpsEarned = (uint256(feeBps) * platformShareBps) / hook.BPS();
@@ -107,7 +108,7 @@ contract PlatformFeeTest is FeeHookHarness {
 
         assertGt(distributed, 0, "nothing was distributed at all");
 
-        (,,,,,,,, uint16 platformShareBps) = hook.poolConfig(poolId);
+        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(poolId);
         assertApproxEqRel(
             (platformGot * 10_000) / distributed,
             platformShareBps,
@@ -127,14 +128,15 @@ contract PlatformFeeTest is FeeHookHarness {
             sellFeeBps: 0,
             burnBps: 0,
             creator: creator,
-            creatorBps: 10_000 // everything, and dividends off - "simple mode"
+            creatorBps: 10_000, // everything, and dividends off - "simple mode"
+                rewardCurrency: Currency.wrap(address(0))
         });
 
         PoolKey memory k = key;
         k.tickSpacing = 61;
         hook.configurePoolFull(k, s);
 
-        (,,,,,,,, uint16 platformShareBps) = hook.poolConfig(k.toId());
+        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(k.toId());
         assertGt(platformShareBps, 0, "a 100% creator share zeroed the platform");
         assertEq(platformShareBps, 5000, "at a 2% fee the platform's half of it is 1% of volume");
     }
@@ -153,7 +155,8 @@ contract PlatformFeeTest is FeeHookHarness {
             sellFeeBps: 0,
             burnBps: 0,
             creator: creator,
-            creatorBps: 5000
+            creatorBps: 5000,
+            rewardCurrency: Currency.wrap(address(0))
         });
 
         PoolKey memory k = key;
@@ -175,14 +178,15 @@ contract PlatformFeeTest is FeeHookHarness {
             sellFeeBps: 0,
             burnBps: 0,
             creator: creator,
-            creatorBps: 5000
+            creatorBps: 5000,
+            rewardCurrency: Currency.wrap(address(0))
         });
 
         PoolKey memory k = key;
         k.tickSpacing = 61;
         hook.configurePoolFull(k, s);
 
-        (,,,,,,,, uint16 platformShareBps) = hook.poolConfig(k.toId());
+        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(k.toId());
         assertEq(platformShareBps, hook.BPS(), "at the floor the platform takes the whole fee");
     }
 

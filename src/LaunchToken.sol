@@ -83,6 +83,10 @@ contract LaunchToken is ERC20 {
         uint256 supply;
         address recipient;
         address payoutToken;
+        /// @dev What holders are actually paid. Zero means the pair currency.
+        address rewardToken;
+        /// @dev Swaps the pair currency into the reward token on withdrawal. May be zero.
+        address converter;
         address controller;
         address poolManager_;
         uint256 maxWallet_;
@@ -130,7 +134,9 @@ contract LaunchToken is ERC20 {
             p.recipient,
             p.minPushPayout,
             p.minShareForQueue,
-            p.supply / 1e6
+            p.supply / 1e6,
+            p.rewardToken,
+            p.converter
         );
 
         // The pool, the launcher and the hook hold large balances as infrastructure, never as

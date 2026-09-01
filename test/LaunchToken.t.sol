@@ -31,6 +31,8 @@ contract LaunchTokenTest is Test, LaunchTokenDeployer {
             supply: SUPPLY,
             recipient: launcher,
             payoutToken: address(payout),
+                rewardToken: address(0),
+                converter: address(0),
             controller: controller,
             poolManager_: poolManager,
             maxWallet_: cap,

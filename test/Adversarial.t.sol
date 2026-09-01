@@ -77,7 +77,9 @@ contract AdversarialTest is Test {
             address(0),
             1, // minPushPayout
             1, // minShareForQueue
-            1 // minSharesForDistribution
+            1, // minSharesForDistribution
+            address(0), // rewardToken - pays the pair currency
+            address(0) // no converter
         );
     }
 
@@ -239,7 +241,16 @@ contract AdversarialTest is Test {
     function test_attack_dustHolderCannotBrickTheAccumulator() public {
         MockERC20 tok = new MockERC20("Pair", "PAIR", 18);
         Distributor d = new Distributor(
-            address(this), address(tok), address(this), address(0), address(0), 1, 1, 1_000e18
+            address(this),
+            address(tok),
+            address(this),
+            address(0),
+            address(0),
+            1,
+            1,
+            1_000e18,
+            address(0),
+            address(0)
         );
 
         d.setBalance(alice, 1); // one wei of shares

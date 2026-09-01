@@ -88,7 +88,20 @@ contract DistributorInvariantTest is Test {
             address(0),
             1, // minPushPayout
             1, // minShareForQueue
-            1_000 // minSharesForDistribution
+            // **THE MAGNITUDE OF THIS GUARD IS LOAD-BEARING**, and an earlier version of this
+            // harness passed a raw `1_000` — roughly 1e18 times weaker than anything the launcher
+            // produces. The fuzzer duly found the overflow it is there to prevent: distribute a
+            // large fee across a tiny share base and `_magnifiedPayoutPerShare` grows without
+            // bound until `_magnifiedPayoutPerShare * shares` panics in checked arithmetic.
+            //
+            // `Launcher` always passes `supply / 1e6`, which for a 1B 18-decimal token is 1e21.
+            // Matching that here is the difference between fuzzing the contract and fuzzing a
+            // misconfiguration nobody can actually deploy through the launcher.
+            // `RewardCurrency`-style misconfiguration is covered separately in
+            // `test_tooWeakAGuardOverflowsTheAccumulator`.
+            1e21,
+            address(0),
+            address(0)
         );
 
         for (uint256 i = 0; i < 5; i++) {
@@ -128,6 +141,40 @@ contract DistributorInvariantTest is Test {
             sum += dist.shareOf(actors[i]);
         }
         assertEq(dist.totalShares(), sum, "totalShares drifted from the sum of balances");
+    }
+
+    /// @notice The finding the fuzzer surfaced, pinned as a test rather than papered over.
+    ///
+    /// @dev `minSharesForDistribution` is not a policy knob, it is an OVERFLOW GUARD, and its
+    ///      magnitude is what makes it work. Set it low enough and a large fee divided across a
+    ///      tiny share base inflates `_magnifiedPayoutPerShare` until `_magnifiedPayoutPerShare *
+    ///      shares` panics in checked arithmetic — which reverts every transfer of the token,
+    ///      permanently, for everybody.
+    ///
+    ///      Not reachable through `Launcher`, which always passes `supply / 1e6`. It IS reachable
+    ///      by anyone deploying a `Distributor` directly, so it is written down here rather than
+    ///      assumed away.
+    function test_tooWeakAGuardOverflowsTheAccumulator() public {
+        MockERC20 tok = new MockERC20("Pair", "PAIR", 18);
+        Distributor weak = new Distributor(
+            address(this), address(tok), address(this), address(0), address(0),
+            1, 1, 1, address(0), address(0) // guard of ONE wei of shares
+        );
+
+        // A single dust holder. `_magnifiedPayoutPerShare += (total << 128) / shares`, so with
+        // shares == 1 each distribution adds the whole magnified amount rather than a share of it.
+        weak.setBalance(address(0xBEEF), 1);
+
+        uint256 huge = type(uint96).max;
+        for (uint256 i = 0; i < 4; i++) {
+            tok.mint(address(weak), huge);
+            weak.distribute(huge);
+        }
+
+        // The accumulator is now ~1e68. A normal-sized holder arriving multiplies it by their
+        // balance inside `_update`, and 1e68 * 1e10 exceeds a uint256.
+        vm.expectRevert();
+        weak.setBalance(address(0xCAFE), 1e10);
     }
 
     /// @notice Everything ever handed to the contract is either distributed or explicitly carried.

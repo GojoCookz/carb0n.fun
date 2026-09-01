@@ -118,6 +118,7 @@ contract RouteTest is Script {
                 salt: bytes32(uint256(block.timestamp)),
                 minPushPayout: 1e6,
                 minShareForQueue: 1e18,
+                rewardCurrency: address(0),
                 feeRecipient: address(0),
                 referrer: address(0),
                 metadata: LaunchMetadata({imageCid: keccak256("route"), bannerCid: 0, infoCid: 0})

@@ -140,6 +140,7 @@ abstract contract GraduationHarness is Test {
             salt: launchSalt,
             minPushPayout: 1e6,
             minShareForQueue: 1e18,
+            rewardCurrency: address(0),
             feeRecipient: address(0),
             referrer: address(0),
             metadata: LaunchMetadata({

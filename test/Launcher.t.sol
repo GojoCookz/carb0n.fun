@@ -112,6 +112,7 @@ contract LauncherTest is Test {
             salt: bytes32(uint256(1)),
             minPushPayout: 1e6,
             minShareForQueue: 1e18,
+            rewardCurrency: address(0),
             feeRecipient: address(0),
             referrer: address(0),
             metadata: LaunchMetadata({

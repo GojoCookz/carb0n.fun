@@ -89,7 +89,8 @@ contract HookAttackTest is FeeHookHarness {
             sellFeeBps: 1000,
             burnBps: 0,
             creator: attacker,
-            creatorBps: 10_000 // the whole fee to the attacker
+            creatorBps: 10_000, // the whole fee to the attacker
+            rewardCurrency: Currency.wrap(address(0))
         });
 
         vm.prank(attacker);
@@ -114,7 +115,8 @@ contract HookAttackTest is FeeHookHarness {
             sellFeeBps: 0,
             burnBps: 0,
             creator: attacker,
-            creatorBps: 2000
+            creatorBps: 2000,
+            rewardCurrency: Currency.wrap(address(0))
         });
 
         // Called AS the launcher, which this test contract is.
@@ -136,7 +138,8 @@ contract HookAttackTest is FeeHookHarness {
             sellFeeBps: 0,
             burnBps: 0,
             creator: address(this),
-            creatorBps: 0
+            creatorBps: 0,
+            rewardCurrency: Currency.wrap(address(0))
         });
 
         vm.expectRevert(abi.encodeWithSelector(FeeHook.FeeTooHigh.selector, uint16(1001)));
@@ -158,7 +161,8 @@ contract HookAttackTest is FeeHookHarness {
             sellFeeBps: 0,
             burnBps: 6000,
             creator: address(this),
-            creatorBps: 5000 // 60% + 50% = 110% of the fee
+            creatorBps: 5000, // 60% + 50% = 110% of the fee
+            rewardCurrency: Currency.wrap(address(0))
         });
 
         vm.expectRevert();
@@ -186,7 +190,8 @@ contract HookAttackTest is FeeHookHarness {
             bool configured,
             uint16 sellFeeBps,
             uint16 burnBps,
-            uint16 platformShareBps
+            uint16 platformShareBps,
+            Currency rewardCurrency
         ) = hook.poolConfig(poolId);
         return FeeHook.PoolConfig({
             distributor: distributor,
@@ -197,6 +202,7 @@ contract HookAttackTest is FeeHookHarness {
             configured: configured,
             sellFeeBps: sellFeeBps,
             burnBps: burnBps,
-            platformShareBps: platformShareBps
+            platformShareBps: platformShareBps,
+            rewardCurrency: rewardCurrency
         });
     }}

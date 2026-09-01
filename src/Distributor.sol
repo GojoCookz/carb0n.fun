@@ -24,13 +24,46 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///
 ///      Robinhood stock tokens are safe as a payout asset here: corporate actions move
 ///      `uiMultiplier()`, not raw balances, so pro-rata accounting on raw balances stays correct.
+/// @notice Swaps a dividend into the currency the creator chose, at withdrawal time.
+///
+/// @dev Deliberately a SEPARATE deployment behind an interface rather than logic in the
+///      distributor. The route from a pair currency to an arbitrary reward on L1 is a moving
+///      target - v3 pools, v4 pools, multi-hop, whichever is deepest this month - and none of
+///      that belongs inside the contract holding everyone''s dividends. It also means a
+///      distributor with no converter simply pays the pair currency, which is the default.
+///
+///      MUST pull exactly `amountIn` of `tokenIn` via the allowance it is given, and MUST send
+///      what it produces directly to `recipient`. Returning zero is a valid "could not route".
+interface IRewardConverter {
+    function convert(address tokenIn, address tokenOut, uint256 amountIn, address recipient)
+        external
+        returns (uint256 amountOut);
+}
+
 contract Distributor {
     uint256 internal constant MAGNITUDE = 2 ** 128;
 
     /// @notice The launch token whose holders are paid.
     address public immutable shareToken;
-    /// @notice The currency holders are paid IN. Fixed at launch, never converted.
+    /// @notice The currency this contract HOLDS and accounts in — always the pair currency.
+    ///
+    /// @dev Not necessarily what a holder receives. See `rewardToken`.
     address public immutable payoutToken;
+
+    /// @notice What holders are actually paid, if the creator chose something else.
+    ///
+    /// @dev **Accounting stays in `payoutToken`; only the final transfer changes.** Fees arrive in
+    ///      the pair currency because that is what a buyer hands over, so any other reward means a
+    ///      swap. Doing that swap on the way IN would credit the accumulator in one token while
+    ///      the contract held another the moment a swap failed — the "fallback" would not degrade,
+    ///      it would make this contract insolvent. Doing it on the way OUT means a failed swap
+    ///      simply pays the pair currency, and not one number in the ledger moves.
+    ///
+    ///      Equal to `payoutToken` on most launches, in which case no conversion is attempted.
+    address public immutable rewardToken;
+
+    /// @notice Converts `payoutToken` into `rewardToken` at withdrawal time. May be unset.
+    address public immutable converter;
 
     /// @notice Dust guard: below this, a push send costs more gas than it delivers.
     uint256 public immutable minPushPayout;
@@ -61,6 +94,10 @@ contract Distributor {
     uint256 public cursor;
 
     event PayoutsAdded(uint256 amount, uint256 newMagnifiedPerShare);
+    /// @notice A dividend was swapped into the creator's chosen reward currency before payment.
+    event RewardConverted(address indexed to, uint256 amountIn, uint256 amountOut, address token);
+    /// @notice The swap could not be made, so the holder was paid the pair currency instead.
+    event RewardConversionFailed(address indexed to, uint256 amount, address wanted);
     event PayoutSent(address indexed account, uint256 amount);
     event PayoutSendFailed(address indexed account, uint256 amount);
     event ExcludedSet(address indexed account, bool isExcluded);
@@ -111,13 +148,19 @@ contract Distributor {
         address _launcher,
         uint256 _minPushPayout,
         uint256 _minShareForQueue,
-        uint256 _minSharesForDistribution
+        uint256 _minSharesForDistribution,
+        address _rewardToken,
+        address _converter
     ) {
         if (_shareToken == address(0) || _payoutToken == address(0) || _controller == address(0)) {
             revert ZeroAddress();
         }
         shareToken = _shareToken;
         payoutToken = _payoutToken;
+        // Zero collapses to the pair currency, so the common path needs no branch and no
+        // converter has to exist for a launch that does not use one.
+        rewardToken = _rewardToken == address(0) ? _payoutToken : _rewardToken;
+        converter = _converter;
         controller = _controller;
         minPushPayout = _minPushPayout;
         minShareForQueue = _minShareForQueue;
@@ -285,9 +328,43 @@ contract Distributor {
         cursor = i >= len ? 0 : i;
     }
 
-    /// @notice Raw-call transfer that reports failure instead of reverting.
-    /// @dev Handles both bool-returning and no-return ERC-20s.
+    /// @notice Pay a holder, converting into the reward currency first if the creator chose one.
+    ///
+    /// @dev **A failed conversion pays the pair currency and moves no accounting.** That is the
+    ///      whole reason conversion lives here rather than on the way in: the amount is already
+    ///      owed and already held, so the worst case is that somebody is paid in the base asset
+    ///      instead of their preferred one. It is emitted either way, because being paid in a
+    ///      currency the creator did not advertise is exactly the kind of thing that must be
+    ///      visible on chain rather than inferred from a balance.
     function _trySend(address to, uint256 amount) internal returns (bool) {
+        if (rewardToken != payoutToken && converter != address(0) && converter.code.length != 0) {
+            // Approve exactly what is being converted, never an unbounded allowance: this
+            // contract holds every holder's money and the converter is a separate deployment.
+            (bool okApprove,) = payoutToken.call(
+                abi.encodeWithSelector(IERC20.approve.selector, converter, amount)
+            );
+            if (okApprove) {
+                try IRewardConverter(converter).convert(payoutToken, rewardToken, amount, to)
+                returns (uint256 out) {
+                    // Clear the allowance whether or not it was fully spent.
+                    (bool cleared,) = payoutToken.call(
+                        abi.encodeWithSelector(IERC20.approve.selector, converter, 0)
+                    );
+                    cleared;
+                    if (out != 0) {
+                        emit RewardConverted(to, amount, out, rewardToken);
+                        return true;
+                    }
+                } catch {
+                    (bool cleared,) = payoutToken.call(
+                        abi.encodeWithSelector(IERC20.approve.selector, converter, 0)
+                    );
+                    cleared;
+                }
+            }
+            emit RewardConversionFailed(to, amount, rewardToken);
+        }
+
         (bool ok, bytes memory ret) =
             payoutToken.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
         return ok && (ret.length == 0 || abi.decode(ret, (bool)));

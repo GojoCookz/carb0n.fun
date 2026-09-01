@@ -79,6 +79,15 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     ///      that resolves the cycle, and `launch` never depends on it: a launch with no vault set
     ///      simply records no referrer.
     address public referralVault;
+
+    /// @notice Swaps the pair currency into a creator's chosen reward at withdrawal time.
+    ///
+    /// @dev Optional and one-shot, like `referralVault`. Unset means every launch pays in its pair
+    ///      currency, which is the default and needs no routing infrastructure to exist at all.
+    ///      Separate from the vault because the routing landscape on L1 changes and this is the
+    ///      piece most likely to be replaced.
+    address public rewardConverter;
+
     address private immutable _deployer;
 
     /// @notice Hard ceiling on the creator's opening buy, as a share of total supply.
@@ -155,6 +164,18 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         ///      forcing them to be the same means a creator's revenue lands wherever they happened
         ///      to be standing. It is written once here and there is no setter, so it is a promise
         ///      to buyers about where the money goes, not a dashboard toggle.
+        /// @dev What holders are paid dividends IN. Zero means the pair currency.
+        ///
+        ///      **This is a choice, not a consequence.** Fees necessarily ARRIVE in the pair
+        ///      currency, because that is what a buyer hands over, so paying anything else means
+        ///      converting on the way out. That conversion is attempted on every sweep and falls
+        ///      back to the pair currency if it cannot be done - see `FeeHook._routeFee`.
+        ///
+        ///      Restricted to currencies on the `PairRegistry` allowlist. Those have had their
+        ///      deployed bytecode scanned for pause, blacklist and mint powers and their liquidity
+        ///      measured; paying somebody a dividend in an unvetted token is paying them in
+        ///      something they may not be able to sell.
+        address rewardCurrency;
         address feeRecipient;
         /// @dev Who referred this creator, or zero. Recorded on the FIRST launch only and ignored
         ///      afterwards, so arriving through a different link later cannot reassign an existing
@@ -251,8 +272,10 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     error OpeningPriceOutOfRange();
     error OnlyDeployer();
     error ReferralVaultAlreadySet();
+    error RewardCurrencyNotApproved(address given);
 
     event ReferralVaultSet(address indexed vault);
+    event RewardConverterSet(address indexed converter);
 
     constructor(
         IPoolManager _poolManager,
@@ -275,6 +298,17 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         if (vault == address(0)) revert ReferralVaultAlreadySet();
         referralVault = vault;
         emit ReferralVaultSet(vault);
+    }
+
+    /// @notice Wire up the reward converter. Callable once, by the deployer, then never again.
+    /// @dev Only affects launches made AFTER it is set: a token's converter is baked into its
+    ///      distributor at launch, so nobody's payout route can be changed out from under them.
+    function initRewardConverter(address conv) external {
+        if (msg.sender != _deployer) revert OnlyDeployer();
+        if (rewardConverter != address(0)) revert ReferralVaultAlreadySet();
+        if (conv == address(0)) revert ReferralVaultAlreadySet();
+        rewardConverter = conv;
+        emit RewardConverterSet(conv);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -385,6 +419,8 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
                 supply: p.supply,
                 recipient: address(this),
                 payoutToken: p.pair,
+                rewardToken: p.rewardCurrency,
+                converter: rewardConverter,
                 controller: address(feeHook),
                 poolManager_: address(poolManager),
                 maxWallet_: p.maxWalletBps == 0 ? 0 : (p.supply * p.maxWalletBps) / BPS,
@@ -410,7 +446,8 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
                 // Zero means "pay me where I stand". Anything else is a deliberate choice of a
                 // team wallet, splitter or multisig, and it is fixed from this transaction on.
                 creator: p.feeRecipient == address(0) ? msg.sender : p.feeRecipient,
-                creatorBps: p.creatorBps
+                creatorBps: p.creatorBps,
+                rewardCurrency: Currency.wrap(address(0))
             })
         );
 
@@ -428,6 +465,11 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
 
     function _validate(LaunchParams memory p) internal view {
         if (!pairRegistry.isApproved(p.pair)) revert PairNotApproved(p.pair);
+        // A reward currency has to clear the same bar as a pair currency: holders must be able to
+        // sell what they are paid, and the allowlist is where that has actually been checked.
+        if (p.rewardCurrency != address(0) && !pairRegistry.isApproved(p.rewardCurrency)) {
+            revert RewardCurrencyNotApproved(p.rewardCurrency);
+        }
         // Image is required, banner is not. A token with no image is unlistable; a token with no
         // banner renders a fallback.
         if (p.metadata.imageCid == bytes32(0)) revert ImageRequired();

@@ -107,6 +107,13 @@ contract FeeHook is HookBase {
         ///      `creatorBps`, `configured`, `sellFeeBps` and `burnBps`, so this costs NO new
         ///      storage slot. `PoolConfig` is loaded into memory on every single swap.
         uint16 platformShareBps;
+        /// @dev What holders are paid IN. Equal to `pairCurrency` on most launches, in which case
+        ///      no conversion happens at all and this costs nothing.
+        ///
+        ///      Opens slot 3 - `PoolConfig` was three slots and is now four. That is one extra
+        ///      cold SLOAD on every swap and it is the price of the feature; there is nowhere left
+        ///      in slots 0-2 to pack an address.
+        Currency rewardCurrency;
     }
 
     /// @notice Per-pool graduation state. Written once by the launcher, latched once by anyone.
@@ -286,6 +293,8 @@ contract FeeHook is HookBase {
         uint16 burnBps;
         address creator;
         uint16 creatorBps;
+        /// @dev Zero means "pay holders in the pair currency", which is the common case.
+        Currency rewardCurrency;
     }
 
     function configurePool(
@@ -305,7 +314,8 @@ contract FeeHook is HookBase {
                 sellFeeBps: 0,
                 burnBps: 0,
                 creator: creator,
-                creatorBps: creatorBps
+                creatorBps: creatorBps,
+                rewardCurrency: pairCurrency
             })
         );
     }
@@ -346,7 +356,11 @@ contract FeeHook is HookBase {
             configured: true,
             sellFeeBps: s.sellFeeBps,
             burnBps: s.burnBps,
-            platformShareBps: platformShareBps
+            platformShareBps: platformShareBps,
+            // Zero collapses to the pair currency, so the no-conversion path needs no branch.
+            rewardCurrency: Currency.unwrap(s.rewardCurrency) == address(0)
+                ? s.pairCurrency
+                : s.rewardCurrency
         });
 
         emit PoolConfigured(
@@ -881,6 +895,15 @@ contract FeeHook is HookBase {
             }
         }
         if (toCreator != 0) _trySend(pairToken, cfg.creator, toCreator);
+
+        // **The distributor is always funded in, and always accounts in, the PAIR CURRENCY** —
+        // whatever holders eventually receive. Converting here instead would credit the dividend
+        // accumulator in one token while the contract held another the moment a swap failed, and
+        // the "fallback" would not degrade, it would make the distributor insolvent.
+        //
+        // Conversion therefore happens on the way OUT, per holder, in `Distributor.withdraw`,
+        // where the amount is already owed and a failure can pay the base currency instead
+        // without any accounting moving. `cfg.rewardCurrency` is read there, not here.
         if (toHolders != 0) {
             if (_trySend(pairToken, cfg.distributor, toHolders)) {
                 Distributor(cfg.distributor).distribute(toHolders);
