@@ -43,6 +43,10 @@ abstract contract GraduationHarness is Test {
 
     PoolManager internal manager;
     PairRegistry internal registry;
+    /// Where the platform's 1% of volume lands. A distinct address from every other actor in
+    /// these tests on purpose: routing it to `address(this)` would hide a misrouted fee inside
+    /// the test contract's own balance, which is exactly the bug worth catching.
+    address internal constant PLATFORM = address(0xFEE0);
     FeeHook internal hook;
     Launcher internal launcher;
     LaunchToken internal tokenImpl;
@@ -87,7 +91,7 @@ abstract contract GraduationHarness is Test {
         // launcher's CREATE address, place the hook against it, then deploy into the reserved slot.
         address predictedLauncher = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         address hookAddr = address(uint160(uint256(0xF00D) << 144 | 0x20CC));
-        deployCodeTo("FeeHook.sol:FeeHook", abi.encode(address(manager), predictedLauncher), hookAddr);
+        deployCodeTo("FeeHook.sol:FeeHook", abi.encode(address(manager), predictedLauncher, PLATFORM), hookAddr);
         hook = FeeHook(hookAddr);
 
         launcher = new Launcher(IPoolManager(address(manager)), hook, registry, address(tokenImpl));
@@ -136,6 +140,7 @@ abstract contract GraduationHarness is Test {
             salt: launchSalt,
             minPushPayout: 1e6,
             minShareForQueue: 1e18,
+            feeRecipient: address(0),
             metadata: LaunchMetadata({
                 imageCid: keccak256("image"), bannerCid: keccak256("banner"), infoCid: keccak256("info")
             })

@@ -26,6 +26,10 @@ import {MockERC20} from "./mocks/MockERC20.sol";
 contract VestingTest is Test {
     PoolManager internal manager;
     PairRegistry internal registry;
+    /// Where the platform's 1% of volume lands. A distinct address from every other actor in
+    /// these tests on purpose: routing it to `address(this)` would hide a misrouted fee inside
+    /// the test contract's own balance, which is exactly the bug worth catching.
+    address internal constant PLATFORM = address(0xFEE0);
     FeeHook internal hook;
     Launcher internal launcher;
     LaunchToken internal tokenImpl;
@@ -46,7 +50,7 @@ contract VestingTest is Test {
 
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         address hookAddr = address(uint160(uint256(0xF00D) << 144 | 0x20CC));
-        deployCodeTo("FeeHook.sol:FeeHook", abi.encode(address(manager), predicted), hookAddr);
+        deployCodeTo("FeeHook.sol:FeeHook", abi.encode(address(manager), predicted, PLATFORM), hookAddr);
         hook = FeeHook(hookAddr);
 
         launcher = new Launcher(IPoolManager(address(manager)), hook, registry, address(tokenImpl));
@@ -77,6 +81,7 @@ contract VestingTest is Test {
             salt: bytes32(uint256(1)),
             minPushPayout: 1e6,
             minShareForQueue: 1e18,
+            feeRecipient: address(0),
             metadata: LaunchMetadata({imageCid: keccak256("i"), bannerCid: 0, infoCid: 0})
         });
     }

@@ -92,6 +92,14 @@ contract FeeHook is HookBase {
         bool configured;
         uint16 sellFeeBps;
         uint16 burnBps;
+        /// @dev The platform's share OF THIS POOL'S FEE, derived once at configuration from
+        ///      `PLATFORM_VOLUME_BPS / feeBps`. Stored rather than recomputed because `_routeFee`
+        ///      would otherwise divide on every sweep to reach a number that can never change.
+        ///
+        ///      Declared last on purpose: `creator` opens slot 2 with 5 bytes spare after
+        ///      `creatorBps`, `configured`, `sellFeeBps` and `burnBps`, so this costs NO new
+        ///      storage slot. `PoolConfig` is loaded into memory on every single swap.
+        uint16 platformShareBps;
     }
 
     /// @notice Per-pool graduation state. Written once by the launcher, latched once by anyone.
@@ -131,8 +139,32 @@ contract FeeHook is HookBase {
     ///      takes the moment it clears their gas, which is what turns accrual into payment.
     uint16 public constant SWEEP_BOUNTY_BPS = 50;
 
+    /// @notice The platform's cut, in basis points OF TRADED VOLUME. 1%.
+    ///
+    /// @dev **Of volume, not of the fee**, and the distinction is the whole design. A share of the
+    ///      fee would mean the platform earns more when a creator charges more, which makes the
+    ///      launchpad's revenue depend on how hard its customers tax their own buyers - the
+    ///      incentive points exactly the wrong way. Fixing it to volume means a 2% launch and a 9%
+    ///      launch pay the platform the same 1%, and every basis point of a creator's ambition is
+    ///      the creator's own.
+    ///
+    ///      It is a CONSTANT, not a per-pool setting and not an owner-settable rate. A launchpad
+    ///      that can raise its own take after people have launched on it is a launchpad nobody
+    ///      should launch on: the terms a creator agreed to must be the terms forever.
+    ///
+    ///      **This is exact on a default launch and slightly less on one that burns.** The burn
+    ///      wedge and the sweep bounty are spent in `unlockCallback` before `_routeFee` ever sees
+    ///      the money, so a 2% launch with a 15% burn pays the platform 0.85% of volume rather
+    ///      than 1%. That is left alone deliberately: taking the platform's cut ahead of the burn
+    ///      would compute every burn on a post-platform base and quietly make it smaller than the
+    ///      number the creator picked. `PlatformDilution.t.sol` measures the real figure.
+    uint16 public constant PLATFORM_VOLUME_BPS = 100;
+
     /// @notice The only address allowed to register a pool config. Set once at deploy.
     address public immutable launcher;
+
+    /// @notice Where the platform's cut is sent. Immutable - see `PLATFORM_VOLUME_BPS`.
+    address public immutable platformRecipient;
 
     mapping(PoolId => PoolConfig) public poolConfig;
     /// @notice Fees charged per pool over all time, in the pair currency. Diagnostics only.
@@ -171,7 +203,13 @@ contract FeeHook is HookBase {
     /// @notice Paid to whoever called `sweep`, out of what they swept.
     event SweepBounty(PoolId indexed poolId, address indexed caller, uint256 amount);
     /// @notice Redeemed and paid out. Emitted on `sweep`, not on the trade that earned it.
-    event FeeTaken(PoolId indexed poolId, uint256 total, uint256 toHolders, uint256 toCreator);
+    event FeeTaken(
+        PoolId indexed poolId,
+        uint256 total,
+        uint256 toHolders,
+        uint256 toCreator,
+        uint256 toPlatform
+    );
     event GraduationConfigured(
         PoolId indexed poolId, address indexed token, uint256 threshold, uint256 supply
     );
@@ -186,15 +224,19 @@ contract FeeHook is HookBase {
     error NotConfigured();
     error FeeTooHigh(uint16 given);
     error CreatorShareTooHigh(uint16 given);
+    error FeeBelowPlatformFloor(uint16 given);
     error ZeroAddress();
     error GraduationAlreadyConfigured();
     error GraduationNotConfigured();
     error ThresholdRequired();
     error SupplyRequired();
 
-    constructor(IPoolManager _poolManager, address _launcher) HookBase(_poolManager) {
-        if (_launcher == address(0)) revert ZeroAddress();
+    constructor(IPoolManager _poolManager, address _launcher, address _platformRecipient)
+        HookBase(_poolManager)
+    {
+        if (_launcher == address(0) || _platformRecipient == address(0)) revert ZeroAddress();
         launcher = _launcher;
+        platformRecipient = _platformRecipient;
     }
 
     /// @inheritdoc HookBase
@@ -273,9 +315,21 @@ contract FeeHook is HookBase {
         if (uint256(s.creatorBps) + s.burnBps > BPS) revert CreatorShareTooHigh(s.creatorBps);
         if (s.distributor == address(0) || s.creator == address(0)) revert ZeroAddress();
 
+        // A buy rate below the platform's own cut cannot pay it. Rejected rather than clamped: a
+        // launch that silently charges more than the creator chose is worse than one that reverts.
+        if (s.feeBps < PLATFORM_VOLUME_BPS) revert FeeBelowPlatformFloor(s.feeBps);
+
         PoolId id = key.toId();
         if (poolConfig[id].configured) revert AlreadyConfigured();
 
+        // The platform takes a fixed share of VOLUME, so its share of the FEE is whatever fraction
+        // of that fee the flat rate represents. At 2% it is half; at 10% it is a tenth. Computed
+        // once here so the sweep path never divides.
+        uint16 platformShareBps = uint16((uint256(PLATFORM_VOLUME_BPS) * BPS) / s.feeBps);
+
+        // The creator's and the burn's shares are taken from what REMAINS after the platform, so
+        // `creatorBps` means "of my own cut" rather than "of the headline rate". Anything else
+        // would let a creator set 100% and leave nothing to pay the platform with.
         poolConfig[id] = PoolConfig({
             distributor: s.distributor,
             pairCurrency: s.pairCurrency,
@@ -284,7 +338,8 @@ contract FeeHook is HookBase {
             creatorBps: s.creatorBps,
             configured: true,
             sellFeeBps: s.sellFeeBps,
-            burnBps: s.burnBps
+            burnBps: s.burnBps,
+            platformShareBps: platformShareBps
         });
 
         emit PoolConfigured(
@@ -440,11 +495,11 @@ contract FeeHook is HookBase {
         if (sqrtPriceX96 == 0) return 0;
 
         if (tokenIsCurrency0) {
-            uint256 step = FullMath.mulDiv(supply, sqrtPriceX96, FixedPoint96.Q96);
-            return FullMath.mulDiv(step, sqrtPriceX96, FixedPoint96.Q96);
+            uint256 up = FullMath.mulDiv(supply, sqrtPriceX96, FixedPoint96.Q96);
+            return FullMath.mulDiv(up, sqrtPriceX96, FixedPoint96.Q96);
         }
-        uint256 step = FullMath.mulDiv(supply, FixedPoint96.Q96, sqrtPriceX96);
-        return FullMath.mulDiv(step, FixedPoint96.Q96, sqrtPriceX96);
+        uint256 down = FullMath.mulDiv(supply, FixedPoint96.Q96, sqrtPriceX96);
+        return FullMath.mulDiv(down, FixedPoint96.Q96, sqrtPriceX96);
     }
 
     // -------------------------------------------------------------------------------------------
@@ -785,16 +840,26 @@ contract FeeHook is HookBase {
         return "";
     }
 
-    /// @dev Splits a swept fee between creator and holders and forwards both.
+    /// @dev Splits a swept fee three ways - platform, creator, holders - and forwards each.
+    ///
+    ///      **The platform is paid FIRST and out of the top.** Not because it matters most, but
+    ///      because it is the only slice that is fixed: it is a flat share of volume, agreed at
+    ///      launch and unchangeable afterwards. Taking it first means the creator's own split is
+    ///      arithmetic on a number that is already theirs, and no combination of `creatorBps` and
+    ///      `burnBps` can leave the platform unpaid.
     ///
     ///      Sends are raw calls: a hostile or blocklisted creator must not be able to revert the
     ///      sweep for everyone else. A failed payout strands the tokens on this contract rather
     ///      than trapping the rest of the distribution.
     function _routeFee(PoolId id, PoolConfig memory cfg, uint256 fee) internal {
-        uint256 toCreator = (fee * cfg.creatorBps) / BPS;
-        uint256 toHolders = fee - toCreator;
+        uint256 toPlatform = (fee * cfg.platformShareBps) / BPS;
+        uint256 rest = fee - toPlatform;
+
+        uint256 toCreator = (rest * cfg.creatorBps) / BPS;
+        uint256 toHolders = rest - toCreator;
 
         address pairToken = Currency.unwrap(cfg.pairCurrency);
+        if (toPlatform != 0) _trySend(pairToken, platformRecipient, toPlatform);
         if (toCreator != 0) _trySend(pairToken, cfg.creator, toCreator);
         if (toHolders != 0) {
             if (_trySend(pairToken, cfg.distributor, toHolders)) {
@@ -802,7 +867,7 @@ contract FeeHook is HookBase {
             }
         }
 
-        emit FeeTaken(id, fee, toHolders, toCreator);
+        emit FeeTaken(id, fee, toHolders, toCreator, toPlatform);
     }
 
     /// @dev Raw call so a hostile or non-standard recipient cannot revert the whole swap. A failed

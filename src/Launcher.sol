@@ -129,6 +129,14 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         bytes32 salt;
         uint256 minPushPayout;
         uint256 minShareForQueue;
+        /// @dev Where this launch's creator fees are paid. ZERO means the caller's own wallet.
+        ///
+        ///      Separate from the launching wallet on purpose: a team splitter, a multisig or a
+        ///      cold wallet is a different address from the hot one that signs a launch, and
+        ///      forcing them to be the same means a creator's revenue lands wherever they happened
+        ///      to be standing. It is written once here and there is no setter, so it is a promise
+        ///      to buyers about where the money goes, not a dashboard toggle.
+        address feeRecipient;
         LaunchMetadata metadata;
     }
 
@@ -360,7 +368,9 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
                 feeBps: p.feeBps,
                 sellFeeBps: p.sellFeeBps,
                 burnBps: p.burnBps,
-                creator: msg.sender,
+                // Zero means "pay me where I stand". Anything else is a deliberate choice of a
+                // team wallet, splitter or multisig, and it is fixed from this transaction on.
+                creator: p.feeRecipient == address(0) ? msg.sender : p.feeRecipient,
                 creatorBps: p.creatorBps
             })
         );

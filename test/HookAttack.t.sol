@@ -185,7 +185,8 @@ contract HookAttackTest is FeeHookHarness {
             uint16 creatorBps,
             bool configured,
             uint16 sellFeeBps,
-            uint16 burnBps
+            uint16 burnBps,
+            uint16 platformShareBps
         ) = hook.poolConfig(poolId);
         return FeeHook.PoolConfig({
             distributor: distributor,
@@ -195,6 +196,7 @@ contract HookAttackTest is FeeHookHarness {
             creatorBps: creatorBps,
             configured: configured,
             sellFeeBps: sellFeeBps,
-            burnBps: burnBps
+            burnBps: burnBps,
+            platformShareBps: platformShareBps
         });
     }}

@@ -53,6 +53,10 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
     using PoolIdLibrary for PoolKey;
 
     PoolManager internal manager;
+    /// Where the platform's 1% of volume lands. A distinct address from every other actor in
+    /// these tests on purpose: routing it to `address(this)` would hide a misrouted fee inside
+    /// the test contract's own balance, which is exactly the bug worth catching.
+    address internal constant PLATFORM = address(0xFEE0);
     FeeHook internal hook;
     LaunchToken internal token;
     Distributor internal dist;
@@ -109,7 +113,7 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         //          | BEFORE_SWAP_RETURNS_DELTA | AFTER_SWAP_RETURNS_DELTA.
         // The high bits are arbitrary; only the low 14 are read by the PoolManager.
         address hookAddr = address(uint160(uint256(0xF00D) << 144 | 0x20CC));
-        deployCodeTo("FeeHook.sol:FeeHook", abi.encode(address(manager), address(this)), hookAddr);
+        deployCodeTo("FeeHook.sol:FeeHook", abi.encode(address(manager), address(this), PLATFORM), hookAddr);
         hook = FeeHook(hookAddr);
 
         token = _deployLaunchTokenSorted(address(pair), _tokenIsCurrency0());

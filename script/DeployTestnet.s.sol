@@ -100,15 +100,24 @@ contract DeployTestnet is Script {
                 | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
         );
 
+        // On testnet the platform's cut goes back to the deployer. On mainnet this MUST be a
+        // multisig: it is immutable on the hook, so a mistake here is permanent for every pool
+        // that hook ever serves.
+        address platformRecipient = deployer;
+
+        // The mined salt depends on the constructor args, so this encoding has to match the
+        // `new FeeHook` call below EXACTLY - a missing argument here silently mines a salt for a
+        // different contract and the deploy fails the address assertion below.
         (address hookAddr, bytes32 salt) = HookMiner.find(
             Addresses.CREATE2_DEPLOYER,
             flags,
             type(FeeHook).creationCode,
-            abi.encode(Addresses.SEPOLIA_POOL_MANAGER, predictedLauncher)
+            abi.encode(Addresses.SEPOLIA_POOL_MANAGER, predictedLauncher, platformRecipient)
         );
 
-        FeeHook feeHook =
-            new FeeHook{salt: salt}(IPoolManager(Addresses.SEPOLIA_POOL_MANAGER), predictedLauncher);
+        FeeHook feeHook = new FeeHook{salt: salt}(
+            IPoolManager(Addresses.SEPOLIA_POOL_MANAGER), predictedLauncher, platformRecipient
+        );
         require(address(feeHook) == hookAddr, "hook did not land on the mined address");
 
         Launcher launcher = new Launcher(

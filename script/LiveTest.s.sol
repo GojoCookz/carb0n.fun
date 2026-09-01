@@ -95,6 +95,7 @@ contract LiveTest is Script {
                 salt: bytes32(uint256(block.timestamp)),
                 minPushPayout: 1e6,
                 minShareForQueue: 1e18,
+                feeRecipient: address(0),
                 metadata: LaunchMetadata({imageCid: keccak256("live"), bannerCid: 0, infoCid: 0})
             })
         );
