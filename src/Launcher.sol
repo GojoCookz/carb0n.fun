@@ -47,6 +47,12 @@ import {LaunchMetadata} from "./types/LaunchMetadata.sol";
 ///      **Nothing here is configurable after the fact.** Fee split, creator share, max wallet and
 ///      metadata are all written during `launch` and there is no setter for any of them. A fee
 ///      split that can change after people have bought is a rug with extra steps.
+
+/// @notice The slice of `ReferralVault` the launcher needs. Declared here rather than imported so
+///         the launcher does not take a hard dependency on a contract it treats as optional.
+interface IReferralVault {
+    function setReferrer(address user, address referrer) external;
+}
 contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using PoolIdLibrary for PoolKey;
@@ -61,6 +67,19 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     PairRegistry public immutable pairRegistry;
     /// @notice The `LaunchToken` implementation every launch clones.
     address public immutable tokenImplementation;
+
+    /// @notice Records who referred each creator. Optional; zero disables referrals entirely.
+    ///
+    /// @dev **Not immutable, and that is forced by a genuine circularity**: the vault's
+    ///      constructor needs the launcher's address to gate `setReferrer`, and the launcher needs
+    ///      the vault's. One of the two has to be wired after the fact.
+    ///
+    ///      It is therefore a ONE-SHOT initializer rather than a setter - callable once, by the
+    ///      deployer, and it reverts forever after. That is the smallest possible mutable surface
+    ///      that resolves the cycle, and `launch` never depends on it: a launch with no vault set
+    ///      simply records no referrer.
+    address public referralVault;
+    address private immutable _deployer;
 
     /// @notice Hard ceiling on the creator's opening buy, as a share of total supply.
     /// @dev A dev buy is legitimate - a creator with zero position has nothing at stake. A dev buy
@@ -137,6 +156,11 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         ///      to be standing. It is written once here and there is no setter, so it is a promise
         ///      to buyers about where the money goes, not a dashboard toggle.
         address feeRecipient;
+        /// @dev Who referred this creator, or zero. Recorded on the FIRST launch only and ignored
+        ///      afterwards, so arriving through a different link later cannot reassign an existing
+        ///      claim. Never reverts the launch: a bad referrer address must not cost somebody
+        ///      their token.
+        address referrer;
         LaunchMetadata metadata;
     }
 
@@ -225,6 +249,10 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     error OnlyPoolManager();
     error LauncherRetainedFunds();
     error OpeningPriceOutOfRange();
+    error OnlyDeployer();
+    error ReferralVaultAlreadySet();
+
+    event ReferralVaultSet(address indexed vault);
 
     constructor(
         IPoolManager _poolManager,
@@ -236,6 +264,17 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         feeHook = _feeHook;
         pairRegistry = _pairRegistry;
         tokenImplementation = _tokenImplementation;
+        _deployer = msg.sender;
+    }
+
+    /// @notice Wire up the referral vault. Callable once, by the deployer, then never again.
+    /// @dev See `referralVault` for why this exists rather than an immutable.
+    function initReferralVault(address vault) external {
+        if (msg.sender != _deployer) revert OnlyDeployer();
+        if (referralVault != address(0)) revert ReferralVaultAlreadySet();
+        if (vault == address(0)) revert ReferralVaultAlreadySet();
+        referralVault = vault;
+        emit ReferralVaultSet(vault);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -378,6 +417,13 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         // Separate from the fee config so the signature governing every fee this pool will ever
         // charge is not widened by a maturity notification.
         feeHook.configureGraduation(key, p.graduationThreshold, p.supply);
+
+        // Referral is strictly best-effort. A vault that is unset, reverting, or handed a
+        // self-referral must never cost somebody their launch - the token is the product and a
+        // marketing attribution is not worth failing it over.
+        if (referralVault != address(0) && p.referrer != address(0)) {
+            try IReferralVault(referralVault).setReferrer(msg.sender, p.referrer) {} catch {}
+        }
     }
 
     function _validate(LaunchParams memory p) internal view {

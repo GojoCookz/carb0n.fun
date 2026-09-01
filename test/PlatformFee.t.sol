@@ -200,4 +200,27 @@ contract PlatformFeeTest is FeeHookHarness {
     function test_platformRateIsAConstant() public view {
         assertEq(hook.PLATFORM_VOLUME_BPS(), 100, "the platform rate is not 1%");
     }
+
+    /// @notice REGRESSION. A plain-wallet platform recipient must not brick every sweep.
+    ///
+    /// @dev `_routeFee` notifies the recipient so a referral vault can split the cut, and the
+    ///      first version wrapped that call in `try/catch` believing it was safe against a
+    ///      recipient with no code. It is NOT: Solidity emits an `extcodesize` guard BEFORE the
+    ///      call and that guard reverts in the calling frame, where `catch` cannot reach it.
+    ///
+    ///      The consequence was total - every sweep in the system reverted, so no fee ever reached
+    ///      a creator or a holder again - and it only appears when the recipient is an EOA, which
+    ///      is exactly what a testnet deploy uses. `PLATFORM` in this harness is a bare address
+    ///      for precisely this reason.
+    function test_aPlainWalletPlatformRecipientDoesNotBrickSweeps() public {
+        assertEq(PLATFORM.code.length, 0, "this test is meaningless against a contract");
+
+        _giveTokens(alice, 10_000_000e18);
+        uint256 before = pair.balanceOf(PLATFORM);
+
+        // Would revert `call to non-contract address` without the code-length guard.
+        _buyExactOut(bob, 500_000e18);
+
+        assertGt(pair.balanceOf(PLATFORM) - before, 0, "sweep did not pay the wallet");
+    }
 }

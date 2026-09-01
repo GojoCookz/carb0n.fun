@@ -66,6 +66,13 @@ import {Distributor} from "./Distributor.sol";
 ///      unlock cycle ends with a non-zero delta and the whole transaction reverts with
 ///      `CurrencyNotSettled`. Returning a delta without taking is the single most common way a v4
 ///      hook bricks every swap in its pool.
+
+/// @notice Optional interface for whatever receives the platform's cut.
+/// @dev The hook calls this AFTER transferring, inside a try/catch. A recipient that does not
+///      implement it (a plain wallet, say) is fine and costs one failed call per sweep.
+interface IPlatformSink {
+    function credit(address currency, uint256 amount, address creator) external;
+}
 contract FeeHook is HookBase {
     using PoolIdLibrary for PoolKey;
     using BalanceDeltaLibrary for BalanceDelta;
@@ -859,7 +866,20 @@ contract FeeHook is HookBase {
         uint256 toHolders = rest - toCreator;
 
         address pairToken = Currency.unwrap(cfg.pairCurrency);
-        if (toPlatform != 0) _trySend(pairToken, platformRecipient, toPlatform);
+        if (toPlatform != 0 && _trySend(pairToken, platformRecipient, toPlatform)) {
+            // Tell the recipient WHOSE launch earned it, so a referral vault can split it up the
+            // chain.
+            //
+            // **The code-length check is load-bearing and try/catch does NOT replace it.** Solidity
+            // emits an `extcodesize` guard BEFORE the call, and that guard reverts in this frame,
+            // where a `catch` cannot reach it. Without this line, pointing `platformRecipient` at
+            // a plain wallet - which is exactly what a testnet deploy does - reverts every sweep
+            // in the system and no fee ever reaches a creator or a holder again.
+            if (platformRecipient.code.length != 0) {
+                try IPlatformSink(platformRecipient).credit(pairToken, toPlatform, cfg.creator) {}
+                catch {}
+            }
+        }
         if (toCreator != 0) _trySend(pairToken, cfg.creator, toCreator);
         if (toHolders != 0) {
             if (_trySend(pairToken, cfg.distributor, toHolders)) {

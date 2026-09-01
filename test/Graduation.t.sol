@@ -141,6 +141,7 @@ abstract contract GraduationHarness is Test {
             minPushPayout: 1e6,
             minShareForQueue: 1e18,
             feeRecipient: address(0),
+            referrer: address(0),
             metadata: LaunchMetadata({
                 imageCid: keccak256("image"), bannerCid: keccak256("banner"), infoCid: keccak256("info")
             })

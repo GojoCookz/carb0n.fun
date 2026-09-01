@@ -10,6 +10,7 @@ import {HookMiner} from "v4-periphery/test/shared/HookMiner.sol";
 import {PairRegistry} from "../src/PairRegistry.sol";
 import {FeeHook} from "../src/FeeHook.sol";
 import {Launcher} from "../src/Launcher.sol";
+import {ReferralVault} from "../src/ReferralVault.sol";
 import {LaunchToken} from "../src/LaunchToken.sol";
 import {MockERC20} from "../test/mocks/MockERC20.sol";
 import {MockBlacklistERC20} from "../test/mocks/MockERC20.sol";
@@ -125,6 +126,21 @@ contract DeployTestnet is Script {
         );
         require(address(launcher) == predictedLauncher, "launcher missed its reserved address");
 
+        // The referral schedule: 20 / 10 / 5 / 3 / 2 percent of the platform's cut, five deep.
+        // 40% total, so the treasury keeps 60% of every fee even on a fully-populated chain.
+        uint16[] memory tiers = new uint16[](5);
+        tiers[0] = 2000;
+        tiers[1] = 1000;
+        tiers[2] = 500;
+        tiers[3] = 300;
+        tiers[4] = 200;
+
+        // Deployed AFTER the launcher because its constructor needs both addresses, which is the
+        // circularity `initReferralVault` exists to close.
+        ReferralVault vault =
+            new ReferralVault(address(launcher), address(feeHook), platformRecipient, tiers);
+        launcher.initReferralVault(address(vault));
+
         vm.stopBroadcast();
 
         console.log("=== hoodstonk :: Sepolia ===");
@@ -140,6 +156,7 @@ contract DeployTestnet is Script {
         console.log("LaunchToken impl  ", address(tokenImpl));
         console.log("FeeHook           ", address(feeHook));
         console.log("Launcher          ", address(launcher));
+        console.log("ReferralVault     ", address(vault));
 
         // Post-deploy assertions. A script that only logs has not verified anything.
         require(registry.isApproved(address(weth)), "weth not approved");
@@ -161,6 +178,8 @@ contract DeployTestnet is Script {
         require(address(launcher.pairRegistry()) == address(registry), "launcher registry mismatch");
         require(launcher.tokenImplementation() == address(tokenImpl), "launcher impl mismatch");
         require(launcher.launchCount() == 0, "a fresh launcher must have no launches");
+        require(launcher.referralVault() == address(vault), "launcher does not point at the vault");
+        require(vault.tierCount() == 5, "referral schedule did not take");
 
         console.log("--- all post-deploy checks passed ---");
     }

@@ -61,6 +61,7 @@ contract VestTest is Script {
                 minPushPayout: 1e6,
                 minShareForQueue: 1e18,
                 feeRecipient: address(0),
+                referrer: address(0),
                 metadata: LaunchMetadata({imageCid: keccak256("vest"), bannerCid: 0, infoCid: 0})
             })
         );
