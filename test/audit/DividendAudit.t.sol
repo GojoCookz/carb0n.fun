@@ -69,6 +69,30 @@ contract PartialConverter is IRewardConverter {
     }
 }
 
+/// @notice Takes NOTHING and moves payout currency INTO the distributor during `convert`.
+/// @dev Harmless under the pre-fix `_trySend` (it returned zero, so the pair-currency fallback
+///      paid the holder). Under the fixed one it underflows the take measurement. See D-07.
+contract DonatingConverter is IRewardConverter {
+    MockERC20 public immutable payout;
+
+    constructor(MockERC20 payout_) {
+        payout = payout_;
+    }
+
+    function convert(address, address, uint256, address) external returns (uint256) {
+        payout.mint(msg.sender, 1);
+        return 0;
+    }
+}
+
+/// @notice Pulls ONE WEI of whatever it was approved for, and reports "could not route".
+contract OneWeiConverter is IRewardConverter {
+    function convert(address tokenIn, address, uint256, address) external returns (uint256) {
+        IERC20(tokenIn).transferFrom(msg.sender, address(this), 1);
+        return 0;
+    }
+}
+
 contract RevertingConverter2 is IRewardConverter {
     function convert(address, address, uint256, address) external pure returns (uint256) {
         revert("no route");
@@ -197,11 +221,33 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
     }
 
     // ===========================================================================================
-    // D-01  A converter that spends its allowance and returns zero is paid, and then the holder
-    //       is paid again out of everyone else's money.
+    // D-01  REGRESSION GUARD. A converter that spends its allowance and returns zero USED TO be
+    //       paid, and then the holder was paid AGAIN out of everyone else's money.
+    //
+    //       THE BUG (audit 02, HIGH). `_trySend` approved the converter for exactly `amount`,
+    //       called it, and decided success purely from the RETURN VALUE. A converter that pulled
+    //       its input via the allowance and returned `0` - the documented "could not route"
+    //       signal, and the shape an HONEST converter produces on a dead route, a dust input or a
+    //       pool that moved - was paid AND fell through to the fallback `transfer`. Two payments,
+    //       one claim. The ledger recorded one, so `totalWithdrawn <= totalDistributed` stayed
+    //       true and the existing solvency invariant was blind to it; the first withdrawal
+    //       emptied the contract and every remaining holder was permanently unpayable.
+    //
+    //       THE FIX. `_trySend` now measures the payoutToken balance before and after the call
+    //       and judges by what the converter actually TOOK. If the allowance was spent it returns
+    //       true and does not pay again - emitting `RewardConverted` when the converter reported
+    //       an output and `RewardConversionFailed` when it did not, so being paid in a currency
+    //       nobody advertised is still visible on chain.
+    //
+    //       MEASURED on the scenario below (two equal holders, 200e18 distributed, thieving
+    //       converter). Old: alice's single `withdraw()` moved 199.999999999999999998e18 out of
+    //       the distributor - 99.999999999999999999e18 to the converter AND the same again to
+    //       alice - leaving bob owed 99.999999999999999999e18 against a balance of 2 wei of
+    //       stream carry. New: the same call moves 99.999999999999999999e18 exactly once, alice
+    //       receives 0 pair on top, and bob's claim is still fully covered.
     // ===========================================================================================
 
-    function test_D01_converterThatSpendsTheAllowanceAndReturnsZeroIsPaidTwice() public {
+    function test_D01_converterThatSpendsTheAllowanceIsNotPaidTwice() public {
         ThievingConverter thief = new ThievingConverter();
         Distributor d = _mk(1, 1, 1, address(reward), address(thief));
 
@@ -219,31 +265,52 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         assertApproxEqAbs(owedBob, 100e18, _dust(d), "precondition: bob owed half");
         assertEq(pair.balanceOf(address(d)), 200e18, "precondition: the contract holds both claims");
 
+        uint256 alicePairBefore = pair.balanceOf(alice);
+        uint256 thiefBefore = pair.balanceOf(address(thief));
+
         vm.prank(alice);
         d.withdraw();
 
-        // The converter kept the whole approved amount...
-        assertEq(pair.balanceOf(address(thief)), owedAlice, "the converter did not spend the allowance");
-        // ...and `_trySend` fell through and paid the pair currency on top of it.
-        assertEq(pair.balanceOf(alice), owedAlice, "alice was not paid the fallback as well");
+        // PRECONDITION FOR EVERYTHING BELOW: the converter really did spend the allowance and
+        // really did return zero. Without this the "not paid twice" assertions would also pass
+        // against a converter that was never reached at all.
+        assertEq(
+            pair.balanceOf(address(thief)) - thiefBefore,
+            owedAlice,
+            "the converter did not spend the allowance, so this test proves nothing"
+        );
 
-        // Two payments for one claim. The ledger recorded ONE.
-        assertEq(d.withdrawnOf(alice), owedAlice, "the ledger only ever saw one payment");
+        // THE FIX. The allowance was spent, so the claim is settled and the fallback is skipped.
+        assertEq(
+            pair.balanceOf(alice) - alicePairBefore,
+            0,
+            "REGRESSION: alice was paid the pair currency on top of the converter"
+        );
+        // The thieving converter delivers nothing by construction - that is the converter's
+        // problem, and it is exactly the tradeoff the fix makes deliberately.
+        assertEq(reward.balanceOf(alice), 0, "the thief delivered a reward it never had");
+
+        // The claim is marked withdrawn exactly once, and cannot be taken again.
+        assertEq(d.withdrawnOf(alice), owedAlice, "the ledger saw something other than one payment");
+        assertEq(d.withdrawableOf(alice), 0, "alice is still owed after being paid");
         assertLe(d.totalWithdrawn(), d.totalDistributed(), "the existing invariant still passes");
 
-        // The contract now holds less than it owes. That is insolvency, not a rounding gap.
-        assertLt(
+        // Exactly ONE claim left the building, so the contract is still solvent for bob.
+        assertEq(
+            pair.balanceOf(address(d)),
+            200e18 - owedAlice,
+            "more than one claim left the contract on a single withdrawal"
+        );
+        assertGe(
             pair.balanceOf(address(d)),
             d.withdrawableOf(bob),
-            "the distributor should be short by exactly one holder's claim"
-        );
-        // Only the stream's own carry survives: 200e18 arrived, ~2 x 100e18 left on one withdrawal.
-        assertLe(
-            pair.balanceOf(address(d)), _dust(d), "both claims left the building on one withdrawal"
+            "the distributor cannot cover the other holder"
         );
     }
 
-    function test_D01b_theSecondPaymentLeavesEveryOtherHolderUnableToClaim() public {
+    /// The other half of the finding, inverted: the second payment used to leave every other
+    /// holder permanently unable to claim. Now bob's pull works, once.
+    function test_D01b_everyOtherHolderCanStillClaimAfterwards() public {
         ThievingConverter thief = new ThievingConverter();
         Distributor d = _mk(1, 1, 1, address(reward), address(thief));
 
@@ -251,29 +318,59 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         d.setBalance(bob, 1_000e18);
         _fundAndVest(d, 200e18);
 
-        vm.prank(alice);
-        d.withdraw();
+        uint256 thiefAfterAlice;
+        {
+            uint256 thiefBefore = pair.balanceOf(address(thief));
+            vm.prank(alice);
+            uint256 paidAlice = d.withdraw();
+            thiefAfterAlice = pair.balanceOf(address(thief));
+            assertEq(
+                thiefAfterAlice - thiefBefore,
+                paidAlice,
+                "precondition: the converter took alice's claim through the allowance"
+            );
+        }
 
         uint256 owedBob = d.withdrawableOf(bob);
-        // NOT decoration. `NothingToWithdraw` now fires for a holder who is simply un-vested, so
-        // the `expectRevert` below would pass on a perfectly solvent contract without this line.
-        assertGt(owedBob, 0, "bob is still owed on the books");
+        assertGt(owedBob, 0, "precondition: bob is still owed on the books");
+        assertGe(
+            pair.balanceOf(address(d)),
+            owedBob,
+            "precondition: and the money to pay him is still here"
+        );
 
-        // Pull fails: nothing left to pay him with.
+        // THE FIX. Under the bug this reverted `NothingToWithdraw` against an empty contract.
+        uint256 heldBefore = pair.balanceOf(address(d));
+        uint256 bobPairBefore = pair.balanceOf(bob);
         vm.prank(bob);
-        vm.expectRevert(Distributor.NothingToWithdraw.selector);
-        d.withdraw();
+        uint256 paid = d.withdraw();
 
-        // Push fails too, silently, and restores his claim - so he is stuck forever, not paid late.
+        assertEq(paid, owedBob, "bob was paid something other than his claim");
+        assertEq(heldBefore - pair.balanceOf(address(d)), owedBob, "exactly one claim moved");
+        assertEq(
+            pair.balanceOf(address(thief)) - thiefAfterAlice,
+            owedBob,
+            "bob's claim was routed through the converter, once"
+        );
+        assertEq(
+            pair.balanceOf(bob) - bobPairBefore, 0, "bob was paid the fallback on top as well"
+        );
+        assertEq(d.withdrawnOf(bob), owedBob, "bob's claim is marked withdrawn exactly once");
+
+        // The push path agrees: both claims are settled, so it moves nothing and pays nobody.
         (uint256 sent, uint256 total) = d.processBatch(10);
-        assertEq(sent, 0, "somebody was paid out of an empty contract");
+        assertEq(sent, 0, "the push path paid a settled claim");
         assertEq(total, 0);
-        assertEq(d.withdrawableOf(bob), owedBob, "bob's claim is intact and unpayable");
+        assertLe(
+            pair.balanceOf(address(d)),
+            _dust(d),
+            "200e18 arrived and exactly two claims left, so only the stream carry remains"
+        );
     }
 
-    /// The same shape via the push path: one batch empties the contract, paying one claim to the
-    /// converter and one to a holder, and leaves the second holder owed money that is gone.
-    function test_D01c_onePushBatchEmptiesTheContractAndStrandsTheSecondHolder() public {
+    /// The same shape via the push path. One batch used to empty the contract after paying a
+    /// single holder twice; it now pays BOTH holders exactly once and strands nobody.
+    function test_D01c_onePushBatchPaysEveryHolderExactlyOnce() public {
         ThievingConverter thief = new ThievingConverter();
         Distributor d = _mk(1, 1, 1, address(reward), address(thief));
 
@@ -281,23 +378,33 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         d.setBalance(bob, 1_000e18);
         _fundAndVest(d, 200e18);
 
+        uint256 owedAlice = d.withdrawableOf(alice);
+        uint256 owedBob = d.withdrawableOf(bob);
+        assertGt(owedAlice, 0, "precondition: alice has a real claim to push");
+        assertGt(owedBob, 0, "precondition: bob has a real claim to push");
+        uint256 alicePairBefore = pair.balanceOf(alice);
+        uint256 bobPairBefore = pair.balanceOf(bob);
+
         (uint256 sent, uint256 total) = d.processBatch(10);
 
-        assertEq(sent, 1, "expected exactly one holder to be paid before the money ran out");
-        assertApproxEqAbs(total, 100e18, _dust(d));
-        assertApproxEqAbs(
-            pair.balanceOf(address(thief)), 100e18, _dust(d), "the converter kept a claim"
+        assertEq(sent, 2, "the batch must reach BOTH holders; under the bug the money ran out");
+        assertEq(total, owedAlice + owedBob, "and pay each of them exactly their own claim");
+        assertEq(
+            pair.balanceOf(address(thief)),
+            owedAlice + owedBob,
+            "the converter took each claim once, through the allowance"
         );
-        assertLe(
-            pair.balanceOf(address(d)), _dust(d), "200e18 arrived and 200e18 left in one batch"
-        );
+        assertEq(pair.balanceOf(alice) - alicePairBefore, 0, "alice was paid the fallback as well");
+        assertEq(pair.balanceOf(bob) - bobPairBefore, 0, "bob was paid the fallback as well");
 
-        // The unpaid holder still has their claim, correctly restored - and nothing to pay it with.
-        address stranded = pair.balanceOf(alice) == 0 ? alice : bob;
-        assertGt(d.withdrawableOf(stranded), 0, "the skipped holder lost their claim");
-        vm.prank(stranded);
-        vm.expectRevert(Distributor.NothingToWithdraw.selector);
-        d.withdraw();
+        assertEq(d.withdrawableOf(alice), 0, "alice's claim is not settled");
+        assertEq(d.withdrawableOf(bob), 0, "bob's claim is not settled");
+        assertLe(
+            pair.balanceOf(address(d)),
+            _dust(d),
+            "200e18 arrived and exactly 200e18 left, so only the stream carry remains"
+        );
+        assertLe(d.totalWithdrawn(), d.totalDistributed(), "the existing invariant still passes");
     }
 
     /// Control: an honest converter that pulls and reports truthfully pays exactly once.
@@ -318,6 +425,102 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         assertEq(reward.balanceOf(alice), owed, "not paid the reward");
         assertEq(pair.balanceOf(address(d)), 200e18 - owed, "the contract lost more than one claim");
         assertGe(pair.balanceOf(address(d)), d.withdrawableOf(bob), "solvent");
+    }
+
+    // ===========================================================================================
+    // D-07 (LOW, NEW - INTRODUCED BY THE D-01 FIX). The take measurement can underflow, and the
+    //      panic is not catchable.
+    // ===========================================================================================
+
+    /// @dev `_trySend` now computes `taken = heldBefore - IERC20(payoutToken).balanceOf(this)`
+    ///      INSIDE the `try`'s SUCCESS block, which the `catch` does not cover. Any converter
+    ///      whose `convert` leaves the distributor holding MORE payout currency than it started
+    ///      with makes that subtraction underflow, and 0.8 arithmetic turns it into a bare
+    ///      panic 0x11.
+    ///
+    ///      **Under the pre-fix code this converter shape was completely harmless**: it took
+    ///      nothing and returned zero, so `_trySend` fell straight through to the pair-currency
+    ///      transfer and the holder was paid. So this is a regression, not a pre-existing hole.
+    ///
+    ///      Two consequences, both asserted below:
+    ///        - `withdraw()` panics instead of paying, and no retry can ever help, because
+    ///          `converter` is IMMUTABLE on the Distributor.
+    ///        - `processBatch` panics for the WHOLE QUEUE, which is precisely what that
+    ///          function's own docstring - "a failing recipient is skipped and the cursor moves
+    ///          on ... one hostile or blocklisted receiver must never brick the queue for
+    ///          everyone else" - promises cannot happen. Same class as D-06c.
+    ///
+    ///      Reached only through a converter the launcher deployer wires in, so it is not
+    ///      attacker-reachable per holder. One-line fix, keeping every property the D-01 fix
+    ///      bought: `uint256 held = IERC20(payoutToken).balanceOf(address(this));
+    ///      uint256 taken = held < heldBefore ? heldBefore - held : 0;`
+    function test_D07_aConverterThatDonatesPayoutCurrencyBackPanicsInsteadOfPaying() public {
+        DonatingConverter donor = new DonatingConverter(pair);
+        Distributor d = _mk(1, 1, 1, address(reward), address(donor));
+
+        d.setBalance(alice, 1_000e18);
+        d.setBalance(bob, 1_000e18);
+        _fundAndVest(d, 200e18);
+
+        uint256 owed = d.withdrawableOf(alice);
+        assertGt(owed, 0, "precondition: there is a real claim, so this is not an empty-claim revert");
+        assertGe(pair.balanceOf(address(d)), owed, "precondition: and the money to pay it is here");
+
+        // Not `NothingToWithdraw`. A raw arithmetic panic, out of reach of the `catch`.
+        vm.prank(alice);
+        vm.expectRevert(stdError.arithmeticError);
+        d.withdraw();
+
+        // And it takes the permissionless push path down with it, for every queued holder.
+        assertGt(d.withdrawableOf(bob), 0, "precondition: bob is a second, entirely innocent holder");
+        vm.expectRevert(stdError.arithmeticError);
+        d.processBatch(10);
+
+        assertEq(d.totalWithdrawn(), 0, "nobody was paid at all");
+    }
+
+    /// @dev The fix's deliberate tradeoff, priced. `_trySend` returns true as soon as the
+    ///      converter took ANYTHING, so a converter that pulls ONE WEI of a ~100e18 allowance and
+    ///      returns zero settles the ENTIRE claim.
+    ///
+    ///      Measured: `withdrawnOf(alice) == 99999999999999999999`, the converter holds 1 wei,
+    ///      alice receives 0 pair and 0 reward, and 100000000000000000000 wei stays in the
+    ///      distributor as surplus attributable to nobody - it is in neither `pendingPayouts` nor
+    ///      anybody's claim.
+    ///
+    ///      This is STRICTLY BETTER than what it replaced - the contract stays solvent and every
+    ///      other holder is still payable, both asserted below - but it is a real behaviour
+    ///      change: the old code paid this holder the pair-currency fallback in full (on top of
+    ///      the wei the converter took). Recorded so that "judged by what it TOOK" is a decision
+    ///      on the record rather than an accident.
+    function test_D07b_aOneWeiTakeSettlesTheWholeClaimWithoutPayingTheHolder() public {
+        OneWeiConverter tiny = new OneWeiConverter();
+        Distributor d = _mk(1, 1, 1, address(reward), address(tiny));
+
+        d.setBalance(alice, 1_000e18);
+        d.setBalance(bob, 1_000e18);
+        _fundAndVest(d, 200e18);
+
+        uint256 owed = d.withdrawableOf(alice);
+        assertGt(owed, 0, "precondition: alice has a real claim");
+        uint256 alicePairBefore = pair.balanceOf(alice);
+
+        vm.prank(alice);
+        d.withdraw();
+
+        assertEq(pair.balanceOf(address(tiny)), 1, "precondition: the converter took exactly one wei");
+        assertEq(pair.balanceOf(alice) - alicePairBefore, 0, "alice was paid the fallback after all");
+        assertEq(reward.balanceOf(alice), 0, "alice received a reward currency from nowhere");
+        assertEq(d.withdrawnOf(alice), owed, "her whole claim was settled by a one-wei take");
+        assertEq(d.withdrawableOf(alice), 0, "and she cannot claim it again");
+
+        // The saving grace, and the reason this is a note rather than a HIGH: no insolvency, and
+        // no other holder is harmed.
+        assertGe(
+            pair.balanceOf(address(d)), d.withdrawableOf(bob), "bob must still be fully covered"
+        );
+        vm.prank(bob);
+        assertEq(d.withdraw(), d.withdrawnOf(bob), "bob's own pull still works");
     }
 
     /// @dev The allowance bound itself holds: the approval is exactly `amount`, so a converter

@@ -212,6 +212,10 @@ contract FeeHook is HookBase {
     event FeeAccrued(PoolId indexed poolId, Currency currency, uint256 amount, bool isBuy);
     /// @notice Launch tokens bought back from the pool and destroyed, during a sweep.
     event Burned(PoolId indexed poolId, uint256 pairSpent, uint256 tokensBurned);
+    /// @notice Sell-fee conversion could not complete, so the remainder was returned to the queue.
+    /// @dev The pool could not absorb it. Deferred rather than reverted: sweep is the only
+    ///      thing that clears this backlog, so a revert here would brick it permanently.
+    event SellFeeConversionDeferred(PoolId indexed poolId, uint256 returned);
     /// @notice An automatic sweep was attempted and failed. The claim stays queued for `sweep`.
     event AutoSweepSkipped(PoolId indexed poolId, uint256 pending);
     /// @notice Paid to whoever called `sweep`, out of what they swept.
@@ -795,21 +799,57 @@ contract FeeHook is HookBase {
         //    hook's own callbacks here, so this internal swap is untaxed and cannot recurse.
         uint256 totalPair = pairAmount;
         if (tokenAmount != 0) {
-            poolManager.burn(address(this), tokenCurrency.toId(), tokenAmount);
-            BalanceDelta d = poolManager.swap(
-                key,
-                SwapParams({
-                    // Selling the launch token: pay token in, receive pair out.
-                    zeroForOne: !pairIsCurrency0,
-                    amountSpecified: -int256(tokenAmount),
-                    sqrtPriceLimitX96: !pairIsCurrency0
-                        ? TickMath.MIN_SQRT_PRICE + 1
-                        : TickMath.MAX_SQRT_PRICE - 1
-                }),
-                ""
-            );
-            int128 gained = pairIsCurrency0 ? d.amount0() : d.amount1();
-            if (gained > 0) totalPair += uint256(uint128(gained));
+            // **The pool may be unable to absorb this, and that must not be fatal.** Production
+            // pools are seeded SINGLE-SIDED, so the pair reserve is only ever what buyers put in.
+            // Once the accumulated sell tax is worth more pair than the pool holds, the swap
+            // cannot fill - and since `sweep` is the ONLY thing that clears `pendingTokenFees`,
+            // a revert here meant every future sweep reverted too, for every caller, forever.
+            // Dividends, creator revenue and platform revenue all stopped permanently, and one
+            // dump by any large holder was enough to trigger it.
+            uint160 limit = !pairIsCurrency0
+                ? TickMath.MIN_SQRT_PRICE + 1
+                : TickMath.MAX_SQRT_PRICE - 1;
+
+            (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(id);
+            // At the very edge of the range the limit is ALREADY passed and the manager reverts
+            // `PriceLimitAlreadyExceeded` before doing any work. Skip rather than die.
+            bool priceAllows =
+                !pairIsCurrency0 ? sqrtPriceX96 > limit : sqrtPriceX96 < limit;
+
+            if (priceAllows) {
+                poolManager.burn(address(this), tokenCurrency.toId(), tokenAmount);
+                BalanceDelta d = poolManager.swap(
+                    key,
+                    SwapParams({
+                        // Selling the launch token: pay token in, receive pair out.
+                        zeroForOne: !pairIsCurrency0,
+                        amountSpecified: -int256(tokenAmount),
+                        sqrtPriceLimitX96: limit
+                    }),
+                    ""
+                );
+
+                // **Re-mint whatever the pool could not take.** An exact-input swap that runs out
+                // of liquidity consumes less than it was given and leaves the rest as an open
+                // token credit; `unlock` reverts `CurrencyNotSettled` on any non-zero delta,
+                // including a credit. Minting the unconsumed remainder back closes the delta AND
+                // returns the fee to the queue, so it is deferred rather than destroyed.
+                int128 tokenDelta = pairIsCurrency0 ? d.amount1() : d.amount0();
+                uint256 spent = tokenDelta < 0 ? uint256(uint128(-tokenDelta)) : 0;
+                if (spent < tokenAmount) {
+                    uint256 unspent = tokenAmount - spent;
+                    poolManager.mint(address(this), tokenCurrency.toId(), unspent);
+                    pendingTokenFees[id] += unspent;
+                    emit SellFeeConversionDeferred(id, unspent);
+                }
+
+                int128 gained = pairIsCurrency0 ? d.amount0() : d.amount1();
+                if (gained > 0) totalPair += uint256(uint128(gained));
+            } else {
+                // Nothing was burned, so there is no delta to close. Put it straight back.
+                pendingTokenFees[id] += tokenAmount;
+                emit SellFeeConversionDeferred(id, tokenAmount);
+            }
         }
 
         if (totalPair == 0) return "";

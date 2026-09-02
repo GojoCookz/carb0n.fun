@@ -12,6 +12,7 @@ import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {Pool} from "v4-core/libraries/Pool.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
@@ -38,6 +39,7 @@ import {LaunchTokenDeployer} from "../utils/LaunchTokenDeployer.sol";
 ///      currency-ordering-sensitive findings with the token as `currency1`.
 abstract contract FeeAuditWorld is Test, LaunchTokenDeployer {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     PoolManager internal manager;
     FeeHook internal hook;
@@ -556,68 +558,146 @@ abstract contract FeeAuditFindings is FeeAuditWorld {
     }
 
     // -------------------------------------------------------------------------------------------
-    // F-05  `sweep()` bricks permanently once the sell-fee pile outgrows the pool's pair reserve.
+    // F-05  REGRESSION GUARD. `sweep()` used to brick PERMANENTLY once the sell-fee pile outgrew
+    //       the pool's pair reserve. It now defers what the pool cannot absorb.
     // -------------------------------------------------------------------------------------------
 
-    /// @dev `unlockCallback` burns the WHOLE `pendingTokenFees` claim into a token credit and then
-    ///      tries to sell all of it in one exact-input swap (FeeHook.sol:798-810). It never checks
-    ///      that the swap actually consumed what it burned.
+    /// @dev **THE BUG (audit 01, HIGH).** `unlockCallback` burned the WHOLE `pendingTokenFees`
+    ///      claim into a token credit and sold all of it in one exact-input swap, without ever
+    ///      checking that the swap consumed what it burned. A production pool is seeded
+    ///      SINGLE-SIDED, so there is no liquidity below the opening tick and the pool's pair
+    ///      balance is only ever what buyers put in. Once the accumulated sell tax was worth more
+    ///      pair than the pool still held, the conversion either
     ///
-    ///      A production pool is seeded SINGLE-SIDED, so there is no liquidity at all below the
-    ///      opening tick and the pool's pair balance is only ever what buyers put in. Once the
-    ///      accumulated sell tax is worth more pair than the pool still holds, the conversion swap
-    ///      walks to `MIN_SQRT_PRICE + 1`, stops with launch tokens unspent, and leaves the hook
-    ///      holding a positive token delta nothing closes. The unlock cycle then ends non-zero and
-    ///      the PoolManager reverts `CurrencyNotSettled`.
+    ///        MODE 1 - reverted `PriceLimitAlreadyExceeded(p, p)` because the dump had already
+    ///                 pinned spot at the exact `sqrtPriceLimitX96` the conversion passes, or
+    ///        MODE 2 - partially filled and left an unsettled token CREDIT, which
+    ///                 `PoolManager.unlock`'s sign-agnostic `NonzeroDeltaCount != 0` check turned
+    ///                 into `CurrencyNotSettled`.
     ///
-    ///      `sweep` is the ONLY way to clear `pendingTokenFees`, and it reverts before it can zero
-    ///      it, so the state is self-perpetuating: every future sweep on that pool reverts too, and
-    ///      the pool's pair-currency fees are trapped alongside the token ones.
-    function test_F05_sweepBricksWhenTheSellPileExceedsThePoolsPairReserve() public {
+    ///      `sweep` is the ONLY thing that clears `pendingTokenFees` and it reverted before
+    ///      reaching the line that clears it, so the state was self-perpetuating: every later
+    ///      sweep by every caller reverted too, and the pool's pair-currency fees were trapped
+    ///      alongside the token ones. Dividends, creator revenue and platform revenue stopped
+    ///      forever, triggered by one ordinary dump.
+    ///
+    ///      **THE FIX.** `unlockCallback` now (1) reads `slot0` and skips the swap entirely when
+    ///      spot is already at the limit, and (2) re-mints whatever the pool could not absorb,
+    ///      adding it back to `pendingTokenFees` and emitting `SellFeeConversionDeferred`. The
+    ///      claim is deferred, never destroyed, and the pair-currency fees queued behind it are
+    ///      released on the same call.
+    ///
+    ///      **MEASURED, this scenario, identical to the wei in both currency orderings.** A
+    ///      2,000,000e18 dump at a 10% sell tax leaves a 200,000e18 pile against a pool whose
+    ///      entire pair reserve is one 1e18 buy (0.03e18 of which is fee):
+    ///
+    ///      | sweep | before the fix | after the fix |
+    ///      |---|---|---|
+    ///      | #1, spot pinned AT the limit | revert `PriceLimitAlreadyExceeded(p,p)` | ok - 200,000e18 deferred, pair fees released, holders paid |
+    ///      | #2, after a 1e18 buy | revert `CurrencyNotSettled` | ok - partial fill, 199,999.030000940899087327e18 deferred |
+    ///      | #3, after a 500,000e18 buy | revert `CurrencyNotSettled` | ok - `pendingTokenFees` -> 0, nothing deferred |
+    ///
+    ///      Note what sweep #2 shows about the SIZE of a partial fill on a single-sided pool: a
+    ///      1e18 buy bought back only 0.97e18 of launch token, so that is all the conversion can
+    ///      sell before it runs out of range. The backlog drains at the rate real pair currency
+    ///      enters the pool, which is the honest behaviour - and is why it must be carried rather
+    ///      than reverted on.
+    ///
+    ///      Sweep #3 is the part that proves DEFERRED rather than LOST: the same claim, untouched
+    ///      through two sweeps the pool could not fill, converts in full once there is pair
+    ///      liquidity to convert it against.
+    function test_F05_sweepSurvivesASellPileLargerThanThePoolsPairReserve() public {
         PoolKey memory k = _newSingleSidedPool(60, /*buy*/ 300, /*sell*/ 1000);
         PoolId id = k.toId();
 
         // One small buy, so the pool holds a little pair currency and the fee path is live.
         _buyExactIn(k, bob, 1e18);
-        assertGt(hook.pendingFees(id), 0, "a pair-currency fee is queued too");
+        uint256 pairFees = hook.pendingFees(id);
+        assertGt(pairFees, 0, "precondition: a pair-currency fee is queued behind the pile");
 
-        // A large holder - a creator allocation, an airdrop, a vested unlock - dumps.
-        token.transfer(alice, 50_000_000e18);
-        _sellExactIn(k, alice, 50_000_000e18);
+        // A large holder - a creator allocation, an airdrop, a vested unlock - dumps. The pool's
+        // whole pair reserve at this instant is one 1e18 buy, so the 10% tax on this is worth
+        // orders of magnitude more pair than the pool can pay.
+        token.transfer(alice, 2_000_000e18);
+        _sellExactIn(k, alice, 2_000_000e18);
 
-        uint256 tokenFees = hook.pendingTokenFees(id);
-        assertGt(tokenFees, 0, "the sell tax accrued in launch tokens");
-        emit log_named_uint("launch tokens owed to holders", tokenFees);
-        emit log_named_uint("pair currency left in the pool", pair.balanceOf(address(manager)));
+        uint256 pile = hook.pendingTokenFees(id);
+        assertGt(pile, 0, "precondition: the sell tax accrued in launch tokens");
+        emit log_named_uint("launch tokens owed to holders   ", pile);
+        emit log_named_uint("pair currency left in the pool  ", pair.balanceOf(address(manager)));
 
-        // MODE 1. The dump pinned the price at the bottom of the seeded range, which is exactly
-        // the `sqrtPriceLimitX96` the conversion swap passes, so `Pool.swap` rejects it outright.
-        // The conversion sells the launch token, so it runs zeroForOne exactly when the token is
-        // currency0 - and the limit it passes is the corresponding end of the band.
+        // -----------------------------------------------------------------------------------
+        // SWEEP #1. Spot is pinned at exactly the limit the conversion swap passes. This is the
+        // input that used to revert `PriceLimitAlreadyExceeded(p, p)` before any work was done.
+        // -----------------------------------------------------------------------------------
         uint160 pinnedAt = _tokenIsCurrency0()
             ? TickMath.MIN_SQRT_PRICE + 1
             : TickMath.MAX_SQRT_PRICE - 1;
-        vm.expectRevert(
-            abi.encodeWithSelector(Pool.PriceLimitAlreadyExceeded.selector, pinnedAt, pinnedAt)
+        (uint160 spot,,,) = StateLibrary.getSlot0(IPoolManager(address(manager)), id);
+        assertEq(spot, pinnedAt, "precondition: the dump pinned spot AT the conversion's own limit");
+
+        uint256 distBefore = pair.balanceOf(address(dist));
+        vm.recordLogs();
+        hook.sweep(k);
+
+        assertEq(_deferredInLogs(id), pile, "the whole pile must be reported as deferred");
+        assertEq(hook.pendingTokenFees(id), pile, "and returned to the queue, wei for wei");
+        assertEq(hook.pendingFees(id), 0, "the pair fees behind it are no longer trapped");
+        assertGt(
+            pair.balanceOf(address(dist)) - distBefore,
+            0,
+            "and holders were actually paid out of them"
         );
-        hook.sweep(k);
 
-        // Not transient, and not caller-specific: nothing but `sweep` clears `pendingTokenFees`,
-        // and `sweep` cannot reach the line that clears it.
-        assertEq(hook.pendingTokenFees(id), tokenFees, "the token pile is still there");
-        vm.prank(bob);
-        vm.expectRevert();
-        hook.sweep(k);
-
-        // MODE 2. Buying lifts the price off the floor, so the conversion swap is now legal - and
-        // partially fills. The unspent launch tokens are a credit the hook opened with `burn` and
-        // never closes, so the unlock cycle ends non-zero.
+        // -----------------------------------------------------------------------------------
+        // SWEEP #2. A buy lifts spot off the floor, so the swap is legal - and partially fills,
+        // because the pool holds far less pair currency than the pile is worth. This is the
+        // input that used to revert `CurrencyNotSettled` on the leftover credit.
+        // -----------------------------------------------------------------------------------
         _buyExactIn(k, bob, 1e18);
-        vm.expectRevert(IPoolManager.CurrencyNotSettled.selector);
+        vm.recordLogs();
         hook.sweep(k);
 
-        assertGt(hook.pendingFees(id), 0, "pair fees are trapped behind the broken conversion");
-        assertEq(hook.pendingTokenFees(id), tokenFees, "and the pile never shrinks");
+        uint256 remainder = hook.pendingTokenFees(id);
+        assertEq(_deferredInLogs(id), remainder, "the event must report exactly what came back");
+        assertLt(remainder, pile, "a partial fill must convert SOME of the pile");
+        assertGt(remainder, 0, "this pool cannot absorb all of it yet - that is the whole scenario");
+        emit log_named_uint("deferred after the partial fill ", remainder);
+
+        // -----------------------------------------------------------------------------------
+        // SWEEP #3. THE PROOF THAT IT WAS DEFERRED AND NOT LOST. Real buying puts real pair
+        // currency in the pool, and the SAME claim - carried across two sweeps that could not
+        // fill it - now converts completely and reaches the holders.
+        // -----------------------------------------------------------------------------------
+        _buyExactIn(k, bob, 500_000e18);
+
+        uint256 distBefore3 = pair.balanceOf(address(dist));
+        vm.recordLogs();
+        hook.sweep(k);
+
+        assertEq(hook.pendingTokenFees(id), 0, "the carried claim finally converted in full");
+        assertEq(_deferredInLogs(id), 0, "and nothing was deferred on the way");
+        assertGt(
+            pair.balanceOf(address(dist)) - distBefore3,
+            0,
+            "the converted sell tax reached the holders"
+        );
+        assertEq(hook.pendingFees(id), 0, "and the pool is fully swept");
+    }
+
+    /// @dev Sum the `returned` field of every `SellFeeConversionDeferred(bytes32,uint256)` in the
+    ///      last recorded trace, for one pool. Zero when the event was never emitted, which is
+    ///      exactly the "nothing was deferred" assertion sweep #3 needs.
+    function _deferredInLogs(PoolId id) internal view returns (uint256 total) {
+        bytes32 sig = keccak256("SellFeeConversionDeferred(bytes32,uint256)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter != address(hook)) continue;
+            if (logs[i].topics.length < 2) continue;
+            if (logs[i].topics[0] != sig) continue;
+            if (logs[i].topics[1] != PoolId.unwrap(id)) continue;
+            total += abi.decode(logs[i].data, (uint256));
+        }
     }
 
     // -------------------------------------------------------------------------------------------

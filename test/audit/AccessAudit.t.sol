@@ -372,22 +372,40 @@ contract AccessAuditTest is AccessAuditHarness {
     }
 
     // -------------------------------------------------------------------------------------------
-    // FINDING A-2 (HIGH): every dividend PUSHED to a VestingVault is permanently unrecoverable.
+    // FINDING A-2 (HIGH) - REGRESSION GUARD. Every dividend PUSHED to a VestingVault USED TO be
+    // permanently unrecoverable.
     // -------------------------------------------------------------------------------------------
     //
-    // `Distributor.processBatch` is permissionless by design. `VestingVault.claimDividends` is
-    // `onlyBeneficiary` and its ONLY way of moving payout currency out is
-    // `balanceAfter - balanceBefore` around a `Distributor.withdraw()` that reverts when nothing
-    // is withdrawable. So:
+    // THE BUG. `Distributor.processBatch` is permissionless by design and the vault is an
+    // ordinary holder in its queue, so anybody could push a payout into it.
+    // `VestingVault.claimDividends`'s only way of moving payout currency out was
+    // `balanceAfter - balanceBefore` around an UNCONDITIONAL `Distributor.withdraw()`:
     //
-    //   push  -> the vault's payout tokens land inside `balanceBefore`
-    //   claim -> `withdraw()` reverts `NothingToWithdraw`, the whole call reverts
-    //   later -> a claim succeeds but only forwards the NEW delta; the pushed balance is skipped
+    //   push  -> the vault's payout tokens land inside `balanceBefore`, invisible to the delta
+    //   claim -> `withdraw()` reverts `NothingToWithdraw` because the push already cleared the
+    //            claim, and takes the whole call down with it
+    //   later -> a claim succeeds but forwards only the NEW delta, stepping over the pile forever
     //
-    // `VestingVault` has no rescue, no owner and no other transfer of `payoutToken`. Cost to
-    // trigger: one `processBatch` call by anybody - or an honest keeper doing exactly the job the
-    // Distributor docstring advertises.
-    function test_finding_pushedDividendsAreStrandedInAVestingVaultForever() public {
+    // The vault has no rescue, no owner and no other `payoutToken` transfer in its ABI, so the
+    // money was gone. Cost to trigger: one cheap call by anybody - or an honest keeper doing
+    // exactly the job the Distributor's own docstring advertises.
+    //
+    // THE FIX. `claimDividends` now pulls ONLY when `withdrawableOf != 0`, then forwards its
+    // ENTIRE balance of both `payoutToken` and `rewardToken` - however that balance arrived -
+    // through a `_forward` helper that refuses to move `token`, the locked principal.
+    //
+    // MEASURED on the scenario below - 5e18 dev buy vested over 90 days, four 5e18 buys swept.
+    // The keeper's push lands 86,948,040,164,649,577 wei of pair currency in the vault, and two
+    // more swept buys accrue a further 37,716,840,131,719,663.
+    //
+    //   OLD: the `claimDividends` immediately after the push REVERTED `NothingToWithdraw`. A
+    //        later one succeeded and forwarded only the new 37,716,840,131,719,663, leaving
+    //        86,948,040,164,649,577 in the vault - unchanged by every subsequent claim.
+    //   NEW: one `claimDividends` forwards 124,664,880,296,369,240 - the pushed pile AND the
+    //        fresh pull together - the vault ends holding zero pair currency, and its locked
+    //        principal is untouched to the wei.
+
+    function test_fixed_pushedDividendsReachTheBeneficiary() public {
         (address token, VestingVault vault) = _launchVested(5e18, 90 days, 0);
         Distributor dist = LaunchToken(token).distributor();
 
@@ -400,59 +418,78 @@ contract AccessAuditTest is AccessAuditHarness {
         assertGt(owedToVault, 0, "the locked bag must accrue like any other holder");
         assertEq(pair.balanceOf(address(vault)), 0, "vault holds no payout currency yet");
 
-        // ANY address may push. This is the documented, intended, permissionless path.
+        // ANY address may push. This is the documented, intended, permissionless path, and it is
+        // the input that used to destroy the money.
         vm.prank(attacker);
         dist.processBatch(50);
 
-        uint256 stranded = pair.balanceOf(address(vault));
-        assertEq(stranded, owedToVault, "the push landed on the vault");
-        assertEq(dist.withdrawableOf(address(vault)), 0, "and the claim is now settled");
+        uint256 pushed = pair.balanceOf(address(vault));
+        assertEq(pushed, owedToVault, "precondition: the push really did land on the vault");
+        assertEq(
+            dist.withdrawableOf(address(vault)),
+            0,
+            "precondition: and really did settle the claim, so there is nothing left to pull"
+        );
 
-        // The beneficiary's only door is now bolted. The two assertions above are what make this
-        // `expectRevert` mean something: under streaming `NothingToWithdraw` also fires for a
-        // holder who is merely un-vested, so the revert alone proves nothing. Here the vault was
-        // provably owed `owedToVault`, provably paid it by the push, and is provably at zero.
-        vm.prank(creator);
-        vm.expectRevert(Distributor.NothingToWithdraw.selector);
-        vault.claimDividends();
-
-        // More trading, more dividends - and the stranded balance is STILL skipped, because
-        // `claimDividends` forwards only the delta it observes around `withdraw()`.
+        // More trading, so ONE call now has both a pushed pile sitting in the balance and a fresh
+        // claim to pull. The old delta measurement could only ever see the second of those.
         _buyAndSweep(trader, token, 5e18);
         _buyAndSweep(stranger, token, 5e18);
         _vest(dist);
 
-        uint256 creatorBefore = pair.balanceOf(creator);
+        uint256 freshClaim = dist.withdrawableOf(address(vault));
+        assertGt(freshClaim, 0, "precondition: there is also a new claim to pull");
+
+        uint256 creatorPairBefore = pair.balanceOf(creator);
+        uint256 creatorTokenBefore = LaunchToken(token).balanceOf(creator);
+        uint256 vaultTokenBefore = LaunchToken(token).balanceOf(address(vault));
+        assertGt(vaultTokenBefore, 0, "precondition: the vault is holding locked principal");
+        assertGt(vault.releasable(), 0, "precondition: some of that principal has even vested");
+
         vm.prank(creator);
         uint256 got = vault.claimDividends();
 
-        assertGt(got, 0, "the new dividend did reach the beneficiary");
-        assertEq(pair.balanceOf(creator) - creatorBefore, got, "and only the new one");
+        // THE FIX, both halves, in one call.
+        assertEq(got, pushed + freshClaim, "the pushed pile was stepped over again");
         assertEq(
-            pair.balanceOf(address(vault)),
-            stranded,
-            "the pushed dividend is still sitting there, unreachable"
+            pair.balanceOf(creator) - creatorPairBefore, got, "the beneficiary was short-changed"
+        );
+        assertEq(pair.balanceOf(address(vault)), 0, "payout currency was left behind in the vault");
+
+        // ...and the LOCKED PRINCIPAL never moves. `_forward`'s `asset == token` guard is the only
+        // thing standing between "forward the whole balance" and "empty the vault early", which is
+        // the entire promise this contract exists to make. Note the precondition above: principal
+        // is genuinely vested and genuinely releasable at this instant, so a missing guard would
+        // show up here rather than being masked by a cliff.
+        assertEq(
+            LaunchToken(token).balanceOf(address(vault)),
+            vaultTokenBefore,
+            "LOCKED PRINCIPAL LEFT THE VAULT"
+        );
+        assertEq(
+            LaunchToken(token).balanceOf(creator),
+            creatorTokenBefore,
+            "the beneficiary was paid locked principal early"
         );
 
-        // There is no other exit. The only `payoutToken` transfer on VestingVault is the one
-        // inside `claimDividends`, and it can only ever move the delta.
-        _buyAndSweep(trader, token, 5e18);
-        _vest(dist);
+        // Claiming again with nothing pending is a harmless no-op returning zero, not a revert
+        // that takes the whole call - and therefore the whole balance - down with it.
         vm.prank(creator);
-        vault.claimDividends();
-        assertEq(pair.balanceOf(address(vault)), stranded, "still stranded after a second claim");
+        assertEq(vault.claimDividends(), 0, "an empty claim must be a no-op, not a revert");
     }
 
-    /// The same defect, reached WITHOUT an attacker: the vault is enqueued like any holder, so the
-    /// first well-meaning keeper to call `processBatch` destroys the creator's dividend stream.
+    /// The same path reached WITHOUT an attacker: the vault is enqueued like any holder, so the
+    /// first well-meaning keeper to call `processBatch` used to destroy the creator's dividend.
+    /// It now costs the beneficiary nothing at all, measured against a control run in which no
+    /// keeper ever fires.
     ///
-    /// @dev **This was a VACUOUS PASS under streaming and was not on the failing list.** Without
-    ///      the `_vest`, the vault is owed zero, `processBatch` walks past it paying nobody, and
-    ///      `claimDividends` reverts `NothingToWithdraw` for the entirely innocent reason that
-    ///      nothing had vested yet - i.e. the test was green on a system where the keeper had
-    ///      done no harm at all. The three added assertions pin the causal chain instead of the
-    ///      revert selector.
-    function test_finding_anHonestKeeperCausesTheSameLoss() public {
+    /// @dev **This test was a VACUOUS PASS once before** (streaming migration wave 3): without the
+    ///      `_vest` the vault was owed zero, `processBatch` walked past it paying nobody, and
+    ///      `claimDividends` reverted `NothingToWithdraw` for the entirely innocent reason that
+    ///      nothing had vested. The queue check, the `assertGt(owedToVault, 0)` and the two
+    ///      post-push assertions pin the causal chain rather than a revert selector; the
+    ///      snapshot control pins the OUTCOME rather than the absence of a revert.
+    function test_fixed_anHonestKeeperCostsTheBeneficiaryNothing() public {
         (address token, VestingVault vault) = _launchVested(5e18, 90 days, 0);
         Distributor dist = LaunchToken(token).distributor();
 
@@ -470,17 +507,46 @@ contract AccessAuditTest is AccessAuditHarness {
         uint256 owedToVault = dist.withdrawableOf(address(vault));
         assertGt(owedToVault, 0, "the vault is genuinely owed before the keeper runs");
 
-        vm.prank(stranger); // a bounty bot, not an attacker
+        // CONTROL: what the beneficiary ends up with if NO keeper ever runs. Without this the
+        // test only says "it did not revert", which is not the same as "it cost nothing".
+        uint256 snap = vm.snapshotState();
+        vm.prank(creator);
+        uint256 withoutKeeper = vault.claimDividends();
+        uint256 creatorEndsWithout = pair.balanceOf(creator);
+        assertGt(withoutKeeper, 0, "the control itself must move real money");
+        require(vm.revertToState(snap), "the no-keeper control could not be unwound");
+
+        // Now the keeper - a bounty bot doing exactly the job the Distributor docstring
+        // advertises, not an attacker.
+        uint256 creatorBefore = pair.balanceOf(creator);
+        vm.prank(stranger);
         dist.processBatch(50);
 
-        // The keeper really did land the money, and really did settle the claim. Without these
-        // two the revert below is indistinguishable from "nothing had vested".
-        assertEq(pair.balanceOf(address(vault)), owedToVault, "the keeper pushed it into the vault");
-        assertEq(dist.withdrawableOf(address(vault)), 0, "and settled the claim doing it");
+        assertEq(
+            pair.balanceOf(address(vault)),
+            owedToVault,
+            "precondition: the keeper pushed it into the vault"
+        );
+        assertEq(
+            dist.withdrawableOf(address(vault)),
+            0,
+            "precondition: and settled the claim doing it"
+        );
 
         vm.prank(creator);
-        vm.expectRevert(Distributor.NothingToWithdraw.selector);
-        vault.claimDividends();
+        uint256 withKeeper = vault.claimDividends();
+
+        assertEq(withKeeper, owedToVault, "the beneficiary got something other than what was owed");
+        assertEq(withKeeper, withoutKeeper, "the keeper changed what the beneficiary could claim");
+        assertEq(
+            pair.balanceOf(creator) - creatorBefore, withKeeper, "the money never reached them"
+        );
+        assertEq(
+            pair.balanceOf(creator),
+            creatorEndsWithout,
+            "keeper or no keeper, the beneficiary ends at the same wei"
+        );
+        assertEq(pair.balanceOf(address(vault)), 0, "nothing was left stranded in the vault");
     }
 
     // -------------------------------------------------------------------------------------------

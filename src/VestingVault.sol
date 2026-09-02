@@ -187,17 +187,42 @@ contract VestingVault {
 
     /// @notice Pull whatever the locked supply has earned and forward it to the beneficiary.
     /// @dev The locked principal never moves early. Only the dividend stream is claimed.
+    /// @dev **Forwards the whole balance, and pulls only if there is something to pull.**
+    ///
+    ///      The previous version measured a DELTA around an unconditional `withdraw()`, and both
+    ///      halves of that were wrong. `Distributor.processBatch` is permissionless and this vault
+    ///      is an ordinary holder in its queue, so anyone could PUSH a payout here; that money
+    ///      landed inside `before`, was therefore invisible to the delta, and `withdraw()` then
+    ///      reverted `NothingToWithdraw` because the push had already cleared the claim - taking
+    ///      the whole call down. Every later claim forwarded only its own delta and stepped over
+    ///      the stranded pile forever. The vault has no owner and no other transfer of this token,
+    ///      so it was unrecoverable, and an honest keeper doing exactly what the distributor's
+    ///      docs recommend was enough to cause it.
     function claimDividends() external onlyBeneficiary returns (uint256 amount) {
         if (accrualRenounced) revert AlreadyRenounced();
 
         Distributor d = Distributor(distributor);
         address payout = d.payoutToken();
 
-        uint256 before = IERC20(payout).balanceOf(address(this));
-        d.withdraw();
-        amount = IERC20(payout).balanceOf(address(this)) - before;
+        // Pull only when there is a claim. A push may already have settled it.
+        if (d.withdrawableOf(address(this)) != 0) d.withdraw();
 
-        if (amount != 0) IERC20(payout).safeTransfer(beneficiary, amount);
+        // Forward everything held, however it arrived - pulled now, or pushed at any point since.
+        amount = _forward(payout);
+
+        // A creator may have chosen to be paid in something other than the pair currency, in
+        // which case the converter sends THAT here instead and the pair balance stays zero.
+        address reward = d.rewardToken();
+        if (reward != payout) amount += _forward(reward);
+    }
+
+    /// @dev **Never forwards the locked principal.** `token` is the vested asset and the guard is
+    ///      the only thing standing between "sweep the dividends out" and "empty the vault early",
+    ///      which is the entire promise this contract exists to make.
+    function _forward(address asset) internal returns (uint256 amount) {
+        if (asset == address(0) || asset == token) return 0;
+        amount = IERC20(asset).balanceOf(address(this));
+        if (amount != 0) IERC20(asset).safeTransfer(beneficiary, amount);
     }
 
     /// @notice Give the locked supply's dividend claim to the other holders. **One way.**

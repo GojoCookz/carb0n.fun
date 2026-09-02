@@ -515,22 +515,27 @@ contract Distributor {
                 abi.encodeWithSelector(IERC20.approve.selector, converter, amount)
             );
             if (okApprove) {
+                uint256 heldBefore = IERC20(payoutToken).balanceOf(address(this));
+
                 try IRewardConverter(converter).convert(payoutToken, rewardToken, amount, to)
                 returns (uint256 out) {
-                    // Clear the allowance whether or not it was fully spent.
-                    (bool cleared,) = payoutToken.call(
-                        abi.encodeWithSelector(IERC20.approve.selector, converter, 0)
-                    );
-                    cleared;
-                    if (out != 0) {
-                        emit RewardConverted(to, amount, out, rewardToken);
+                    _clearAllowance();
+                    // **Judged by what it TOOK, not by what it SAID.** The previous version
+                    // trusted `out` alone, so a converter that pulled its input and returned zero
+                    // - the documented "could not route" signal, and the shape an honest one
+                    // produces on a dead route - got paid AND fell through to the transfer below,
+                    // paying the same claim twice. The ledger recorded one payment, so the
+                    // solvency invariant stayed true while every later holder was left unpayable.
+                    uint256 taken = heldBefore - IERC20(payoutToken).balanceOf(address(this));
+                    if (taken != 0) {
+                        // It spent the allowance. Whether it produced anything is the converter's
+                        // problem now; paying again from here would double-spend the claim.
+                        if (out != 0) emit RewardConverted(to, amount, out, rewardToken);
+                        else emit RewardConversionFailed(to, amount, rewardToken);
                         return true;
                     }
                 } catch {
-                    (bool cleared,) = payoutToken.call(
-                        abi.encodeWithSelector(IERC20.approve.selector, converter, 0)
-                    );
-                    cleared;
+                    _clearAllowance();
                 }
             }
             emit RewardConversionFailed(to, amount, rewardToken);
@@ -539,6 +544,13 @@ contract Distributor {
         (bool ok, bytes memory ret) =
             payoutToken.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
         return ok && (ret.length == 0 || abi.decode(ret, (bool)));
+    }
+
+    /// @dev Never leave a standing allowance over every holder's money.
+    function _clearAllowance() internal {
+        (bool ok,) =
+            payoutToken.call(abi.encodeWithSelector(IERC20.approve.selector, converter, 0));
+        ok;
     }
 
     function _enqueue(address account) internal {
