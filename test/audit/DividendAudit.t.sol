@@ -156,6 +156,47 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
     }
 
     // ===========================================================================================
+    // Streaming migration helpers
+    //
+    // `distribute` no longer credits `_magnifiedPayoutPerShare` in the instant it is called - it
+    // arms a linear vest over `STREAM_WINDOW` and `_checkpoint()` folds in elapsed time. So MONEY
+    // and ENTITLEMENT now run on different clocks: `pair.balanceOf(address(d))` moves immediately,
+    // `withdrawableOf` does not move at all until the clock does. Deciding which of the two an
+    // assertion is about is the whole migration.
+    // ===========================================================================================
+
+    /// @dev Warp past the end of the current stream so entitlement is fully visible.
+    ///
+    ///      Uses `skip`, which reads the clock back through the cheatcode. `via_ir` caches
+    ///      `block.timestamp`, so a chained `vm.warp(block.timestamp + X)` silently no-ops from
+    ///      the second call onwards and the test measures the wrong instant while staying green.
+    function _vest(Distributor d) internal {
+        skip(uint256(d.STREAM_WINDOW()) + 1);
+    }
+
+    function _fundAndVest(Distributor d, uint256 amount) internal {
+        _fund(d, amount);
+        _vest(d);
+    }
+
+    /// @dev The honest absolute tolerance on "was owed exactly X".
+    ///
+    ///      `_arm` sets `rate = total / window` and CARRIES `total % window` in `pendingPayouts`,
+    ///      so up to `STREAM_WINDOW` base units of any distribution are deferred rather than
+    ///      vested. That is dust, not loss - it is released by the next fee-bearing distribution -
+    ///      but it makes the 2-wei tolerances this file was written with unreachable.
+    function _dust(Distributor d) internal view returns (uint256) {
+        return uint256(d.STREAM_WINDOW());
+    }
+
+    /// @dev A permissionless checkpoint. `processBatch(0)` runs `_checkpoint()` before the
+    ///      `maxAccounts == 0` early return, so it walks nobody, pays nobody, and is the only way
+    ///      to make `totalDistributed` (which only ever moves inside `_checkpoint`) current.
+    function _crank(Distributor d) internal {
+        d.processBatch(0);
+    }
+
+    // ===========================================================================================
     // D-01  A converter that spends its allowance and returns zero is paid, and then the holder
     //       is paid again out of everyone else's money.
     // ===========================================================================================
@@ -167,11 +208,15 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         d.setBalance(alice, 1_000e18);
         d.setBalance(bob, 1_000e18);
         _fund(d, 200e18);
+        // The money is here immediately; the entitlement is not. Nothing about D-01 depends on
+        // the timing, so let the stream finish and take the whole claim.
+        assertEq(pair.balanceOf(address(d)), 200e18, "the money lands instantly, before any vest");
+        _vest(d);
 
         uint256 owedAlice = d.withdrawableOf(alice);
         uint256 owedBob = d.withdrawableOf(bob);
-        assertApproxEqAbs(owedAlice, 100e18, 2, "precondition: alice owed half");
-        assertApproxEqAbs(owedBob, 100e18, 2, "precondition: bob owed half");
+        assertApproxEqAbs(owedAlice, 100e18, _dust(d), "precondition: alice owed half");
+        assertApproxEqAbs(owedBob, 100e18, _dust(d), "precondition: bob owed half");
         assertEq(pair.balanceOf(address(d)), 200e18, "precondition: the contract holds both claims");
 
         vm.prank(alice);
@@ -192,8 +237,10 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
             d.withdrawableOf(bob),
             "the distributor should be short by exactly one holder's claim"
         );
-        // Only truncation dust survives: 200e18 arrived, ~2 x 100e18 left on one withdrawal.
-        assertLe(pair.balanceOf(address(d)), 2, "both claims left the building on one withdrawal");
+        // Only the stream's own carry survives: 200e18 arrived, ~2 x 100e18 left on one withdrawal.
+        assertLe(
+            pair.balanceOf(address(d)), _dust(d), "both claims left the building on one withdrawal"
+        );
     }
 
     function test_D01b_theSecondPaymentLeavesEveryOtherHolderUnableToClaim() public {
@@ -202,12 +249,14 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         d.setBalance(alice, 1_000e18);
         d.setBalance(bob, 1_000e18);
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
 
         vm.prank(alice);
         d.withdraw();
 
         uint256 owedBob = d.withdrawableOf(bob);
+        // NOT decoration. `NothingToWithdraw` now fires for a holder who is simply un-vested, so
+        // the `expectRevert` below would pass on a perfectly solvent contract without this line.
         assertGt(owedBob, 0, "bob is still owed on the books");
 
         // Pull fails: nothing left to pay him with.
@@ -230,14 +279,18 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         d.setBalance(alice, 1_000e18);
         d.setBalance(bob, 1_000e18);
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
 
         (uint256 sent, uint256 total) = d.processBatch(10);
 
         assertEq(sent, 1, "expected exactly one holder to be paid before the money ran out");
-        assertApproxEqAbs(total, 100e18, 2);
-        assertApproxEqAbs(pair.balanceOf(address(thief)), 100e18, 2, "the converter kept a claim");
-        assertLe(pair.balanceOf(address(d)), 2, "200e18 arrived and 200e18 left in one batch");
+        assertApproxEqAbs(total, 100e18, _dust(d));
+        assertApproxEqAbs(
+            pair.balanceOf(address(thief)), 100e18, _dust(d), "the converter kept a claim"
+        );
+        assertLe(
+            pair.balanceOf(address(d)), _dust(d), "200e18 arrived and 200e18 left in one batch"
+        );
 
         // The unpaid holder still has their claim, correctly restored - and nothing to pay it with.
         address stranded = pair.balanceOf(alice) == 0 ? alice : bob;
@@ -254,9 +307,10 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         d.setBalance(alice, 1_000e18);
         d.setBalance(bob, 1_000e18);
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
 
         uint256 owed = d.withdrawableOf(alice);
+        assertGt(owed, 0, "precondition: there is a real claim to route");
         vm.prank(alice);
         d.withdraw();
 
@@ -274,9 +328,10 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         d.setBalance(alice, 1_000e18);
         d.setBalance(bob, 1_000e18);
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
 
         uint256 owed = d.withdrawableOf(alice);
+        assertGt(owed, 0, "precondition: there is a real claim for the converter to reach for");
         vm.prank(alice);
         d.withdraw();
 
@@ -287,6 +342,12 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
     }
 
     /// @dev The allowance must be zero after every converter outcome, not just the happy one.
+    ///
+    ///      **This was a VACUOUS PASS under streaming and was not on the failing list.** Without
+    ///      the vest, `withdraw()` reverts `NothingToWithdraw` before `_trySend` runs, so no
+    ///      `approve` is ever issued and "no allowance survived" is true of a converter that was
+    ///      never called. Negative control: delete the `_vest` and this test still passes green
+    ///      while exercising exactly none of the five converters.
     function test_sound_noAllowanceSurvivesAnyConverterOutcome() public {
         address[5] memory convs = [
             address(new HonestConverter()),
@@ -299,7 +360,8 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         for (uint256 i = 0; i < 5; i++) {
             Distributor d = _mk(1, 1, 1, address(reward), convs[i]);
             d.setBalance(alice, 1_000e18);
-            _fund(d, 100e18);
+            _fundAndVest(d, 100e18);
+            assertGt(d.withdrawableOf(alice), 0, "the converter must actually be reached");
             vm.prank(alice);
             try d.withdraw() {} catch {}
             assertEq(
@@ -318,10 +380,11 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
             d.setBalance(alice, 1_000e18);
             d.setBalance(bob, 1_000e18);
-            _fund(d, 200e18);
+            _fundAndVest(d, 200e18);
 
             uint256 owedA = d.withdrawableOf(alice);
             uint256 owedB = d.withdrawableOf(bob);
+            assertGt(owedA, 0, "precondition: a real claim to reenter against");
             // Balances accumulate across the two modes, so measure deltas.
             uint256 rA = reward.balanceOf(alice);
             uint256 rB = reward.balanceOf(bob);
@@ -365,10 +428,12 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         d.setBalance(address(dumb), 1_000e18);
         d.setBalance(alice, 1_000e18);
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
 
         uint256 stranded = d.withdrawableOf(address(dumb));
-        assertApproxEqAbs(stranded, 100e18, 2, "the dumb holder accrued half of the distribution");
+        assertApproxEqAbs(
+            stranded, 100e18, _dust(d), "the dumb holder accrued half of the distribution"
+        );
 
         // Push cannot rescue it either: the transfer succeeds and the pair currency lands on a
         // contract with no function that can ever move it again.
@@ -394,8 +459,9 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         d.setBalance(address(vault), 1_000e18);
         d.setBalance(alice, 1_000e18);
 
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
         uint256 aliceBefore = d.withdrawableOf(alice);
+        assertGt(aliceBefore, 0, "precondition: a real stream exists to be renounced out of");
 
         vm.prank(creator);
         vault.renounceAccrual();
@@ -405,11 +471,11 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         assertEq(d.totalShares(), 2_000e18, "renouncing did not change the denominator");
 
         // So the next distribution still cuts the vault in, and alice's rate is unchanged.
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
         assertApproxEqAbs(
             d.withdrawableOf(alice) - aliceBefore,
             100e18,
-            2,
+            _dust(d),
             "alice received a renounced holder's share - she did not"
         );
         assertGt(d.withdrawableOf(address(vault)), 0, "the vault kept accruing after renouncing");
@@ -476,17 +542,18 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         // A real holder arrives and is stuck behind all of them for push purposes.
         d.setBalance(alice, 1_000e18);
-        _fund(d, 100e18);
+        _fundAndVest(d, 100e18);
 
         (uint256 sent,) = d.processBatch(40);
         assertEq(sent, 0, "the first full batch paid a real holder");
-        assertEq(d.withdrawableOf(alice), d.withdrawableOf(alice), "");
         assertGt(d.withdrawableOf(alice), 0, "alice is owed and was not pushed");
 
-        // The pull path is unaffected - which is why this is griefing, not theft.
+        // The pull path is unaffected - which is why this is griefing, not theft. Measured as a
+        // delta: an absolute `> 0` would be true of any harness that funds its actors.
+        uint256 aliceBefore = pair.balanceOf(alice);
         vm.prank(alice);
         d.withdraw();
-        assertGt(pair.balanceOf(alice), 0, "pull must always work");
+        assertGt(pair.balanceOf(alice) - aliceBefore, 0, "pull must always work");
     }
 
     /// @dev `processBatch` is documented at Distributor.sol:15-16 as something "the hook calls
@@ -497,9 +564,23 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         // `grep -rn "processBatch" src/` returns only Distributor.sol's own definition and
         // docstring. This test pins the consequence: a queued holder owed money stays owed until
         // somebody volunteers gas.
+        //
+        //      Streaming makes this WORSE, not better. `distribute` has exactly one call site in
+        //      `src/` - FeeHook.sol:909, inside the sweep - so if the hook ever did call
+        //      `processBatch` "opportunistically after a swap" it would call it in the same
+        //      transaction as the sweep, where `withdrawableOf` is zero for every holder by
+        //      construction. Any future wiring has to DELAY the push, not fold it into the trade.
         Distributor d = _mkDefault();
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
+
+        // Nobody is owed anything in the block the fee lands - that is the streaming defence.
+        assertEq(d.withdrawableOf(alice), 0, "a same-block push would have nothing to pay");
+        (uint256 sentNow,) = d.processBatch(10);
+        assertEq(sentNow, 0, "a same-block push is a guaranteed no-op walk");
+
+        // A window later she is owed, and still nothing on chain will move it.
+        _vest(d);
         assertGt(d.withdrawableOf(alice), 0, "owed, and nothing on-chain will push it");
     }
 
@@ -554,8 +635,10 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         // Bob buys in after every one of those fees was already earned.
         d.setBalance(bob, 1_000_000e18);
 
-        // Any subsequent fee - his own next trade will do - flushes the pile.
-        _fund(d, 1e18);
+        // Any subsequent fee - his own next trade will do - flushes the pile. Streaming makes him
+        // wait a window for it, and that is the whole of what it costs him: the carry is still
+        // split on the register as it stands at FLUSH time, not at accrual time.
+        _fundAndVest(d, 1e18);
 
         uint256 bobTook = d.withdrawableOf(bob);
         uint256 aliceGot = d.withdrawableOf(alice);
@@ -580,8 +663,16 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         Distributor d = _mk(1, 1, FLOOR, address(0), address(0));
 
         d.setBalance(alice, FLOOR * 10);
-        _fund(d, 100e18);
-        assertEq(d.pendingPayouts(), 0, "precondition: a real base takes its distribution");
+        _fundAndVest(d, 100e18);
+        _crank(d);
+        // `assertEq(pendingPayouts(), 0)` is unreachable under streaming: `_arm` truncates
+        // `total / window` and carries the remainder. The strictly stronger statement is that
+        // the carry is bounded by one window AND that nothing was dropped on the way.
+        assertLt(d.pendingPayouts(), _dust(d), "precondition: a real base takes its distribution");
+        assertEq(
+            d.totalDistributed() + d.pendingPayouts(), 100e18, "the first distribution lost value"
+        );
+        uint256 carriedDust = d.pendingPayouts();
 
         // Everyone exits.
         d.setBalance(alice, 0);
@@ -589,11 +680,11 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         _fund(d, 100e18);
         _fund(d, 100e18);
-        assertEq(d.pendingPayouts(), 200e18, "carry reopened");
+        assertEq(d.pendingPayouts(), 200e18 + carriedDust, "carry reopened");
 
         // A fresh arrival takes all of it.
         d.setBalance(carol, FLOOR);
-        _fund(d, 1e18);
+        _fundAndVest(d, 1e18);
         assertGt(d.withdrawableOf(carol), 200e18, "the reopened carry went to the newcomer");
     }
 
@@ -649,6 +740,13 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         pair.mint(address(d), total);
         d.distribute(total);
 
+        // The squeeze only happens once the stream has actually VESTED into
+        // `_magnifiedPayoutPerShare`. Un-vested, the accumulator is still zero and
+        // `_setShares`'s checked `_magnifiedPayoutPerShare * delta` cannot overflow at any
+        // `total` - so without this warp the probe reports "safe" for every input and D-06/D-06b
+        // would be measuring nothing at all.
+        skip(uint256(d.STREAM_WINDOW()) + 1);
+
         d.setBalance(bob, supply - floor_); // the whole rest of the supply arrives at once
         aliceOwed = d.withdrawableOf(alice);
         bobOwed = d.withdrawableOf(bob);
@@ -687,8 +785,15 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
             pair.mint(address(weak), huge);
             weak.distribute(huge);
         }
+        // All forty are armed, none are credited yet. Let them vest: the panic lives in
+        // `_magnifiedPayoutPerShare * balance`, and under streaming that accumulator is still
+        // zero at this point.
+        _vest(weak);
+        _crank(weak);
 
         // `_magnifiedPayoutPerShare`, reproduced from the same arithmetic the contract used.
+        // Approximate now rather than exact - the stream carries `total % window` per arm - which
+        // is fine, because `step` only has to land the product near 0.9 * 2**256.
         uint256 mps = 40 * ((huge * (2 ** 128)) / 2);
         // A delta whose product sits at ~0.9 * 2**256: legal for the checked multiply in
         // `_setShares`, and two of them put the BALANCE product past 2**256.
@@ -733,27 +838,32 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         assertEq(d.queueLength(), 0, "an excluded account entered the push queue");
 
         d.setBalance(alice, 1_000e18);
-        _fund(d, 100e18);
+        _fundAndVest(d, 100e18);
         assertEq(d.withdrawableOf(pool), 0, "an excluded account accrued");
-        assertApproxEqAbs(d.withdrawableOf(alice), 100e18, 2, "the whole fee went to the real holder");
+        assertApproxEqAbs(
+            d.withdrawableOf(alice), 100e18, _dust(d), "the whole fee went to the real holder"
+        );
     }
 
     function test_sound_excludingAHolderFreezesTheirClaimAndRemovesTheirShares() public {
         Distributor d = _mkDefault();
         d.setBalance(alice, 1_000e18);
         d.setBalance(bob, 1_000e18);
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
 
         uint256 frozen = d.withdrawableOf(alice);
+        assertGt(frozen, 0, "precondition: alice has a real claim that must survive exclusion");
         d.setExcluded(alice, true);
 
         assertEq(d.shareOf(alice), 0, "shares not removed");
         assertEq(d.totalShares(), 1_000e18, "denominator not corrected");
         assertEq(d.withdrawableOf(alice), frozen, "an already-earned claim was confiscated");
 
-        _fund(d, 100e18);
+        _fundAndVest(d, 100e18);
         assertEq(d.withdrawableOf(alice), frozen, "an excluded account kept accruing");
-        assertApproxEqAbs(d.withdrawableOf(bob), 200e18, 3, "the remaining holder takes the rest");
+        assertApproxEqAbs(
+            d.withdrawableOf(bob), 200e18, 2 * _dust(d), "the remaining holder takes the rest"
+        );
     }
 
     function test_sound_unExcludingGrantsNoRetroactiveEntitlement() public {
@@ -763,7 +873,9 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         _fund(d, 100e18); // carried: nobody holds shares
         d.setBalance(bob, 1_000e18);
-        _fund(d, 100e18);
+        _fundAndVest(d, 100e18); // 200e18 total, all of it bob's - he is the only holder
+
+        assertGt(d.withdrawableOf(bob), 0, "precondition: there is real history to be back-dated to");
 
         d.setExcluded(alice, false);
         assertEq(d.shareOf(alice), 0, "un-excluding must not resurrect shares by itself");
@@ -773,18 +885,24 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         d.setBalance(alice, 1_000e18);
         assertEq(d.withdrawableOf(alice), 0, "re-entry back-dated her to before the distributions");
 
-        _fund(d, 200e18);
-        assertApproxEqAbs(d.withdrawableOf(alice), 100e18, 2, "and forward accrual is correct");
+        _fundAndVest(d, 200e18);
+        assertApproxEqAbs(
+            d.withdrawableOf(alice), 100e18, _dust(d), "and forward accrual is correct"
+        );
     }
 
     function test_sound_aMidDistributionTransferNeitherCreatesNorDestroysEntitlement() public {
         Distributor d = _mkDefault();
         d.setBalance(alice, 1_000e18);
         d.setBalance(bob, 1_000e18);
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
 
         uint256 aliceOwed = d.withdrawableOf(alice);
         uint256 bobOwed = d.withdrawableOf(bob);
+        // Without this, both are zero and every assertion below is true of a contract that
+        // distributed nothing. This test passed for that reason before the migration.
+        assertGt(aliceOwed, 0, "precondition: there is entitlement to neither create nor destroy");
+        assertGt(bobOwed, 0, "precondition: there is entitlement to neither create nor destroy");
 
         // Alice hands her whole position to bob AFTER the distribution.
         d.setBalance(alice, 0);
@@ -798,10 +916,13 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
     function test_sound_aClaimCannotBeTakenTwice() public {
         Distributor d = _mkDefault();
         d.setBalance(alice, 1_000e18);
-        _fund(d, 100e18);
+        _fundAndVest(d, 100e18);
 
         vm.prank(alice);
         uint256 first = d.withdraw();
+        // `NothingToWithdraw` now also fires for a holder who is merely un-vested, so the revert
+        // below proves nothing unless the FIRST withdrawal really moved money.
+        assertGt(first, 0, "precondition: the first pull actually paid");
 
         vm.prank(alice);
         vm.expectRevert(Distributor.NothingToWithdraw.selector);
@@ -818,7 +939,7 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         Distributor d = _mkDefault();
         d.setBalance(alice, 1_000e18);
         d.setBalance(bob, 1_000e18);
-        _fund(d, 200e18);
+        _fundAndVest(d, 200e18);
 
         d.processBatch(1); // pays whoever the cursor is on
         vm.prank(alice);
@@ -827,6 +948,10 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         try d.withdraw() {} catch {}
         d.processBatch(10);
 
+        // Both really were paid - otherwise "neither path paid twice" is true of a run in which
+        // neither path paid at all, which is what this test measured before the vest.
+        assertGt(pair.balanceOf(alice), 0, "alice was never paid, so nothing was tested");
+        assertGt(pair.balanceOf(bob), 0, "bob was never paid, so nothing was tested");
         assertLe(d.totalWithdrawn(), d.totalDistributed(), "paid more than arrived");
         assertLe(pair.balanceOf(alice) + pair.balanceOf(bob), 200e18, "paid more than arrived");
         assertGe(pair.balanceOf(address(d)), 0);
@@ -843,10 +968,20 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         assertEq(d.totalDistributed(), 0);
 
         d.setBalance(alice, FLOOR);
-        _fund(d, 100e18);
+        _fundAndVest(d, 100e18);
+        _crank(d); // `totalDistributed` only ever moves inside `_checkpoint`
 
-        assertEq(d.pendingPayouts(), 0, "carry not released");
-        assertEq(d.totalDistributed(), 700e18, "the carry was counted twice or lost");
+        // `pendingPayouts == 0` is unreachable now: `_arm` carries `total % window`. The
+        // replacement is strictly stronger - it says the seven distributions are ALL still
+        // accounted for, in exactly one of the two buckets, rather than merely that the carry
+        // bucket happens to read zero.
+        assertLt(d.pendingPayouts(), _dust(d), "carry not released");
+        assertEq(
+            d.totalDistributed() + d.pendingPayouts(),
+            700e18,
+            "the carry was counted twice or lost"
+        );
+        assertGt(d.withdrawableOf(alice), 690e18, "the carry never reached the only holder");
         assertLe(d.withdrawableOf(alice), 700e18, "owed more than ever arrived");
         assertGe(pair.balanceOf(address(d)), d.withdrawableOf(alice), "insolvent");
     }
@@ -857,7 +992,7 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         for (uint256 i = 0; i < 5; i++) {
             d.setBalance(hs[i], 1_000e18);
         }
-        _fund(d, 500e18);
+        _fundAndVest(d, 500e18);
 
         // Walk two at a time, more than a full lap.
         uint256 paid;
@@ -869,7 +1004,7 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
 
         for (uint256 i = 0; i < 5; i++) {
             assertEq(d.withdrawableOf(hs[i]), 0, "somebody was skipped");
-            assertApproxEqAbs(pair.balanceOf(hs[i]), 100e18, 2, "somebody was paid twice");
+            assertApproxEqAbs(pair.balanceOf(hs[i]), 100e18, _dust(d), "somebody was paid twice");
         }
         assertLe(d.totalWithdrawn(), d.totalDistributed());
     }
@@ -884,7 +1019,7 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         for (uint256 i = 0; i < 4; i++) {
             d.setBalance(hs[i], 1_000e18);
         }
-        _fund(d, 400e18);
+        _fundAndVest(d, 400e18);
 
         d.processBatch(2); // pays queue[0], queue[1]; cursor lands on 2
         assertEq(d.cursor(), 2);
@@ -900,7 +1035,9 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         assertEq(d.withdrawableOf(hs[3]), 0, "the moved holder was stranded, not merely delayed");
 
         for (uint256 i = 0; i < 4; i++) {
-            assertApproxEqAbs(pair.balanceOf(hs[i]), 100e18, 2, "somebody was skipped or repaid");
+            assertApproxEqAbs(
+                pair.balanceOf(hs[i]), 100e18, _dust(d), "somebody was skipped or repaid"
+            );
         }
     }
 
@@ -950,7 +1087,10 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         pair.mint(address(w.dist), 100e18);
         vm.prank(controller);
         w.dist.distribute(100e18);
+        _vest(w.dist);
+
         uint256 owed = w.dist.withdrawableOf(alice);
+        assertGt(owed, 0, "precondition: there is entitlement for a self-transfer to disturb");
         uint256 qlen = w.dist.queueLength();
 
         vm.prank(alice);
@@ -1042,7 +1182,11 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         }
         for (uint256 f = 0; f < 3; f++) {
             _fund(d, uint256(fees[f]));
-            // Churn: everyone halves, then restores.
+            // Churn: everyone halves, then restores. The half-window warp puts the churn INSIDE a
+            // live stream, which is where the interesting interleaving is: `_checkpoint` runs
+            // before every `_setShares`, so a balance moving mid-vest must neither create nor
+            // strand value.
+            skip(uint256(d.STREAM_WINDOW()) / 2);
             for (uint256 i = 0; i < 6; i++) {
                 d.setBalance(hs[i], (uint256(balances[i]) * 1e9) / 2);
             }
@@ -1050,6 +1194,10 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
             for (uint256 i = 0; i < 6; i++) {
                 d.setBalance(hs[i], uint256(balances[i]) * 1e9);
             }
+            // ...and then let the rest of it land, so `owed` below is a real number.
+            // Un-warped, every `withdrawableOf` is zero and `owed <= held` is true of a contract
+            // that received nothing AND of one insolvent by every wei.
+            _vest(d);
         }
 
         uint256 owed = d.pendingPayouts();
@@ -1058,6 +1206,14 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
             owed += d.withdrawableOf(hs[i]);
             sum += d.shareOf(hs[i]);
         }
+        // NON-VACUITY GUARD. `owed <= held` is true of a contract that received nothing AND of
+        // one insolvent by every wei, so on any run where real money met a real holder base the
+        // money has to have actually reached somebody. Negative control: delete the two warps in
+        // the loop above and this fires on the first run - the whole fuzz was green on `0 <= 0`.
+        if (uint256(fees[0]) + fees[1] + fees[2] >= 1e18 && sum >= FLOOR * 10) {
+            assertGt(d.totalWithdrawn(), 0, "value arrived at a real holder base and paid nobody");
+        }
+
         assertGe(pair.balanceOf(address(d)), owed, "the distributor owes more than it holds");
         assertEq(d.totalShares(), sum, "totalShares drifted");
         assertEq(d.shareOf(ex), 0, "an excluded account holds shares");

@@ -367,6 +367,25 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         token.transfer(who, amount);
     }
 
+    /// @dev Run the dividend stream out, so what a holder is owed becomes readable.
+    ///
+    ///      **A distribution is no longer credited in the instant it lands.** `Distributor.
+    ///      distribute` arms a stream that vests linearly over `STREAM_WINDOW`, which is the
+    ///      entire defence against `buy -> sweep -> sell` in one transaction capturing a share of
+    ///      the whole pot having held for zero blocks. `Streaming.t.sol` is the reference.
+    ///
+    ///      **Money and ENTITLEMENT are on different clocks, and that distinction decides whether
+    ///      a test needs this call.** The pair currency reaches the distributor the moment
+    ///      `sweep()` runs, so anything asserting on `pair.balanceOf(address(dist))` is unaffected.
+    ///      Only `withdrawableOf`/`accumulativeOf` are delayed, so only the assertions that read a
+    ///      holder's entitlement have to let the stream finish first.
+    ///
+    ///      Call this AFTER the fee-generating trade and BEFORE the assertion. A blanket warp in
+    ///      `setUp` would prove nothing, since there is nothing streaming yet.
+    function _vest() internal {
+        vm.warp(block.timestamp + dist.STREAM_WINDOW() + 1);
+    }
+
     // ===============================================================================================
     // Hook address and permissions
     // ===============================================================================================
@@ -567,6 +586,10 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
 
     /// @dev The commercial test. Ordinary router traffic - plain exact-input buys - must pay
     ///      holders. This asserted zero before the fix.
+    ///
+    ///      The fee is charged and swept on every one of these trades - that half is instant. What
+    ///      the holder is OWED streams in over `STREAM_WINDOW`, so `_vest()` is what makes the
+    ///      money that was always theirs visible to the assertion.
     function test_defaultRouterBehaviourPaysHolders() public {
         _giveTokens(alice, 10_000_000e18);
 
@@ -580,6 +603,9 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
             (uint256(1_000_000e18) * FEE_BPS) / 10_000,
             "ten normal buys pay in full"
         );
+        assertGt(pair.balanceOf(address(dist)), 0, "the holders' money arrived immediately");
+
+        _vest();
         assertGt(dist.withdrawableOf(alice), 0, "and a holder who did nothing is owed real money");
     }
 
@@ -603,6 +629,13 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
 
         _buyExactOut(bob, 500_000e18);
 
+        // The money is on the distributor in the same block, but nothing is claimable yet: a
+        // zero-block position earns zero, by construction. That is the anti-front-running
+        // property, not a missing payment - the very next line proves the payment is there.
+        assertGt(pair.balanceOf(address(dist)), 0, "the fee reached the distributor at once");
+        assertEq(dist.withdrawableOf(alice), 0, "but a zero-duration hold is owed nothing");
+
+        _vest();
         assertGt(dist.withdrawableOf(alice), 0, "a holder must accrue from someone else's trade");
 
         uint256 owed = dist.withdrawableOf(alice);
@@ -677,6 +710,11 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         assertGt(token.balanceOf(address(manager)), 0, "...despite holding most of the supply");
 
         _buyExactOut(bob, 500_000e18);
+        // Vesting first is load-bearing on BOTH assertions below. Un-vested, everybody is owed
+        // exactly zero, so "the pool must be owed nothing" would pass against a distributor that
+        // was allocating the pool the whole fee - the assertion needs a live, non-zero
+        // distribution to be worth anything, and `alice` is the control that proves there is one.
+        _vest();
 
         assertEq(dist.withdrawableOf(address(manager)), 0, "the pool must be owed nothing");
         assertGt(dist.withdrawableOf(alice), 0, "a real holder still accrues");
@@ -685,18 +723,30 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
     /// @dev The push path must never raw-transfer the pair currency into the singleton. An unsynced
     ///      ERC-20 arriving at the PoolManager is not a donation - it is an unowned balance that the
     ///      next caller to `sync`/`settle` can claim for free.
+    ///
+    ///      **This test used to pass for two wrong reasons and both are fixed here.** `alice` is
+    ///      funded with the pair currency in `setUp`, so `pair.balanceOf(alice) > 0` was true
+    ///      before `processBatch` was ever called - it had to become a DELTA. And under streaming
+    ///      an un-vested batch walks a queue where everyone is owed zero, pays nobody, and passes
+    ///      "no dividend may be pushed into the pool" trivially - so the batch has to be made to
+    ///      pay somebody before its routing means anything.
     function test_pushQueueNeverPaysThePoolManager() public {
         _giveTokens(alice, 10_000_000e18);
         _buyExactOut(bob, 500_000e18);
+        _vest();
+
+        assertGt(dist.withdrawableOf(alice), 0, "precondition: there is a real dividend to push");
 
         uint256 managerPairBefore = pair.balanceOf(address(manager));
+        uint256 alicePairBefore = pair.balanceOf(alice);
 
-        dist.processBatch(dist.queueLength());
+        (uint256 sentCount,) = dist.processBatch(dist.queueLength());
 
         assertEq(
             pair.balanceOf(address(manager)), managerPairBefore, "no dividend may be pushed into the pool"
         );
-        assertGt(pair.balanceOf(alice), 0, "but real holders are paid");
+        assertGt(sentCount, 0, "the batch paid nobody, so its routing proves nothing");
+        assertGt(pair.balanceOf(alice) - alicePairBefore, 0, "but real holders are paid");
     }
 
     /// @dev Shares must track only tokens in real hands. Both pieces of infrastructure that hold
@@ -720,13 +770,20 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
     }
 
     /// @dev Conservation: the distributor can never owe more than the hook actually delivered.
+    ///
+    ///      **Vesting is what keeps this from being vacuous.** Read in the block of the trade both
+    ///      holders are owed exactly zero, and `0 <= held` is true of a contract that received
+    ///      nothing and of one that is insolvent by every wei it holds. The window has to run, and
+    ///      the claim has to be non-zero, before "owed <= held" is a solvency statement at all.
     function testFuzz_distributorNeverOwesMoreThanItReceived(uint256 amountOut) public {
         amountOut = bound(amountOut, 1e18, 1_000_000e18);
         _giveTokens(alice, 10_000_000e18);
         _giveTokens(bob, 5_000_000e18);
 
         _buyExactOut(address(this), amountOut);
+        _vest();
 
+        assertGt(dist.withdrawableOf(alice), 0, "nothing was owed, so nothing was proven");
         assertLe(
             dist.withdrawableOf(alice) + dist.withdrawableOf(bob),
             pair.balanceOf(address(dist)),

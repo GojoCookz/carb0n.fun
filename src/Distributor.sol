@@ -91,7 +91,14 @@ contract Distributor {
     ///      dividends feel unresponsive on a token whose holders check hourly.
     uint64 public constant STREAM_WINDOW = 24 hours;
 
-    /// @notice Magnified payout released per second while a stream is live.
+    /// @notice Payout released per second while a stream is live, PRE-MAGNIFIED by `MAGNITUDE`.
+    ///
+    /// @dev **Magnified, and that is not cosmetic.** Stored as a plain per-second amount it is
+    ///      `total / window`, which truncates to ZERO for anything under `STREAM_WINDOW` base
+    ///      units. On an 18-decimal pair 86,400 wei is dust, but on a 6-decimal pair like USDC it
+    ///      is 8.64 cents — so a quiet USDC-paired pool would credit nobody on every sweep and
+    ///      quietly route the whole fee into the carry. Carrying the magnitude here keeps the rate
+    ///      meaningful down to a single base unit.
     uint256 public streamRate;
     /// @notice When the current stream finishes. Zero before the first distribution.
     uint64 public streamFinish;
@@ -227,18 +234,28 @@ contract Distributor {
         uint64 from = lastCheckpoint;
         if (upTo <= from) return;
 
+        // Magnified, because `streamRate` is.
+        uint256 vested = (uint256(upTo - from) * streamRate) / MAGNITUDE;
+
+        // **Do NOT advance the clock for a sub-unit vest.** Rounding down to zero and moving on
+        // would lose those seconds permanently, one wei at a time, on every transfer of a quiet
+        // token. Leaving `lastCheckpoint` where it is lets the fraction accumulate until it is
+        // worth at least one base unit.
+        if (vested == 0) return;
         lastCheckpoint = upTo;
-        uint256 amount = uint256(upTo - from) * streamRate;
-        if (amount == 0) return;
 
         uint256 shares = totalShares;
         if (shares == 0 || shares < minSharesForDistribution) {
-            pendingPayouts += amount;
+            pendingPayouts += vested;
             return;
         }
 
-        _magnifiedPayoutPerShare += (amount * MAGNITUDE) / shares;
-        totalDistributed += amount;
+        // Credited from the ROUNDED amount, not from the magnified one. Deriving the accumulator
+        // and `totalDistributed` from two different precisions lets entitlement exceed what was
+        // actually distributed - measured at one wei over, which is one wei of insolvency on the
+        // final withdrawal and exactly the kind of dust that bricks a last claim.
+        _magnifiedPayoutPerShare += (vested * MAGNITUDE) / shares;
+        totalDistributed += vested;
     }
 
     /// @dev The accumulator as it stands RIGHT NOW, including time not yet checkpointed. Views
@@ -252,8 +269,11 @@ contract Distributor {
         uint256 shares = totalShares;
         if (shares == 0 || shares < minSharesForDistribution) return _magnifiedPayoutPerShare;
 
-        uint256 amount = uint256(upTo - lastCheckpoint) * streamRate;
-        return _magnifiedPayoutPerShare + (amount * MAGNITUDE) / shares;
+        // Mirrors `_checkpoint` exactly, including the rounding, or the view would promise a
+        // holder more than a withdraw in the same block would actually pay them.
+        uint256 vested = (uint256(upTo - lastCheckpoint) * streamRate) / MAGNITUDE;
+        if (vested == 0) return _magnifiedPayoutPerShare;
+        return _magnifiedPayoutPerShare + (vested * MAGNITUDE) / shares;
     }
 
     /// @dev Start or extend the stream, weighting the new money against whatever is still
@@ -268,22 +288,52 @@ contract Distributor {
     function _arm(uint256 addition) internal {
         uint256 nowTs = block.timestamp;
         uint256 remainingTime = streamFinish > nowTs ? streamFinish - nowTs : 0;
-        uint256 remaining = remainingTime * streamRate;
+        // `streamRate` is magnified, so the unvested remainder must be divided back down before
+        // it can be weighed against `addition`, which is in plain units.
+        uint256 remaining = (remainingTime * streamRate) / MAGNITUDE;
         uint256 total = addition + remaining;
         if (total == 0) return;
 
         uint256 window = (remaining * remainingTime + addition * STREAM_WINDOW) / total;
         if (window == 0) window = 1;
 
-        uint256 rate = total / window;
+        uint256 rate = (total * MAGNITUDE) / window;
         // Truncation dust is carried, not dropped. Over many small sweeps this would otherwise
         // silently accumulate as unreachable balance on the contract.
-        uint256 dust = total - rate * window;
+        uint256 dust = total - (rate * window) / MAGNITUDE;
         if (dust != 0) pendingPayouts += dust;
 
         streamRate = rate;
         streamFinish = uint64(nowTs + window);
         lastCheckpoint = uint64(nowTs);
+    }
+
+    /// @notice Fold carried value back into a stream. Permissionless, and takes no arguments.
+    ///
+    /// @dev **Without this the carry can be unreachable.** `distribute` is `onlyController` and
+    ///      the hook only calls it when the holder slice is non-zero, so `distribute(0)` — the
+    ///      thing that flushes `pendingPayouts` — cannot be reached on a deployed system at all.
+    ///      Streaming also added two new ways INTO the carry that instant crediting did not have:
+    ///      `_arm` truncation dust on every distribution, and `_checkpoint` carrying whenever the
+    ///      register empties MID-stream, which previously could not happen because there was no
+    ///      stream to be mid-way through.
+    ///
+    ///      A live token self-heals on its next fee-bearing sweep. One that empties and then stops
+    ///      trading would have stranded it permanently, against a docstring promising it is
+    ///      "folded into the next distribution". Permissionless because there is nothing to abuse:
+    ///      it moves nobody's money anywhere except into the stream everybody is paid from, and it
+    ///      cannot be used to time anything, since what it arms vests over the full window.
+    function flush() external {
+        _checkpoint();
+        uint256 carry = pendingPayouts;
+        if (carry == 0) return;
+
+        uint256 shares = totalShares;
+        if (shares == 0 || shares < minSharesForDistribution) return;
+
+        pendingPayouts = 0;
+        _arm(carry);
+        emit PayoutsAdded(carry, _magnifiedPayoutPerShare);
     }
 
     function distribute(uint256 amount) external onlyController {

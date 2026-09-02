@@ -45,11 +45,19 @@ contract ZeroConverter is IRewardConverter {
 }
 
 contract RewardCurrencyTest is Test {
-    /// @dev Amounts are asserted with a few wei of tolerance throughout. `_magnifiedPayoutPerShare`
-    ///      divides by total shares and truncates, so a holder receives their share minus dust -
-    ///      by design, and in the direction that leaves the contract solvent rather than short.
-    ///      Demanding exact equality here would be asserting against the accumulator, not the
-    ///      feature.
+    /// @dev Amounts are asserted with tolerance throughout, and there are now TWO sources of it.
+    ///      `_magnifiedPayoutPerShare` divides by total shares and truncates, costing at most a
+    ///      wei per holder. `_arm` then divides the distribution into a per-second rate and
+    ///      carries `total % STREAM_WINDOW` in `pendingPayouts` rather than dropping it, which
+    ///      costs strictly less than `STREAM_WINDOW` wei. Both round DOWN - the direction that
+    ///      leaves the contract solvent rather than short - so `STREAM_WINDOW` is the honest
+    ///      bound and demanding exact equality would be asserting against the accumulator rather
+    ///      than the feature.
+    ///
+    ///      Every test here also has to WAIT. A distribution no longer credits entitlement in the
+    ///      block it lands; it vests linearly over `STREAM_WINDOW`, which is what makes a
+    ///      zero-block position worthless. Without a warp `withdrawableOf` is 0 and `withdraw`
+    ///      reverts with `NothingToWithdraw`, so nothing about conversion would ever be exercised.
     MockERC20 internal pair; // what fees arrive in
     MockERC20 internal reward; // what the creator wants holders paid in
 
@@ -83,10 +91,13 @@ contract RewardCurrencyTest is Test {
 
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         vm.prank(alice);
         d.withdraw();
-        assertApproxEqAbs(pair.balanceOf(alice), 100e18, 2, "holder was not paid the pair currency");
+        assertApproxEqAbs(
+            pair.balanceOf(alice), 100e18, d.STREAM_WINDOW(), "holder was not paid the pair currency"
+        );
     }
 
     // ===========================================================================================
@@ -98,11 +109,18 @@ contract RewardCurrencyTest is Test {
 
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         vm.prank(alice);
         d.withdraw();
 
-        assertApproxEqAbs(reward.balanceOf(alice), 200e18, 4, "holder was not paid in the reward currency");
+        // The converter pays 2:1, so it doubles the tolerance along with the amount.
+        assertApproxEqAbs(
+            reward.balanceOf(alice),
+            200e18,
+            2 * uint256(d.STREAM_WINDOW()),
+            "holder was not paid in the reward currency"
+        );
         assertEq(pair.balanceOf(alice), 0, "holder was also paid the pair currency");
     }
 
@@ -113,11 +131,22 @@ contract RewardCurrencyTest is Test {
 
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
-        assertApproxEqAbs(d.withdrawableOf(alice), 100e18, 2, "owed should be denominated in the pair");
+        assertApproxEqAbs(
+            d.withdrawableOf(alice),
+            100e18,
+            d.STREAM_WINDOW(),
+            "owed should be denominated in the pair"
+        );
         vm.prank(alice);
         d.withdraw();
-        assertApproxEqAbs(d.totalWithdrawn(), 100e18, 2, "withdrawn should be denominated in the pair");
+        assertApproxEqAbs(
+            d.totalWithdrawn(),
+            100e18,
+            d.STREAM_WINDOW(),
+            "withdrawn should be denominated in the pair"
+        );
     }
 
     // ===========================================================================================
@@ -129,11 +158,14 @@ contract RewardCurrencyTest is Test {
 
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         vm.prank(alice);
         d.withdraw();
 
-        assertApproxEqAbs(pair.balanceOf(alice), 100e18, 2, "holder was not paid at all");
+        assertApproxEqAbs(
+            pair.balanceOf(alice), 100e18, d.STREAM_WINDOW(), "holder was not paid at all"
+        );
         assertEq(reward.balanceOf(alice), 0);
         assertEq(d.withdrawableOf(alice), 0, "the claim survived being paid");
     }
@@ -145,11 +177,17 @@ contract RewardCurrencyTest is Test {
 
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         vm.prank(alice);
         d.withdraw();
 
-        assertApproxEqAbs(pair.balanceOf(alice), 100e18, 2, "a zero return was treated as a successful payout");
+        assertApproxEqAbs(
+            pair.balanceOf(alice),
+            100e18,
+            d.STREAM_WINDOW(),
+            "a zero return was treated as a successful payout"
+        );
     }
 
     /// A reward currency set with NO converter deployed must still pay, not strand.
@@ -158,10 +196,16 @@ contract RewardCurrencyTest is Test {
 
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         vm.prank(alice);
         d.withdraw();
-        assertApproxEqAbs(pair.balanceOf(alice), 100e18, 2, "holder was stranded by a missing converter");
+        assertApproxEqAbs(
+            pair.balanceOf(alice),
+            100e18,
+            d.STREAM_WINDOW(),
+            "holder was stranded by a missing converter"
+        );
     }
 
     /// **Solvency across every converter outcome.** This is the invariant the whole design exists
@@ -177,6 +221,9 @@ contract RewardCurrencyTest is Test {
         Distributor d = _mk(address(reward), conv);
         d.setBalance(alice, 1_000e18);
         _fund(d, uint256(amount));
+        // Fully vested is the WORST case for this assertion: it is the moment the contract owes
+        // the most it will ever owe on this distribution.
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         vm.prank(alice);
         d.withdraw();
@@ -196,6 +243,7 @@ contract RewardCurrencyTest is Test {
 
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
         vm.prank(alice);
         d.withdraw();
 

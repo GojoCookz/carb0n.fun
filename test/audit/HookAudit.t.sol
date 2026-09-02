@@ -333,6 +333,19 @@ abstract contract HookAuditWorld is Test {
         return _swapRaw(k, who, !_buyIsZeroForOne(), int256(amountOut));
     }
 
+    /// @dev Warp past the end of the current dividend stream.
+    ///
+    ///      `Distributor.distribute` no longer credits the accumulator in the instant a sweep
+    ///      lands - it arms a linear vest over `STREAM_WINDOW`. Money and entitlement are on
+    ///      different clocks: `pair.balanceOf(address(dist))` moves on the sweep,
+    ///      `withdrawableOf` does not move until the clock does.
+    ///
+    ///      `skip` reads the clock back through the cheatcode. `via_ir` caches `block.timestamp`,
+    ///      so a chained `vm.warp(block.timestamp + X)` silently no-ops.
+    function _vest(Distributor dist) internal {
+        skip(uint256(dist.STREAM_WINDOW()) + 1);
+    }
+
     /// @dev The hook's ERC-6909 claim balance for a currency, straight off the singleton.
     function _claims(Currency c) internal view returns (uint256) {
         return manager.balanceOf(address(hook), c.toId());
@@ -394,6 +407,12 @@ abstract contract HookAuditCases is HookAuditWorld {
     /// @dev The consequence stated as money: on a pool that only ever sees router traffic, every
     ///      wei of fee stays an ERC-6909 claim and a holder's `withdrawableOf` stays ZERO until a
     ///      human or a bot calls `sweep`. The claims are real and safe - they are just not paid.
+    ///
+    ///      **Streaming does not fix this and does not soften it.** It adds a second, independent
+    ///      delay on top: after the sweep finally happens, entitlement still takes a full
+    ///      `STREAM_WINDOW` to appear. So V-01 now costs a holder the unbounded wait for a
+    ///      volunteer PLUS 24 hours, and the intermediate assertion below distinguishes the two -
+    ///      un-swept and un-vested are both "owed nothing", for entirely different reasons.
     function test_V01b_routerOnlyTrafficLeavesHoldersUnpaidIndefinitely() public {
         (address t, PoolKey memory k, PoolId id) = _defaultLaunch();
         Distributor dist = LaunchToken(t).distributor();
@@ -406,7 +425,17 @@ abstract contract HookAuditCases is HookAuditWorld {
         assertGt(hook.pendingFees(id), 0, "fees were charged");
         assertEq(dist.withdrawableOf(alice), 0, "but a holder is owed nothing until someone sweeps");
 
+        // Not swept: waiting a full window changes nothing at all, because there is no stream to
+        // vest. This is the assertion that separates "nobody swept" from "the stream is young".
+        _vest(dist);
+        assertEq(dist.withdrawableOf(alice), 0, "time alone never pays an un-swept pool");
+        assertEq(pair.balanceOf(address(dist)), 0, "and no money has moved either");
+
         hook.sweep(k);
+        assertGt(pair.balanceOf(address(dist)), 0, "the sweep moves the MONEY immediately");
+        assertEq(dist.withdrawableOf(alice), 0, "but not the ENTITLEMENT - that streams");
+
+        _vest(dist);
         assertGt(dist.withdrawableOf(alice), 0, "the manual path does pay");
     }
 

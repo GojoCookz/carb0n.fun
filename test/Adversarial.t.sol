@@ -96,6 +96,10 @@ contract AdversarialTest is Test {
         d.setBalance(alice, 1_000e18);
         evil.mint(address(d), 100e18);
         d.distribute(100e18);
+        // A distribution vests over `STREAM_WINDOW` rather than crediting instantly, so there is
+        // nothing to reenter for until it has. Advance past the finish so the pot is fully
+        // claimable and the double-pay attempt below has real money to try to take twice.
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         uint256 owed = d.withdrawableOf(alice);
         assertGt(owed, 0, "precondition: alice is owed something");
@@ -119,6 +123,9 @@ contract AdversarialTest is Test {
         d.setBalance(bob, 1_000e18);
         evil.mint(address(d), 100e18);
         d.distribute(100e18);
+        // Fully vest first: `processBatch` skips anybody owed less than `minPushPayout`, so with
+        // an un-vested stream it would walk the queue paying nobody and never reach `transfer`.
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         uint256 owedA = d.withdrawableOf(alice);
         uint256 owedB = d.withdrawableOf(bob);
@@ -148,6 +155,9 @@ contract AdversarialTest is Test {
         d.setBalance(carol, 1_000e18);
         tok.mint(address(d), 300e18);
         d.distribute(300e18);
+        // Vest the stream so all three holders are genuinely owed something - otherwise the batch
+        // pays nobody and "the blocked holder did not brick the queue" would pass vacuously.
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
 
         tok.block_(bob);
 
@@ -169,9 +179,14 @@ contract AdversarialTest is Test {
         d.setBalance(alice, 1_000e18);
         tok.mint(address(d), 100e18);
         d.distribute(100e18);
+        // Without this warp nothing has vested, `withdraw` reverts with `NothingToWithdraw`
+        // whatever the token does, and the test passes while proving nothing at all - `before`
+        // would be 0 and the assertion would be 0 == 0. The claim has to exist to be eaten.
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
         tok.block_(alice);
 
         uint256 before = d.withdrawableOf(alice);
+        assertGt(before, 0, "precondition: there is a real claim to lose");
         vm.prank(alice);
         vm.expectRevert();
         d.withdraw();
@@ -265,7 +280,21 @@ contract AdversarialTest is Test {
         d.setBalance(bob, 10_000e18);
         tok.mint(address(d), 1e18);
         d.distribute(1e18);
-        assertEq(d.totalDistributed(), 1_001e18, "the carry was not folded in");
+
+        // Folding the carry back in ARMS it, it does not credit it: the whole 1_001e18 now vests
+        // over `STREAM_WINDOW`. Advance past the finish and checkpoint so the ledger below reads
+        // the settled state rather than a stream in flight.
+        vm.warp(block.timestamp + d.STREAM_WINDOW() + 1);
+        d.processBatch(0); // permissionless checkpoint - walks nobody, pays nobody
+
+        // `_arm` splits the total into a per-second rate and carries the `total % STREAM_WINDOW`
+        // remainder in `pendingPayouts` rather than dropping it, so the two buckets together are
+        // still exactly what came in. That equality is the real claim: not one wei was lost
+        // between being carried and being paid.
+        assertEq(
+            d.totalDistributed() + d.pendingPayouts(), 1_001e18, "the carry was not folded in"
+        );
+        assertLt(d.pendingPayouts(), d.STREAM_WINDOW(), "more than truncation dust was withheld");
 
         vm.prank(bob);
         d.withdraw();

@@ -181,6 +181,11 @@ contract LauncherTest is Test {
         Distributor dist = LaunchToken(token).distributor();
         _buy(holderFunded(), token, 1e18);
 
+        // The swept fee is STREAMED, not credited on the spot: `distribute` arms it to vest over
+        // `STREAM_WINDOW` so a buy-sweep-sell in one transaction captures nothing. The trader
+        // therefore has to be allowed to hold before there is anything to pay them.
+        vm.warp(block.timestamp + dist.STREAM_WINDOW() + 1);
+
         uint256 owed = dist.withdrawableOf(trader);
         assertGt(owed, 0, "a holder accrues from someone else's trade");
 
@@ -364,12 +369,20 @@ contract LauncherTest is Test {
         hook.sweep(_key(token));
 
         assertEq(hook.pendingFees(_key(token).toId()), 0, "claim redeemed in full");
+        assertGt(pair.balanceOf(address(dist)), 0, "and the tokens really reached the ledger");
+
+        // There is now a THIRD place the fee can legitimately be: armed on the stream, vesting
+        // over `STREAM_WINDOW`, in neither `totalDistributed` nor `pendingPayouts` yet. Advance
+        // past the finish and checkpoint so it has resolved into one of the two accounted buckets
+        // - which is what "never dropped" has to mean once distribution takes time.
+        vm.warp(block.timestamp + dist.STREAM_WINDOW() + 1);
+        dist.processBatch(0); // permissionless checkpoint - walks nobody, pays nobody
+
         assertGt(
             dist.totalDistributed() + dist.pendingPayouts(),
             0,
             "the fee was accounted for - carried or distributed, never dropped"
         );
-        assertGt(pair.balanceOf(address(dist)), 0, "and the tokens really reached the ledger");
 
         // The creator bought, so they are a holder and the fee is theirs to claim.
         assertGt(dist.withdrawableOf(creator), 0, "the holder can actually claim it");

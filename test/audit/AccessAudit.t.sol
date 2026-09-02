@@ -167,9 +167,23 @@ abstract contract AccessAuditHarness is Test {
     }
 
     /// @dev An ordinary exact-input buy, then a sweep so the fee becomes real ERC-20.
+    ///
+    ///      The sweep moves MONEY onto the Distributor immediately. It does NOT move
+    ///      ENTITLEMENT: `distribute` arms a linear vest over `STREAM_WINDOW` and nothing is
+    ///      withdrawable in the block it lands. Anything that reads `withdrawableOf` must call
+    ///      `_vest` first - which is deliberately NOT folded into this helper, because two tests
+    ///      in this file warp on their own vesting-schedule clock and a hidden warp would
+    ///      silently move that too.
     function _buyAndSweep(address who, address token, uint256 amountIn) internal {
         _buy(who, token, amountIn);
         hook.sweep(_key(token));
+    }
+
+    /// @dev Warp past the end of the current dividend stream. `skip` reads the clock back through
+    ///      the cheatcode; `via_ir` caches `block.timestamp` and silently no-ops a chained
+    ///      `vm.warp(block.timestamp + X)`.
+    function _vest(Distributor dist) internal {
+        skip(uint256(dist.STREAM_WINDOW()) + 1);
     }
 
     function _launchVested(uint256 devBuy, uint64 duration, uint64 cliff)
@@ -311,9 +325,10 @@ contract AccessAuditTest is AccessAuditHarness {
         // ...and the route to it is permanently absent.
         assertEq(dist.converter(), address(0), "converter baked in as zero, immutably");
 
-        // Two trades so a holder actually accrues.
+        // Two trades so a holder actually accrues, then a full window so the stream vests.
         _buyAndSweep(trader, token, 1e18);
         _buyAndSweep(stranger, token, 1e18);
+        _vest(dist);
 
         uint256 owed = dist.withdrawableOf(trader);
         assertGt(owed, 0, "no dividend to test with");
@@ -376,9 +391,10 @@ contract AccessAuditTest is AccessAuditHarness {
         (address token, VestingVault vault) = _launchVested(5e18, 90 days, 0);
         Distributor dist = LaunchToken(token).distributor();
 
-        // Earn the vault a dividend.
+        // Earn the vault a dividend, and let it vest - entitlement is on the clock now.
         _buyAndSweep(trader, token, 5e18);
         _buyAndSweep(stranger, token, 5e18);
+        _vest(dist);
 
         uint256 owedToVault = dist.withdrawableOf(address(vault));
         assertGt(owedToVault, 0, "the locked bag must accrue like any other holder");
@@ -392,7 +408,10 @@ contract AccessAuditTest is AccessAuditHarness {
         assertEq(stranded, owedToVault, "the push landed on the vault");
         assertEq(dist.withdrawableOf(address(vault)), 0, "and the claim is now settled");
 
-        // The beneficiary's only door is now bolted.
+        // The beneficiary's only door is now bolted. The two assertions above are what make this
+        // `expectRevert` mean something: under streaming `NothingToWithdraw` also fires for a
+        // holder who is merely un-vested, so the revert alone proves nothing. Here the vault was
+        // provably owed `owedToVault`, provably paid it by the push, and is provably at zero.
         vm.prank(creator);
         vm.expectRevert(Distributor.NothingToWithdraw.selector);
         vault.claimDividends();
@@ -401,6 +420,7 @@ contract AccessAuditTest is AccessAuditHarness {
         // `claimDividends` forwards only the delta it observes around `withdraw()`.
         _buyAndSweep(trader, token, 5e18);
         _buyAndSweep(stranger, token, 5e18);
+        _vest(dist);
 
         uint256 creatorBefore = pair.balanceOf(creator);
         vm.prank(creator);
@@ -417,6 +437,7 @@ contract AccessAuditTest is AccessAuditHarness {
         // There is no other exit. The only `payoutToken` transfer on VestingVault is the one
         // inside `claimDividends`, and it can only ever move the delta.
         _buyAndSweep(trader, token, 5e18);
+        _vest(dist);
         vm.prank(creator);
         vault.claimDividends();
         assertEq(pair.balanceOf(address(vault)), stranded, "still stranded after a second claim");
@@ -424,12 +445,20 @@ contract AccessAuditTest is AccessAuditHarness {
 
     /// The same defect, reached WITHOUT an attacker: the vault is enqueued like any holder, so the
     /// first well-meaning keeper to call `processBatch` destroys the creator's dividend stream.
+    ///
+    /// @dev **This was a VACUOUS PASS under streaming and was not on the failing list.** Without
+    ///      the `_vest`, the vault is owed zero, `processBatch` walks past it paying nobody, and
+    ///      `claimDividends` reverts `NothingToWithdraw` for the entirely innocent reason that
+    ///      nothing had vested yet - i.e. the test was green on a system where the keeper had
+    ///      done no harm at all. The three added assertions pin the causal chain instead of the
+    ///      revert selector.
     function test_finding_anHonestKeeperCausesTheSameLoss() public {
         (address token, VestingVault vault) = _launchVested(5e18, 90 days, 0);
         Distributor dist = LaunchToken(token).distributor();
 
         _buyAndSweep(trader, token, 5e18);
         _buyAndSweep(stranger, token, 5e18);
+        _vest(dist);
 
         // The vault really is in the push queue - it is not an exotic state.
         bool queued;
@@ -438,8 +467,16 @@ contract AccessAuditTest is AccessAuditHarness {
         }
         assertTrue(queued, "the vault is a queued holder");
 
+        uint256 owedToVault = dist.withdrawableOf(address(vault));
+        assertGt(owedToVault, 0, "the vault is genuinely owed before the keeper runs");
+
         vm.prank(stranger); // a bounty bot, not an attacker
         dist.processBatch(50);
+
+        // The keeper really did land the money, and really did settle the claim. Without these
+        // two the revert below is indistinguishable from "nothing had vested".
+        assertEq(pair.balanceOf(address(vault)), owedToVault, "the keeper pushed it into the vault");
+        assertEq(dist.withdrawableOf(address(vault)), 0, "and settled the claim doing it");
 
         vm.prank(creator);
         vm.expectRevert(Distributor.NothingToWithdraw.selector);

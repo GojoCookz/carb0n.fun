@@ -277,6 +277,23 @@ abstract contract EconWorld is Test {
         _swapRaw(k, who, !_buyIsZeroForOne(), -int256(tokensIn));
     }
 
+    /// @dev Warp past the end of the current dividend stream.
+    ///
+    ///      `Distributor.distribute` no longer credits `_magnifiedPayoutPerShare` in the instant
+    ///      `sweep()` calls it - it arms a linear vest over `STREAM_WINDOW` (24 hours). **That
+    ///      change is what closes E-03**, and it is why the two attack tests below now assert the
+    ///      opposite of what they were written to assert.
+    ///
+    ///      Note what it does NOT delay: the pair currency itself still lands on the distributor,
+    ///      the creator, the platform and the sweeper's bounty inside the sweep. Money and
+    ///      entitlement are on different clocks now, and every P/L in this file is money.
+    ///
+    ///      `skip` reads the clock back through the cheatcode; `via_ir` caches `block.timestamp`
+    ///      and silently no-ops a chained `vm.warp(block.timestamp + X)`.
+    function _vest(Distributor dist) internal {
+        skip(uint256(dist.STREAM_WINDOW()) + 1);
+    }
+
     // --------------------------------------------------------------------------------------------
     // Measurement helpers
     // --------------------------------------------------------------------------------------------
@@ -517,13 +534,40 @@ abstract contract EconAuditCases is EconWorld {
         assertLt(-cost, int256(0.0004e18), "for a third of a basis point of the opening cap");
     }
 
-    /// @dev **Forcing graduation is not merely cheap, it can be free.** The push that fakes the
-    ///      market cap also makes the attacker the dominant shareholder for one instant, so they
-    ///      fold `sweep()` into the same bundle and recover their own buy fee - plus whatever pot
-    ///      the pool had already accumulated - out of the holders' side of the split.
+    /// @dev **THIS FINDING IS FIXED. The test is now the regression guard, not the exploit.**
+    ///
+    ///      As originally written this asserted the OPPOSITE: forcing graduation was not merely
+    ///      cheap, it was FREE. The push that fakes the market cap also made the attacker the
+    ///      dominant shareholder for one instant, so folding `sweep()` into the same bundle
+    ///      recovered their own buy fee - plus whatever pot the pool had already accumulated -
+    ///      out of the holders' side of the split, and turned a -3.8528 pair cost into a profit.
     ///
     ///         buy -> checkGraduation -> sweep -> sell -> withdraw
-    function test_E02c_foldingTheSweepIntoTheGraduationPushPaysForIt() public {
+    ///
+    ///      The bundle is unchanged and still runs end to end. What changed is that
+    ///      `Distributor.distribute` arms a 24-hour linear vest instead of crediting the
+    ///      accumulator, so the leg that used to pay for the whole exercise now pays nothing.
+    ///
+    ///      Measured on this exact scenario, identical to the wei in both currency orderings:
+    ///
+    ///        | | instant credit (audit/05) | streaming |
+    ///        |---|---|---|
+    ///        | bare push, no sweep           | -3.8528 pair     | **-3.8828 pair** (measured
+    ///          in-test against this turnover pool, not quoted) |
+    ///        | push with the sweep folded in | **+4.0114 pair** | **-3.8027 pair** |
+    ///        | so the sweep leg is worth     | +7.86 pair       | **+0.0801 pair** |
+    ///
+    ///      The sweep leg is still worth SOMETHING - the bundle comes out 0.0801 pair ahead of
+    ///      the bare push - and the test asserts that residue is EXACTLY the 0.5%
+    ///      `SWEEP_BOUNTY_BPS` on the pot, to the wei. That is payment for gas on a public good
+    ///      and was never the problem. `audit/08-streaming-designs.md` predicted precisely this:
+    ///      "the 0.5% sweep bounty becomes safe again ... `FeeHook.sol:154` can stay". The
+    ///      dividend leg, which was the profitable part, is now worth zero.
+    ///
+    ///      **Graduation is still forgeable.** E-02 and E-02b are untouched and still fail-by-
+    ///      design as findings: a spot read is a spot read. All that changed is that the attacker
+    ///      now has to pay for it.
+    function test_E02c_foldingTheSweepIntoTheGraduationPushNoLongerPaysForIt() public {
         (address t, PoolKey memory k, PoolId id) = _defaultLaunch();
         Distributor dist = LaunchToken(t).distributor();
         _approveTrader(t, attacker);
@@ -531,25 +575,65 @@ abstract contract EconAuditCases is EconWorld {
         // A pool with ordinary turnover, i.e. an unswept pot and a small resting register.
         _buildTurnoverPool(t, k, 5e18, 20e18, 20);
 
-        uint256 start = pair.balanceOf(attacker);
         uint256 curveIn = _sqrt(M * (M * 5)) - M;
         uint256 notional = (curveIn * 10_000) / (10_000 - 300) + 2e18;
 
+        // ---- CONTROL: the bare push, measured here rather than quoted from the old audit, so
+        // the "does the sweep leg pay for it" question is answered against this exact state.
+        uint256 snap = vm.snapshotState();
+        uint256 bareStart = pair.balanceOf(attacker);
         _buy(k, attacker, notional);
         hook.checkGraduation(id);
+        _sell(k, attacker, IERC20(t).balanceOf(attacker));
+        int256 bare = int256(pair.balanceOf(attacker)) - int256(bareStart);
+        vm.revertToState(snap);
+
+        // ---- THE BUNDLE: identical, plus the sweep the attacker used to be paid for.
+        uint256 start = pair.balanceOf(attacker);
+        _buy(k, attacker, notional);
+        hook.checkGraduation(id);
+        uint256 potAtSweep = hook.pendingFees(id);
         vm.prank(attacker);
         hook.sweep(k);
+
+        // The instant the pot is distributed, the attacker owns most of the register and is
+        // entitled to none of it. This is the line the whole change exists for.
+        assertEq(dist.withdrawableOf(attacker), 0, "a zero-block position was credited");
+
         _sell(k, attacker, IERC20(t).balanceOf(attacker));
         if (dist.withdrawableOf(attacker) != 0) {
             vm.prank(attacker);
             dist.withdraw();
         }
-
         int256 pl = int256(pair.balanceOf(attacker)) - int256(start);
+
+        // Waiting out the window does not rescue it either: the correction froze on the way out.
+        _vest(dist);
+        assertEq(dist.withdrawableOf(attacker), 0, "the exited attacker vested in afterwards");
+        assertEq(
+            int256(pair.balanceOf(attacker)) - int256(start), pl, "the P/L moved after they left"
+        );
+
+        uint256 bounty = (potAtSweep * hook.SWEEP_BOUNTY_BPS()) / 10_000;
         console2.log("E-02c  notional pushed              :", _p(int256(notional)));
+        console2.log("E-02c  bare push, no sweep          :", _p(bare));
         console2.log("E-02c  NET P/L OF A FAKE GRADUATION :", _p(pl));
+        console2.log("E-02c  what the sweep leg was worth :", _p(pl - bare));
+        console2.log("E-02c  ...the 0.5% bounty alone     :", _p(int256(bounty)));
+
         assertTrue(hook.hasGraduated(id), "latched");
-        assertGt(pl, 0, "the attacker is PAID to forge the graduation signal");
+        assertLt(pl, 0, "REGRESSION: the attacker is once again PAID to forge the signal");
+        assertGt(pl, bare, "the sweep bounty is still earned - it just no longer pays for the push");
+        // Everything the sweep leg is worth is the bounty, to the wei. Nothing from the pot
+        // itself reaches a position that was opened and closed inside one block. Both branches
+        // run the identical two swaps from the identical snapshot, so this is exact, not
+        // approximate - if entitlement ever leaks back into the same block, it shows up here
+        // before it shows up in the sign of `pl`.
+        assertEq(
+            pl - bare,
+            int256(bounty),
+            "the sweep leg paid more than the bounty: entitlement is leaking into the same block"
+        );
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {
@@ -564,28 +648,53 @@ abstract contract EconAuditCases is EconWorld {
 
     // ============================================================================================
     // E-03  Dividend front-running: buy, sweep, sell, in one transaction.
+    //
+    // THE CRITICAL OF THIS AUDIT, AND IT IS NOW CLOSED. Everything below is a regression guard.
     // ============================================================================================
 
-    /// @dev **The most profitable repeatable attack in this file.**
+    /// @dev **E-03 WAS THE CRITICAL. IT IS FIXED, AND THIS TEST IS THE PROOF.**
     ///
-    ///      `sweep()` is permissionless and `Distributor.distribute` splits pro-rata by the share
-    ///      register AT THAT INSTANT. So the attacker does not have to predict a sweep or win a
-    ///      race - they call it themselves, in the middle of their own round trip:
+    ///      Nothing about the attack has been made harder. `sweep()` is still permissionless, it
+    ///      still pays a 0.5% bounty to whoever calls it, the attacker still does not have to
+    ///      predict a sweep or win a race, and the whole bundle still executes end to end:
     ///
     ///         buy -> sweep -> sell -> withdraw
     ///
-    ///      The buy makes them the dominant shareholder, the sweep pays the whole accumulated pot
-    ///      out against that register, the sell unwinds the position at the same price it was
-    ///      bought at (a round trip on this curve returns the input to the wei), and `withdraw`
-    ///      collects. Their entire cost is `feeBps` on the buy; their revenue is the sweep bounty
-    ///      plus their share of a pot that other people's trades paid for.
+    ///      What changed is one line of `Distributor`. `distribute` no longer credits
+    ///      `_magnifiedPayoutPerShare` in the instant it is called - it arms a linear vest over
+    ///      `STREAM_WINDOW` (24 hours), and `_checkpoint()` folds in elapsed time at the top of
+    ///      every entry point. Inside one block `elapsed == 0`, so a position opened and closed
+    ///      in the same block is credited **exactly zero**, not "a sliver". The revenue leg of
+    ///      the attack is gone; the cost leg - `feeBps` on the buy - is untouched.
     ///
-    ///      **The pool shape that makes it work is the normal one.** A memecoin pool's fee pot is
-    ///      built by TURNOVER - people who buy and then sell - while the share register at any
-    ///      instant holds only the resting float. So the pot is large and the register is small,
-    ///      which is exactly the ratio this attack needs. The scenario below is a 5-pair resting
-    ///      holder and 400 pair of round-trip volume, which is a quiet day.
-    function test_E03_buySweepSellCapturesTheHoldersPot() public {
+    ///      Measured on this exact scenario (5-pair resting holder, 400 pair of round-trip
+    ///      volume, 40 pair deployed, 12.1500 pair in the pot), identical to the wei in both
+    ///      currency orderings:
+    ///
+    ///        |                            | instant credit (audit/05) | streaming        |
+    ///        |----------------------------|---------------------------|------------------|
+    ///        | attacker net P/L           | **+4.8738 pair**          | **-1.1332 pair** |
+    ///        | ...return on capital       | +12.18%                   | -2.83%           |
+    ///        | ...share of the pot taken  | 40.11%                    | -9.32%           |
+    ///        | attacker's share of the register at the sweep | ~ | 84.78% (unchanged)   |
+    ///        | alice owed, honest sweep   | 6.4479 pair               | 6.4479 pair      |
+    ///        | alice owed, attacked sweep | (lost 83.28%)             | **7.0847 pair**  |
+    ///        | so the attack costs alice  | **-83.28%**               | **+0.6368 pair** |
+    ///
+    ///      The honest resting holder does not merely stop losing. She ends up 9.88% AHEAD of the
+    ///      control, because the attacker's own buy fee joins the pot and then vests entirely to
+    ///      her - she is the only party still holding when the clock runs. **The attack has
+    ///      become a donation to the people it used to rob.**
+    ///
+    ///      What the attacker keeps is 0.0607 pair, and that is the `SWEEP_BOUNTY_BPS` they could
+    ///      have had for calling `sweep()` while holding nothing at all. The buy leg is worth
+    ///      **-1.1940 pair**, i.e. exactly the fee it costs and not one wei of entitlement.
+    ///
+    ///      The residual, stated plainly and unchanged from `audit/08-streaming-designs.md`: a
+    ///      buyer who takes a large position right after a sweep and genuinely holds the full
+    ///      window does capture the stream. That is not an attack, that is a holder, and every
+    ///      design in the streaming literature accepts it.
+    function test_E03_buySweepSellIsUnprofitableUnderStreaming() public {
         (address t, PoolKey memory k, PoolId id) = _defaultLaunch();
         Distributor dist = LaunchToken(t).distributor();
         _approveTrader(t, attacker);
@@ -595,12 +704,19 @@ abstract contract EconAuditCases is EconWorld {
         assertGt(pot, 0, "there is a pot to take");
         uint256 register = dist.totalShares();
 
-        // ---- Control: an honest stranger sweeps from this exact state.
+        // ---- Control: an honest stranger sweeps from this exact state, and the window runs out.
         uint256 snap = vm.snapshotState();
         vm.prank(carol);
         hook.sweep(k);
+        _vest(dist);
         uint256 aliceHonest = dist.withdrawableOf(alice);
+        assertGt(aliceHonest, 0, "control: the resting holder is paid at all");
         vm.revertToState(snap);
+
+        // ---- Baseline: the attacker calls `sweep()` and holds NOTHING. This is the number the
+        // bundle has to beat, not zero - the 0.5% bounty is payment for gas on a public good and
+        // was never the finding. See `_bareSweepBounty`.
+        int256 bountyOnly = _bareSweepBounty(k);
 
         // ---- Attack: buy, sweep, sell, withdraw. One transaction's worth of actions.
         uint256 start = pair.balanceOf(attacker);
@@ -608,15 +724,33 @@ abstract contract EconAuditCases is EconWorld {
 
         _buy(k, attacker, buyIn);
         uint256 alpha = (dist.shareOf(attacker) * 10_000) / dist.totalShares();
+        assertGt(alpha, 5_000, "precondition: the buy really did make them the dominant holder");
+
         vm.prank(attacker);
         hook.sweep(k);
+
+        // THE ASSERTION THE WHOLE CHANGE EXISTS FOR. They own the overwhelming majority of the
+        // share register at the exact instant the pot is distributed, and they are entitled to
+        // none of it. Under instant credit this read ~40% of the pot.
+        assertEq(dist.withdrawableOf(attacker), 0, "a zero-block position was credited");
+
         _sell(k, attacker, IERC20(t).balanceOf(attacker));
         if (dist.withdrawableOf(attacker) != 0) {
             vm.prank(attacker);
             dist.withdraw();
         }
-
         int256 profit = int256(pair.balanceOf(attacker)) - int256(start);
+
+        // Nor can they simply come back tomorrow: `_setShares` froze their correction against the
+        // accumulator as it stood when they exited, which was before any of this vested.
+        _vest(dist);
+        assertEq(dist.withdrawableOf(attacker), 0, "the exited attacker vested in later");
+        assertEq(
+            int256(pair.balanceOf(attacker)) - int256(start),
+            profit,
+            "the attacker's P/L moved after they had already left"
+        );
+
         uint256 aliceAttacked = dist.withdrawableOf(alice);
 
         console2.log("E-03   pot at the moment of attack  :", _p(int256(pot)));
@@ -629,26 +763,45 @@ abstract contract EconAuditCases is EconWorld {
         console2.log("E-03   alice owed, honest sweep     :", _p(int256(aliceHonest)));
         console2.log("E-03   alice owed, attacked sweep   :", _p(int256(aliceAttacked)));
         console2.log(
-            "E-03   HONEST HOLDER LOSS           :", _p(int256(aliceAttacked) - int256(aliceHonest))
+            "E-03   HONEST HOLDER GAIN           :", _p(int256(aliceAttacked) - int256(aliceHonest))
         );
-        console2.log(
-            "E-03   ...share of her dividend lost:", _pct(aliceHonest - aliceAttacked, aliceHonest)
-        );
+        console2.log("E-03   P/L of just calling sweep()  :", _p(bountyOnly));
+        console2.log("E-03   ...what the BUY LEG is worth :", _p(profit - bountyOnly));
 
-        assertGt(profit, 0, "the zero-duration round trip is profitable");
-        assertLt(aliceAttacked, aliceHonest, "and the resting holder was diluted out of her pot");
+        assertLt(profit, 0, "REGRESSION: the zero-duration round trip is profitable again");
+        // The sharpest form of the fix: taking a position ahead of the sweep is strictly worse
+        // than not taking one. Everything the attacker earns, they would have earned by doing
+        // nothing but paying the gas.
+        assertLt(profit, bountyOnly, "REGRESSION: the buy leg buys entitlement again");
+        assertGe(
+            aliceAttacked, aliceHonest, "REGRESSION: the resting holder was diluted by the attack"
+        );
     }
 
-    /// @dev The shape of the profit curve. The attacker pays `feeBps * B` and recovers the bounty
-    ///      plus `alpha * holderShare * (pot + their own fee)`, where `alpha` rises with `B` and
-    ///      the cost rises linearly. Sweeping `B` locates the optimum.
-    function test_E03b_theProfitCurveAndItsOptimum() public {
-        console2.log("E-03b  buyIn(pair) | profit(pair) | ROI on capital");
+    /// @dev **There is no longer an optimum, because there is no longer a hump.**
+    ///
+    ///      Under instant credit the attacker paid `feeBps * B` and recovered the bounty plus
+    ///      `alpha * holderShare * (pot + their own fee)`. `alpha` rose with `B` while the cost
+    ///      rose linearly, so the curve had a maximum and sweeping `B` located it. Under
+    ///      streaming the `alpha` term is identically zero at zero blocks held, so the only two
+    ///      terms left are a bounty that does not depend on `B` at all and a fee that is linear
+    ///      in it. The curve is now monotonically DECREASING and negative everywhere - bigger
+    ///      buys simply lose more.
+    ///
+    ///      **The baseline is the bare sweep, not zero.** Calling `sweep()` while holding nothing
+    ///      earns `SWEEP_BOUNTY_BPS` and always has - that is what the bounty is for, and E-04
+    ///      shows it cannot be farmed. At a 2-pair buy the fee is smaller than that bounty, so
+    ///      the bundle still nets a positive 0.0010 pair; measuring against zero would mis-read
+    ///      the gas subsidy as a surviving exploit. The question E-03 asks is whether the BUY
+    ///      adds anything, and the answer is that it subtracts, at every size.
+    function test_E03b_theProfitCurveHasNoProfitableSize() public {
+        console2.log("E-03b  buyIn(pair) | profit(pair) | ROI | vs. just sweeping");
         uint256[7] memory sizes =
             [uint256(2e18), 5e18, 10e18, 20e18, 40e18, 120e18, 400e18];
+        int256 previous = type(int256).max;
         for (uint256 i = 0; i < sizes.length; ++i) {
             uint256 snap = vm.snapshotState();
-            int256 profit = _runDividendAttack(M, 5e18, 20e18, 20, sizes[i]);
+            (int256 profit, int256 bountyOnly) = _runDividendAttack(M, 5e18, 20e18, 20, sizes[i]);
             console2.log(
                 string.concat(
                     "E-03b  ",
@@ -656,19 +809,29 @@ abstract contract EconAuditCases is EconWorld {
                     " | ",
                     _p(profit),
                     " | ",
-                    _signedPct(profit, sizes[i])
+                    _signedPct(profit, sizes[i]),
+                    " | ",
+                    _p(profit - bountyOnly)
                 )
             );
+            assertLt(
+                profit, bountyOnly, "REGRESSION: taking a position ahead of the sweep pays again"
+            );
+            assertLt(profit, previous, "REGRESSION: the profit curve grew a hump again");
+            previous = profit;
             vm.revertToState(snap);
         }
     }
 
-    /// @dev Where it stops being worth it. The attack's payoff scales with the pot and the pot
-    ///      scales with the pool, so there is no size at which it becomes UNPROFITABLE - only a
-    ///      size at which the profit stops clearing L1 gas. A `buy -> sweep -> sell -> withdraw`
-    ///      bundle measures at roughly 800k gas; at 20 gwei that is 0.016 pair when the pair is
-    ///      WETH. The table below brackets the crossing.
-    function test_E03c_whereTheDividendAttackStopsClearingGas() public {
+    /// @dev The old finding was that the attack never becomes UNPROFITABLE at any pool size -
+    ///      the payoff scaled with the pot and the pot scaled with the pool, so there was only a
+    ///      size at which the profit stopped clearing L1 gas (~800k gas, 0.016 pair at 20 gwei
+    ///      when the pair is WETH), and the table bracketed that crossing.
+    ///
+    ///      **Under streaming there is no crossing to bracket.** The payoff no longer scales with
+    ///      anything, because it is zero, so the bundle is under water at every pool size from a
+    ///      0.1-pair opening cap to a 100-pair one. Three orders of magnitude, one sign.
+    function test_E03c_theDividendAttackIsUnderWaterAtEveryPoolSize() public {
         uint256 gasCost = 800_000 * 20 gwei; // 0.016 ETH
         console2.log("E-03c  gas floor for the bundle (pair):", _p(int256(gasCost)));
         console2.log("E-03c  openingMcap | volume | profit | clears gas?");
@@ -678,7 +841,8 @@ abstract contract EconAuditCases is EconWorld {
             uint256 snap = vm.snapshotState();
             uint256 c = caps[i];
             // Scale the scenario with the pool: 5% resting float, 4x the cap in round-trip volume.
-            int256 profit = _runDividendAttack(c, c / 20, c / 5, 20, (c * 4) / 10);
+            (int256 profit, int256 bountyOnly) =
+                _runDividendAttack(c, c / 20, c / 5, 20, (c * 4) / 10);
             console2.log(
                 string.concat(
                     "E-03c  ",
@@ -691,31 +855,63 @@ abstract contract EconAuditCases is EconWorld {
                     profit > int256(gasCost) ? "YES" : "no"
                 )
             );
+            assertLt(profit, 0, "REGRESSION: some pool size makes the zero-block attack pay");
+            assertLt(profit, bountyOnly, "REGRESSION: the buy leg is worth something again");
             vm.revertToState(snap);
         }
     }
 
     /// @dev The same attack across the legal fee band. `platformShareBps = 100*BPS/feeBps`, so the
     ///      holders' slice of every fee is `(1 - 100/feeBps) * (1 - creatorBps)`. A HIGHER trading
-    ///      fee leaves a bigger slice for holders, which is a bigger slice for the attacker to
-    ///      take - and the attacker's own cost rises at the same rate. The table shows which way
-    ///      that trade nets out.
-    function test_E03d_theAttackAcrossTheLegalFeeBand() public {
+    ///      fee used to leave a bigger slice for holders, which was a bigger slice for the
+    ///      attacker to take - and the old measurement was that this NETTED OUT IN THE ATTACKER'S
+    ///      FAVOUR: +30.12 pair at the 1000 bps ceiling, ten times the profit at 100 bps. The fee
+    ///      knob a creator reaches for to reward holders more was the same knob that made robbing
+    ///      them more lucrative.
+    ///
+    ///      **That is inverted now.** The holders' slice is unreachable at zero blocks held, so
+    ///      raising `feeBps` only raises the attacker's own cost. The band runs one way.
+    function test_E03d_aHigherFeeNowOnlyMakesTheAttackWorseForTheAttacker() public {
         console2.log("E-03d  feeBps | creatorBps | attacker profit");
         uint16[4] memory fees = [uint16(100), 300, 600, 1000];
+        int256 previous = type(int256).max;
         for (uint256 i = 0; i < fees.length; ++i) {
             uint256 snap = vm.snapshotState();
-            int256 profit = _runDividendAttackAtFee(fees[i], 0);
+            (int256 profit, int256 bountyOnly) = _runDividendAttackAtFee(fees[i], 0);
             console2.log(
                 string.concat(
                     "E-03d  ", vm.toString(uint256(fees[i])), " | 0 | ", _p(profit)
                 )
             );
+            assertLt(profit, 0, "REGRESSION: the attack pays at some legal fee rate");
+            assertLt(profit, bountyOnly, "REGRESSION: the buy leg is worth something again");
+            assertLt(profit, previous, "REGRESSION: a higher fee is once again better for the attacker");
+            previous = profit;
             vm.revertToState(snap);
         }
     }
 
     // ---- attack plumbing -----------------------------------------------------------------------
+
+    /// @dev The control that matters now. `sweep()` is permissionless and pays
+    ///      `SWEEP_BOUNTY_BPS` to whoever calls it, so **doing nothing but calling it, holding no
+    ///      position at all, has always been mildly profitable** - that is what the bounty is
+    ///      FOR, and E-04 already establishes it cannot be farmed. The E-03 question is a
+    ///      different one: does taking a POSITION ahead of the sweep add anything on top?
+    ///
+    ///      Under instant credit it added a share of the whole pot. Under streaming it adds
+    ///      nothing and costs `feeBps`, so the bundle must come out strictly BELOW this baseline
+    ///      at every size. Comparing against zero instead would mis-read the bounty as an
+    ///      exploit at small buy sizes, where the fee on a tiny position is less than the bounty
+    ///      the attacker would have earned anyway.
+    function _bareSweepBounty(PoolKey memory k) internal returns (int256 bounty) {
+        uint256 snap = vm.snapshotState();
+        uint256 start = pair.balanceOf(attacker);
+        vm.prank(attacker);
+        hook.sweep(k);
+        bounty = int256(pair.balanceOf(attacker)) - int256(start);
+        require(vm.revertToState(snap), "bare-sweep control could not be unwound");
+    }
 
     /// @dev The realistic pool shape: one resting holder plus `trips` round trips of `tripPair`.
     ///      Round-trippers pay the fee and end with zero shares, which is precisely why the pot
@@ -736,13 +932,17 @@ abstract contract EconAuditCases is EconWorld {
         }
     }
 
+    /// @return profit the P/L of `buy -> sweep -> sell -> withdraw`, measured over the attacker's
+    ///         whole LIFETIME rather than just the atomic bundle
+    /// @return bountyOnly the P/L of calling `sweep()` from the identical state while holding
+    ///         nothing at all - the baseline the bundle has to beat to be an attack
     function _runDividendAttack(
         uint256 mcap,
         uint256 restingPair,
         uint256 tripPair,
         uint256 trips,
         uint256 buyIn
-    ) internal returns (int256) {
+    ) internal returns (int256 profit, int256 bountyOnly) {
         Launcher.LaunchParams memory p = _baseParams();
         p.openingMarketCap = mcap;
         p.graduationThreshold = mcap * 5;
@@ -751,6 +951,8 @@ abstract contract EconAuditCases is EconWorld {
         _approveTrader(t, attacker);
 
         _buildTurnoverPool(t, k, restingPair, tripPair, trips);
+
+        bountyOnly = _bareSweepBounty(k);
 
         uint256 start = pair.balanceOf(attacker);
         _buy(k, attacker, buyIn);
@@ -761,10 +963,21 @@ abstract contract EconAuditCases is EconWorld {
             vm.prank(attacker);
             dist.withdraw();
         }
-        return int256(pair.balanceOf(attacker)) - int256(start);
+        // Give the attacker the benefit of the doubt: let the whole window run and let them try
+        // again from a zero-share position. Reporting only the atomic P/L would understate the
+        // payoff if the stream ever leaked to an exited holder, so the tables measure LIFETIME.
+        _vest(dist);
+        if (dist.withdrawableOf(attacker) != 0) {
+            vm.prank(attacker);
+            dist.withdraw();
+        }
+        profit = int256(pair.balanceOf(attacker)) - int256(start);
     }
 
-    function _runDividendAttackAtFee(uint16 feeBps, uint16 creatorBps) internal returns (int256) {
+    function _runDividendAttackAtFee(uint16 feeBps, uint16 creatorBps)
+        internal
+        returns (int256 profit, int256 bountyOnly)
+    {
         Launcher.LaunchParams memory p = _baseParams();
         p.feeBps = feeBps;
         p.creatorBps = creatorBps;
@@ -773,6 +986,8 @@ abstract contract EconAuditCases is EconWorld {
         _approveTrader(t, attacker);
 
         _buildTurnoverPool(t, k, 5e18, 20e18, 20);
+
+        bountyOnly = _bareSweepBounty(k);
 
         uint256 start = pair.balanceOf(attacker);
         _buy(k, attacker, 40e18);
@@ -783,7 +998,13 @@ abstract contract EconAuditCases is EconWorld {
             vm.prank(attacker);
             dist.withdraw();
         }
-        return int256(pair.balanceOf(attacker)) - int256(start);
+        // Lifetime, not atomic - see `_runDividendAttack`.
+        _vest(dist);
+        if (dist.withdrawableOf(attacker) != 0) {
+            vm.prank(attacker);
+            dist.withdraw();
+        }
+        profit = int256(pair.balanceOf(attacker)) - int256(start);
     }
 
     // ============================================================================================
@@ -861,6 +1082,13 @@ abstract contract EconAuditCases is EconWorld {
     ///      Measured against a control where an honest stranger sweeps from the identical state.
     ///      **The result is a grief, not a theft**: the attacker's own P/L is negative, but the
     ///      burn is starved and that shortfall is permanent.
+    ///
+    ///      **Unaffected by streaming, and worth saying why.** A sandwich is atomic by
+    ///      definition - the front-run, the victim call and the unwind are one bundle - so the
+    ///      attacker's position is open for zero blocks and the dividend leg of their P/L is now
+    ///      structurally zero. The `withdraw` below is therefore dead code kept for shape; the
+    ///      number it reports is pure sandwich P/L, which only makes the "grief, not theft"
+    ///      reading stronger. The burn shortfall itself never depended on the dividend path.
     function test_E05_sandwichingTheBurnAndTheSellConversion() public {
         Launcher.LaunchParams memory p = _baseParams();
         p.sellFeeBps = 500;
@@ -1177,16 +1405,28 @@ abstract contract EconAuditCases is EconWorld {
         vm.prank(creator);
         pair.approve(address(swapRouter), type(uint256).max);
 
+        Distributor dist = LaunchToken(t).distributor();
         uint256 start = pair.balanceOf(creator);
         for (uint256 i = 0; i < 5; ++i) {
             _buy(k, creator, 100e18);
             vm.prank(creator);
             hook.sweep(k);
+            // HOLD ACROSS THE WINDOW before unwinding. Under streaming, a washer who round-trips
+            // inside one block collects no dividend at all, which would make this test pass for
+            // a reason that has nothing to do with the platform's flat 1%. Waiting out the full
+            // stream is the BEST case available to the washer and therefore the only honest way
+            // to state "always lossy" - they recover the entire holder slice as the sole holder.
+            _vest(dist);
+            if (dist.withdrawableOf(creator) != 0) {
+                vm.prank(creator);
+                dist.withdraw();
+            }
             _sell(k, creator, IERC20(t).balanceOf(creator));
             vm.prank(creator);
             hook.sweep(k);
         }
-        Distributor dist = LaunchToken(t).distributor();
+        // ...and the last sweep's stream too, though they have already exited into it.
+        _vest(dist);
         if (dist.withdrawableOf(creator) != 0) {
             vm.prank(creator);
             dist.withdraw();

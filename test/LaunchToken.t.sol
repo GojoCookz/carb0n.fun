@@ -206,15 +206,22 @@ contract LaunchTokenTest is Test, LaunchTokenDeployer {
         vm.prank(controller);
         dist.distribute(400e18);
 
-        // alice holds 25% of shares, bob 75%. The magnified-per-share accumulator truncates, so
-        // payouts round DOWN by up to a wei each. That is the correct direction: dust is stranded
-        // in the contract and folded into the next distribution, and the pool can never be drained
-        // by rounding. Assert the bound and the direction, never exact equality.
+        // Nothing is claimable in the block the fee lands - it vests over `STREAM_WINDOW`, which
+        // is what makes a zero-block position worthless. Advance past the finish so the split
+        // below is the settled one.
+        vm.warp(block.timestamp + dist.STREAM_WINDOW() + 1);
+
+        // alice holds 25% of shares, bob 75%. Payouts round DOWN twice over: the magnified-
+        // per-share accumulator truncates by up to a wei each, and `_arm` divides the fee into a
+        // per-second rate and carries the `400e18 % STREAM_WINDOW` remainder in `pendingPayouts`
+        // rather than dropping it. Both are the correct direction - dust stays in the contract and
+        // is folded into the next distribution, and the pool can never be drained by rounding.
+        // Assert the bound and the direction, never exact equality.
         uint256 aliceOwed = dist.withdrawableOf(alice);
         uint256 bobOwed = dist.withdrawableOf(bob);
 
-        assertApproxEqAbs(aliceOwed, 100e18, 1, "alice ~25%");
-        assertApproxEqAbs(bobOwed, 300e18, 1, "bob ~75%");
+        assertApproxEqAbs(aliceOwed, 100e18, dist.STREAM_WINDOW(), "alice ~25%");
+        assertApproxEqAbs(bobOwed, 300e18, dist.STREAM_WINDOW(), "bob ~75%");
         assertLe(aliceOwed, 100e18, "must round down, never up");
         assertLe(bobOwed, 300e18, "must round down, never up");
 
@@ -315,8 +322,21 @@ contract LaunchTokenTest is Test, LaunchTokenDeployer {
         vm.prank(controller);
         dist.distribute(1e18);
 
-        assertEq(dist.pendingPayouts(), 0, "carry released");
-        assertEq(dist.totalDistributed(), 1_001e18, "the carried amount was included");
+        // Flushing the carry ARMS it rather than crediting it: the whole 1_001e18 is scheduled to
+        // vest over `STREAM_WINDOW`. Advance past the finish and checkpoint so the ledger below
+        // reads a settled stream instead of one in flight.
+        vm.warp(block.timestamp + dist.STREAM_WINDOW() + 1);
+        dist.processBatch(0); // permissionless checkpoint - walks nobody, pays nobody
+
+        // What is still carried is only `_arm`'s truncation remainder, `total % STREAM_WINDOW`,
+        // held back on purpose rather than dropped. The 1_000e18 is out of the carry and the two
+        // buckets still sum to exactly what arrived.
+        assertLt(dist.pendingPayouts(), dist.STREAM_WINDOW(), "carry not released");
+        assertEq(
+            dist.totalDistributed() + dist.pendingPayouts(),
+            1_001e18,
+            "the carried amount was not included"
+        );
         assertGt(dist.withdrawableOf(bob), 999e18, "and the real holder receives it");
     }
 

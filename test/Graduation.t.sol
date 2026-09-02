@@ -540,6 +540,8 @@ abstract contract GraduationHarness is Test {
     function test_graduationChangesNothingAboutTrading() public {
         (address token, PoolId id) = _launch();
         Distributor dist = LaunchToken(token).distributor();
+        uint256 window = dist.STREAM_WINDOW();
+        uint256 t0 = block.timestamp;
 
         // Establish a holder so distributions actually land, then measure a control buy.
         _buy(trader, token, BUY_PAST_THRESHOLD);
@@ -550,12 +552,25 @@ abstract contract GraduationHarness is Test {
         assertFalse(hook.hasGraduated(id), "control buy happened before the latch");
         assertTrue(hook.checkGraduation(id), "now latch it");
 
+        // **Drain the pre-graduation streams before taking the baseline.** A dividend vests over
+        // `STREAM_WINDOW` instead of landing in the block its fee is swept, so without this the
+        // delta measured below would be dominated by the CONTROL buys vesting late and would stay
+        // positive even if the post-graduation buy paid holders nothing at all - the exact thing
+        // this test exists to rule out. Everything armed so far is fully vested at this point, so
+        // the second window measures only the trade that happens inside it.
+        //
+        // Absolute warps, not `block.timestamp + X` twice: under `via_ir` the timestamp is cached
+        // and the second chained warp silently no-ops.
+        vm.warp(t0 + window + 1);
+
         uint256 owedBefore = dist.withdrawableOf(trader);
         uint256 feesAtLatch = hook.totalFeesTaken(id);
         _buy(stranger, token, 1e18);
         uint256 chargedGraduated = hook.totalFeesTaken(id) - feesAtLatch;
 
         assertEq(chargedGraduated, chargedUngraduated, "the fee is 3% either side of graduation");
+
+        vm.warp(t0 + 2 * window + 2);
         assertGt(dist.withdrawableOf(trader) - owedBefore, 0, "holders still get paid");
         assertEq(LaunchToken(token).maxWallet(), 0, "and no cap silently appeared");
     }
