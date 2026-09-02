@@ -74,6 +74,30 @@ contract Distributor {
     /// @dev Overflow guard, not a policy knob. See the constructor docs.
     uint256 public immutable minSharesForDistribution;
 
+    /// @notice How long a distribution takes to fully vest into the accumulator.
+    ///
+    /// @dev **This window is the entire defence against dividend front-running**, and it exists
+    ///      because the classic dividend-token lineage does NOT defend against it. Traced across
+    ///      four implementations from 2019 to 2025: `claimWait` and friends rate-limit CLAIMING
+    ///      while leaving ENTITLEMENT creditable in a single instant, so `buy -> trigger -> sell`
+    ///      in one transaction captures a share of the whole pot having held for zero blocks.
+    ///
+    ///      Streaming makes that worthless. An attacker who buys, sweeps and sells in one
+    ///      transaction earns only what vested in that block — dust, against the trading fee they
+    ///      just paid on both legs. Earning a real share requires holding across the window, which
+    ///      is price risk, which is indistinguishable from simply investing. That is the point.
+    ///
+    ///      24 hours is a deliberate midpoint. Shorter makes the attack cheaper; longer makes
+    ///      dividends feel unresponsive on a token whose holders check hourly.
+    uint64 public constant STREAM_WINDOW = 24 hours;
+
+    /// @notice Magnified payout released per second while a stream is live.
+    uint256 public streamRate;
+    /// @notice When the current stream finishes. Zero before the first distribution.
+    uint64 public streamFinish;
+    /// @notice Last second already folded into `_magnifiedPayoutPerShare`.
+    uint64 public lastCheckpoint;
+
     uint256 internal _magnifiedPayoutPerShare;
     mapping(address account => int256) internal _corrections;
     mapping(address account => uint256) internal _withdrawn;
@@ -186,12 +210,93 @@ contract Distributor {
     ///      An earlier version returned early here and the fee stayed on this contract with nothing
     ///      recording it, unreachable forever. `pendingPayouts` is what makes the "folded into the
     ///      next distribution" promise true.
+    /// @dev Fold everything that has vested since the last touch into the accumulator.
+    ///
+    ///      **Must run BEFORE any read or write of shares or entitlement**, which is what makes
+    ///      the stream sound: a balance change is always applied to an accumulator that is already
+    ///      current, so incoming shares can never be credited with time they were not present for.
+    ///
+    ///      When there is nobody to pay, the elapsed value is CARRIED rather than stranded.
+    ///      Synthetix's `updateReward` advances its clock even at zero supply and loses those
+    ///      seconds permanently — 0xmacro published that exact bug against a Synthetix sibling.
+    ///      It matters more here than there, because this contract's own constructor documents
+    ///      that `totalShares` is genuinely zero during the dev buy, which is the FIRST trade.
+    function _checkpoint() internal {
+        uint64 finish = streamFinish;
+        uint64 upTo = uint64(block.timestamp) < finish ? uint64(block.timestamp) : finish;
+        uint64 from = lastCheckpoint;
+        if (upTo <= from) return;
+
+        lastCheckpoint = upTo;
+        uint256 amount = uint256(upTo - from) * streamRate;
+        if (amount == 0) return;
+
+        uint256 shares = totalShares;
+        if (shares == 0 || shares < minSharesForDistribution) {
+            pendingPayouts += amount;
+            return;
+        }
+
+        _magnifiedPayoutPerShare += (amount * MAGNITUDE) / shares;
+        totalDistributed += amount;
+    }
+
+    /// @dev The accumulator as it stands RIGHT NOW, including time not yet checkpointed. Views
+    ///      must use this or a holder's balance would appear to jump only when somebody else
+    ///      happens to transact.
+    function _perShareNow() internal view returns (uint256) {
+        uint64 finish = streamFinish;
+        uint64 upTo = uint64(block.timestamp) < finish ? uint64(block.timestamp) : finish;
+        if (upTo <= lastCheckpoint) return _magnifiedPayoutPerShare;
+
+        uint256 shares = totalShares;
+        if (shares == 0 || shares < minSharesForDistribution) return _magnifiedPayoutPerShare;
+
+        uint256 amount = uint256(upTo - lastCheckpoint) * streamRate;
+        return _magnifiedPayoutPerShare + (amount * MAGNITUDE) / shares;
+    }
+
+    /// @dev Start or extend the stream, weighting the new money against whatever is still
+    ///      unvested.
+    ///
+    ///      **Weighted average, not a flat reset.** Synthetix sets `periodFinish = now + duration`
+    ///      on every notify, so anyone may push the finish line out with dust — and unlike
+    ///      Synthetix, whose notifier is permissioned, ANYONE can trigger a distribution here by
+    ///      calling `sweep()`. A dust distribution therefore barely moves the finish line: it is
+    ///      averaged in proportion to how little it is worth. This is Yearn v3's profit-unlocking
+    ///      rule, and the analogy is exact — a harvest is our sweep.
+    function _arm(uint256 addition) internal {
+        uint256 nowTs = block.timestamp;
+        uint256 remainingTime = streamFinish > nowTs ? streamFinish - nowTs : 0;
+        uint256 remaining = remainingTime * streamRate;
+        uint256 total = addition + remaining;
+        if (total == 0) return;
+
+        uint256 window = (remaining * remainingTime + addition * STREAM_WINDOW) / total;
+        if (window == 0) window = 1;
+
+        uint256 rate = total / window;
+        // Truncation dust is carried, not dropped. Over many small sweeps this would otherwise
+        // silently accumulate as unreachable balance on the contract.
+        uint256 dust = total - rate * window;
+        if (dust != 0) pendingPayouts += dust;
+
+        streamRate = rate;
+        streamFinish = uint64(nowTs + window);
+        lastCheckpoint = uint64(nowTs);
+    }
+
     function distribute(uint256 amount) external onlyController {
+        // Vest what is owed under the OLD rate before the new money changes it.
+        _checkpoint();
+
         uint256 total = amount + pendingPayouts;
         if (total == 0) return;
 
         // Carry while there is nobody to pay, AND while the holder base is small enough that
         // dividing by it would inflate `_magnifiedPayoutPerShare` into later overflow territory.
+        // Nothing is armed in that case: a stream with no holders would vest into the carry
+        // anyway, one `_checkpoint` at a time, for no benefit.
         uint256 shares = totalShares;
         if (shares == 0 || shares < minSharesForDistribution) {
             pendingPayouts = total;
@@ -199,13 +304,22 @@ contract Distributor {
         }
 
         pendingPayouts = 0;
-        _magnifiedPayoutPerShare += (total * MAGNITUDE) / shares;
-        totalDistributed += total;
+        // NOT credited to the accumulator here. `_arm` schedules it to vest over `STREAM_WINDOW`,
+        // which is what makes a zero-block position worthless.
+        _arm(total);
         emit PayoutsAdded(total, _magnifiedPayoutPerShare);
     }
 
     /// @notice Called by the launch token on every balance change.
+    ///
+    /// @dev **Checkpoints BEFORE touching shares, and that ordering is the whole fix.** Vesting
+    ///      first means the accumulator already reflects every second the OLD holder base was
+    ///      present for, so the arriving balance is credited from this instant forward and cannot
+    ///      claim time it was not there for. The classic dividend lineage gets this backwards:
+    ///      it moves the accumulator, then transfers, then updates the register, which credits a
+    ///      seller while they still hold the position they are selling.
     function setBalance(address account, uint256 newBalance) external onlyShareToken {
+        _checkpoint();
         if (excluded[account]) {
             if (shareOf[account] != 0) _setShares(account, 0);
             return;
@@ -214,6 +328,7 @@ contract Distributor {
     }
 
     function setExcluded(address account, bool isExcluded) external onlyController {
+        _checkpoint();
         excluded[account] = isExcluded;
         if (isExcluded && shareOf[account] != 0) _setShares(account, 0);
         emit ExcludedSet(account, isExcluded);
@@ -245,8 +360,10 @@ contract Distributor {
     // Views
     // -------------------------------------------------------------------------------------------
 
+    /// @dev Uses `_perShareNow`, not the stored value, so a holder's balance rises continuously
+    ///      instead of jumping only when somebody else happens to transact.
     function accumulativeOf(address account) public view returns (uint256) {
-        int256 acc = int256(_magnifiedPayoutPerShare * shareOf[account]) + _corrections[account];
+        int256 acc = int256(_perShareNow() * shareOf[account]) + _corrections[account];
         if (acc <= 0) return 0;
         return uint256(acc) / MAGNITUDE;
     }
@@ -275,6 +392,9 @@ contract Distributor {
 
     /// @notice Pull. Always available, never gated on anyone else paying gas.
     function withdraw() external returns (uint256) {
+        // Vest first, so a holder is paid everything owed up to this second rather than up to
+        // whenever somebody else last transacted.
+        _checkpoint();
         uint256 amount = withdrawableOf(msg.sender);
         if (amount == 0) revert NothingToWithdraw();
         _withdrawn[msg.sender] += amount;
@@ -294,6 +414,7 @@ contract Distributor {
     /// @return sentCount how many accounts were actually paid
     /// @return sentTotal total payout tokens moved
     function processBatch(uint256 maxAccounts) public returns (uint256 sentCount, uint256 sentTotal) {
+        _checkpoint();
         uint256 len = _queue.length;
         if (len == 0 || maxAccounts == 0) return (0, 0);
         if (maxAccounts > len) maxAccounts = len;
