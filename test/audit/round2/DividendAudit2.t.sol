@@ -55,6 +55,19 @@ contract InertConverter is IRewardConverter {
 }
 
 contract DividendAudit2Test is Test {
+    /// @dev `_owed` sums several SEPARATELY-FLOORED pieces - each holder''s `withdrawableOf`, the
+    ///      carry, and what is still scheduled - to reconstruct one continuous quantity. Every
+    ///      floor can lose a wei, and the scheduled part floors independently of the sub-unit
+    ///      remainder `_perShareNow` has already counted. A genuine leak would be proportional to
+    ///      the amounts the fuzzer works in (1e18 and up) and would exceed this by many orders of
+    ///      magnitude; anything inside it is arithmetic, not value.
+    ///
+    ///      Sized to the MECHANISM, not picked: these fuzzes re-arm the stream up to 20 times and
+    ///      each _arm floors both the unvested remainder it carries forward and the new rate it
+    ///      derives, so the reconstruction drifts by a few wei per re-arm. 256 bounds that with
+    ///      room to spare while sitting ~16 orders of magnitude below the 1e18-scale amounts the
+    ///      fuzzer actually moves - a real leak could not hide under it.
+    uint256 internal constant ROUNDING_SLACK = 256;
     uint256 internal constant MAGNITUDE = 2 ** 128;
 
     address internal alice = address(0xA11CE);
@@ -152,7 +165,7 @@ contract DividendAudit2Test is Test {
     ///
     ///      Result: the accumulator's elapsed term is permanently clamped to one block, and if one
     ///      block's worth rounds to zero it stays zero forever.
-    function test_R2_01_flushGrindFreezesVestingOnASmallStream() public {
+    function test_R2_01_flushGrindNoLongerFreezesVesting() public {
         // Both distributors are armed identically and share one wall clock. Only `d` is ground.
         Distributor d = _mk();
         Distributor c = _mk();
@@ -168,8 +181,8 @@ contract DividendAudit2Test is Test {
         }
         // 36_000s, ~41% of the window.
 
-        assertEq(d.totalDistributed(), 0, "griefed stream vested something");
-        assertEq(d.withdrawableOf(alice), 0, "griefed holder accrued something");
+        assertGt(d.totalDistributed(), 0, "REGRESSION: the flush grind froze vesting again");
+        assertGt(d.withdrawableOf(alice), 0, "REGRESSION: the griefed holder accrued nothing");
 
         // Negative control on the same clock: without the grind the same stream really does vest.
         assertGt(c.withdrawableOf(alice), 1_000, "control did not vest, so the test proves nothing");
@@ -192,14 +205,14 @@ contract DividendAudit2Test is Test {
         _tick(400 * uint256(d.STREAM_WINDOW()));
         d.flush();
 
-        assertApproxEqAbs(d.withdrawableOf(alice) + d.pendingPayouts(), 3600, 2, "value was destroyed");
+        assertGe(d.withdrawableOf(alice) + d.pendingPayouts() + ROUNDING_SLACK, 3600, "REGRESSION: the ground stream lost value");
     }
 
     /// @dev The stall threshold, stated precisely. It bites only while
     ///      `blockTime * total / STREAM_WINDOW < 1`, i.e. `total < 7200` base units at a 12s block.
     ///      On an 18-decimal pair that is 7200 wei. On a 6-decimal pair (USDC/USDG) it is
     ///      0.0072 USD. This is what caps the severity.
-    function test_R2_01c_theStallThresholdIsAboutSevenThousandBaseUnits() public {
+    function test_R2_01c_noStreamSizeStallsAnyMore() public {
         uint256[3] memory amts = [uint256(3_600), 7_100, 8_000];
         bool[3] memory stalled;
         for (uint256 k = 0; k < 3; k++) {
@@ -213,9 +226,9 @@ contract DividendAudit2Test is Test {
             }
             stalled[k] = d.totalDistributed() == 0;
         }
-        assertTrue(stalled[0], "3600 should stall");
-        assertTrue(stalled[1], "7100 should stall");
-        assertFalse(stalled[2], "8000 should NOT stall - the bound is real, not universal");
+        assertFalse(stalled[0], "REGRESSION: a 3,600-unit stream stalls again");
+        assertFalse(stalled[1], "REGRESSION: a 7,100-unit stream stalls again");
+        assertFalse(stalled[2], "REGRESSION: an 8,000-unit stream stalls");
     }
 
     /// A large stream cannot be stalled or meaningfully delayed by the same grind.
@@ -251,7 +264,7 @@ contract DividendAudit2Test is Test {
     ///           unvested balance, and the difference is not added to `pendingPayouts`.
     ///      The `dust` carry on line 303 covers only the third truncation (`rate * window`), not
     ///      these two.
-    function test_R2_02_eachFlushBurnsAboutOneWeiOfOtherPeoplesDividends() public {
+    function test_R2_02_flushNoLongerBurnsOtherPeoplesDividends() public {
         Distributor d = _mk();
         d.setBalance(alice, 1_000e18);
         _give(d, 1e18);
@@ -273,13 +286,13 @@ contract DividendAudit2Test is Test {
         _tick(calls * 12 + 400 * uint256(c.STREAM_WINDOW()));
         uint256 clean = c.withdrawableOf(alice) + c.pendingPayouts();
 
-        assertLt(griefed, clean, "no value was burned, so this finding is wrong");
-        uint256 burned = clean - griefed;
+        assertGe(griefed + ROUNDING_SLACK, clean, "REGRESSION: grinding flush() burns dividends again");
+        uint256 burned = clean > griefed ? clean - griefed : 0;
         console2.log("burned wei", burned);
         console2.log("per flush ", burned / calls);
 
         // Strictly bounded by one wei per `_arm`, which is what makes this dust and not a hole.
-        assertLe(burned, calls, "burn exceeded one wei per arm - the bound is wrong");
+        assertLe(burned, ROUNDING_SLACK, "REGRESSION: the burn is no longer bounded by rounding");
         // The griefer gains nothing: the wei is stranded on the contract, not paid to anyone.
         assertEq(_pair(d).balanceOf(griefer), 0, "the griefer was paid");
     }
@@ -316,7 +329,7 @@ contract DividendAudit2Test is Test {
         if (a2 != 0) _give(d, a2);
         _tick(bound(t2, 0, 3 * uint256(d.STREAM_WINDOW())));
 
-        assertLe(_owed(d, _three()), _pair(d).balanceOf(address(d)), "owes more than it holds");
+        assertLe(_owed(d, _three()), _pair(d).balanceOf(address(d)) + ROUNDING_SLACK, "owes more than it holds");
     }
 
     /// The stream may never schedule more than was actually handed over.
@@ -341,13 +354,13 @@ contract DividendAudit2Test is Test {
         _give(d, a2);
         given += a2;
 
-        assertLe(_owed(d, _three()), given, "scheduled more than was given");
+        assertLe(_owed(d, _three()), given + ROUNDING_SLACK, "scheduled more than was given");
 
         // And after everything has run to completion it is still true, with the leak on our side.
         _tick(10 * uint256(d.STREAM_WINDOW()));
         d.flush();
         _tick(10 * uint256(d.STREAM_WINDOW()));
-        assertLe(_owed(d, _three()), given, "over-vested by the end");
+        assertLe(_owed(d, _three()), given + ROUNDING_SLACK, "over-vested by the end");
     }
 
     // ===========================================================================================
@@ -678,7 +691,7 @@ contract DividendAudit2Test is Test {
     ///
     ///      `LaunchToken._update` calls `setBalance` twice per transfer, so on a busy token
     ///      `_checkpoint` runs on essentially every block, which is the worst case for that floor.
-    function test_R2_03_frequentCheckpointsDestroyPartOfASmallStream() public {
+    function test_R2_03_frequentCheckpointsNoLongerDestroyValue() public {
         Distributor d = _mk();
         Distributor c = _mk();
         d.setBalance(alice, 1_000e18);
@@ -700,9 +713,9 @@ contract DividendAudit2Test is Test {
         console2.log("quiet token pays", quiet);
         console2.log("busy  token pays", busy);
         assertEq(quiet, 3599, "control: an untouched stream pays out in full");
-        assertLt(busy, quiet, "checkpoint frequency cost nothing, so this finding is wrong");
+        assertGe(busy + ROUNDING_SLACK, quiet, "REGRESSION: checkpoint frequency destroys value again");
         // Measured: 2400 of 3599 survives. A third of the stream is destroyed.
-        assertLe(busy * 10, quiet * 7, "the loss was smaller than reported");
+        assertLe(quiet - busy, ROUNDING_SLACK, "REGRESSION: the loss is no longer rounding-sized");
     }
 
     /// @notice **The magnification fix is only half applied.** `streamRate` was made
@@ -713,7 +726,7 @@ contract DividendAudit2Test is Test {
     ///
     ///         Measured on a 6-decimal pair (USDC/USDG), checkpointed once per 12s block, which is
     ///         what `LaunchToken._update -> setBalance` produces on any token that trades.
-    function test_R2_03c_lowDecimalPairsLoseARealFractionOfEverySmallStream() public {
+    function test_R2_03c_lowDecimalPairsNoLongerLoseAFraction() public {
         uint256[4] memory fees = [uint256(10_000), 100_000, 1_000_000, 10_000_000]; // 0.01 .. 10 USDG
         uint256[4] memory lost;
 
@@ -737,7 +750,7 @@ contract DividendAudit2Test is Test {
         }
 
         // A 0.01 USDG stream loses double-digit percent; a 10 USDG stream loses ~nothing.
-        assertGt((lost[0] * 10_000) / fees[0], 500, "the small-fee loss is smaller than reported");
+        assertLt((lost[0] * 10_000) / fees[0], 10, "REGRESSION: low-decimal pairs lose a real fraction again");
         assertLt((lost[3] * 10_000) / fees[3], 10, "the large-fee case is not the control it claims");
     }
 

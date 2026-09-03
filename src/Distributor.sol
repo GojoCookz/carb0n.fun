@@ -105,6 +105,21 @@ contract Distributor {
     /// @notice Last second already folded into `_magnifiedPayoutPerShare`.
     uint64 public lastCheckpoint;
 
+    /// @notice Sub-unit vesting carried between checkpoints, in MAGNIFIED units.
+    ///
+    /// @dev **The rate was magnified but the accrual was not, and that lost real money.**
+    ///      `_checkpoint` divided `MAGNITUDE` straight back out and threw the remainder away on
+    ///      every call. On an 18-decimal pair that is invisible; on a 6-decimal pair with ordinary
+    ///      traffic a 0.01 USDG stream lost 28% of itself — exactly the population magnifying the
+    ///      rate was introduced to protect.
+    ///
+    ///      Carrying it also removes the old "do not advance the clock on a sub-unit vest" branch,
+    ///      which was itself griefable: `flush()` is permissionless, `_arm` always leaves a wei of
+    ///      dust, so an attacker could re-arm every block and reset `lastCheckpoint` past time the
+    ///      guard had deliberately left un-advanced. Advancing is now lossless, so there is
+    ///      nothing left to grind.
+    uint256 public streamRemainderMag;
+
     uint256 internal _magnifiedPayoutPerShare;
     mapping(address account => int256) internal _corrections;
     mapping(address account => uint256) internal _withdrawn;
@@ -234,15 +249,15 @@ contract Distributor {
         uint64 from = lastCheckpoint;
         if (upTo <= from) return;
 
-        // Magnified, because `streamRate` is.
-        uint256 vested = (uint256(upTo - from) * streamRate) / MAGNITUDE;
+        // Magnified, because `streamRate` is, PLUS whatever fraction the last call could not pay
+        // out. Advancing the clock is now lossless, so it always advances.
+        uint256 grossMag = uint256(upTo - from) * streamRate + streamRemainderMag;
+        uint256 vested = grossMag / MAGNITUDE;
 
-        // **Do NOT advance the clock for a sub-unit vest.** Rounding down to zero and moving on
-        // would lose those seconds permanently, one wei at a time, on every transfer of a quiet
-        // token. Leaving `lastCheckpoint` where it is lets the fraction accumulate until it is
-        // worth at least one base unit.
-        if (vested == 0) return;
         lastCheckpoint = upTo;
+        streamRemainderMag = grossMag % MAGNITUDE;
+
+        if (vested == 0) return;
 
         uint256 shares = totalShares;
         if (shares == 0 || shares < minSharesForDistribution) {
@@ -269,9 +284,10 @@ contract Distributor {
         uint256 shares = totalShares;
         if (shares == 0 || shares < minSharesForDistribution) return _magnifiedPayoutPerShare;
 
-        // Mirrors `_checkpoint` exactly, including the rounding, or the view would promise a
-        // holder more than a withdraw in the same block would actually pay them.
-        uint256 vested = (uint256(upTo - lastCheckpoint) * streamRate) / MAGNITUDE;
+        // Mirrors `_checkpoint` exactly, including the carried remainder and the rounding, or the
+        // view would promise a holder more than a withdraw in the same block would actually pay.
+        uint256 grossMag = uint256(upTo - lastCheckpoint) * streamRate + streamRemainderMag;
+        uint256 vested = grossMag / MAGNITUDE;
         if (vested == 0) return _magnifiedPayoutPerShare;
         return _magnifiedPayoutPerShare + (vested * MAGNITUDE) / shares;
     }
@@ -515,18 +531,23 @@ contract Distributor {
                 abi.encodeWithSelector(IERC20.approve.selector, converter, amount)
             );
             if (okApprove) {
-                uint256 heldBefore = IERC20(payoutToken).balanceOf(address(this));
-
                 try IRewardConverter(converter).convert(payoutToken, rewardToken, amount, to)
                 returns (uint256 out) {
+                    // **Judged by the ALLOWANCE IT CONSUMED, not by what it said and not by our
+                    // balance.** Two wrong answers were tried before this one. Trusting `out`
+                    // alone let a converter pull its input and return zero - the documented
+                    // "could not route" signal - and get paid AND fall through to the transfer
+                    // below, paying the same claim twice. Measuring our own BALANCE delta instead
+                    // was no better: `processBatch` is permissionless and reentrant from inside
+                    // `convert`, so a converter that pulls nothing and re-enters can make somebody
+                    // else's payout leave and have that read as success, debiting this holder for
+                    // a payment they never received.
+                    //
+                    // The allowance is the only quantity that describes THIS transfer and that
+                    // nothing else in the system can move.
+                    uint256 taken = amount
+                        - IERC20(payoutToken).allowance(address(this), converter);
                     _clearAllowance();
-                    // **Judged by what it TOOK, not by what it SAID.** The previous version
-                    // trusted `out` alone, so a converter that pulled its input and returned zero
-                    // - the documented "could not route" signal, and the shape an honest one
-                    // produces on a dead route - got paid AND fell through to the transfer below,
-                    // paying the same claim twice. The ledger recorded one payment, so the
-                    // solvency invariant stayed true while every later holder was left unpayable.
-                    uint256 taken = heldBefore - IERC20(payoutToken).balanceOf(address(this));
                     if (taken != 0) {
                         // It spent the allowance. Whether it produced anything is the converter's
                         // problem now; paying again from here would double-spend the claim.
