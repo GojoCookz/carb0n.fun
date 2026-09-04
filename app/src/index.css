@@ -1,0 +1,169 @@
+@import 'tailwindcss';
+
+/*
+  Design tokens — Ethereum monochrome.
+
+  This is a GENERAL launchpad on Ethereum L1. Pair currencies (WETH, USDC, PEPE, SPX, WXMR,
+  and 17 more) are options the user picks, so no single pair's brand colour may become the
+  app's identity.
+
+  The palette is greyscale taken off the Ethereum mark itself, and the accent IS white.
+  That is the whole idea: with no chromatic accent in the chrome, the ONLY colour anywhere
+  in the app comes from the token logos — which makes the pair roster the visual subject
+  rather than decoration. Primary actions invert to black-on-white.
+*/
+@theme {
+  /*
+    ETH NOIR.
+
+    The Ethereum mark is not grey — it is FACETED CHROME. Six planes, each catching
+    light differently, with a faint violet-blue in the shadow side. That material is
+    the whole design language here: the accent is a metal gradient, never a flat
+    colour, and surfaces are lit from a single top edge the way a machined face is.
+
+    Deliberately NOT: near-black plus one acid accent. That look is spent. The luxury
+    here comes from depth and restraint — true black ground, barely-lifted surfaces,
+    hairline light, and a very long ease.
+  */
+
+  /* Ground → surfaces. A true black floor so lifted panels actually read as lifted. */
+  --color-ink-950: #050507;
+  --color-ink-900: #0c0c0f;
+  --color-ink-850: #131317;
+  --color-ink-800: #1a1a1f;
+  --color-ink-700: #26262d;
+  --color-ink-600: #35353e;
+
+  /* Text ramp, carrying the mark's faint cool cast rather than pure neutral grey. */
+  --color-bone-50: #f2f3f6;
+  --color-bone-200: #c9cbd3;
+  --color-bone-400: #8b8d99;
+  --color-bone-500: #666875;
+  --color-bone-600: #4a4c57;
+
+  /* The chrome accent. Solid values for text, the gradients below for surfaces. */
+  --color-volt-300: #ffffff;
+  --color-volt-400: #e8eaf0;
+  --color-volt-500: #ffffff;
+  --color-volt-600: #9a9caa;
+
+  --color-steel-300: #a9abb8;
+  --color-steel-400: #7b7d8a;
+  --color-steel-500: #53555f;
+
+  /* Warning reads as serious, not festive, against a monochrome field. */
+  --color-danger-400: #d98c8c;
+
+  --font-display: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  --radius-card: 16px;
+
+  /* Long and soft. Luxury reads as unhurried; 150ms reads as an app. */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/*
+  Chrome. A brushed-metal ramp used for the accent surface and for display text.
+  Angled at 135deg so the highlight sits where the ETH mark's lit faces do.
+*/
+.chrome {
+  background-image: linear-gradient(
+    135deg,
+    #ffffff 0%,
+    #c9cbd3 18%,
+    #8b8d99 38%,
+    #f2f3f6 52%,
+    #a9abb8 70%,
+    #6a6c78 88%,
+    #d5d7de 100%
+  );
+}
+
+/* Chrome as TYPE. Used once per screen at most — it is the signature, not decoration. */
+.chrome-text {
+  background-image: linear-gradient(135deg, #ffffff 0%, #b9bcc6 40%, #f2f3f6 60%, #8b8d99 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/*
+  The lit edge. A one-pixel highlight along the top of a surface, which is what makes
+  a flat panel read as a machined face rather than a grey rectangle. Cheap, and it is
+  most of the "luxurious" in this system.
+*/
+.lit {
+  position: relative;
+}
+.lit::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.16) 22%,
+    rgba(255, 255, 255, 0.28) 50%,
+    rgba(255, 255, 255, 0.16) 78%,
+    transparent 100%
+  );
+  pointer-events: none;
+}
+
+@font-face {
+  font-family: 'Space Grotesk';
+  src: url('https://fonts.gstatic.com/s/spacegrotesk/v16/V8mQoQDjQSkFtoMM3T6r8E7mF71Q-gOoraIAEj7oUXskPMBBSSJLm2E.woff2')
+    format('woff2');
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPVmUsaaDhw.woff2')
+    format('woff2');
+  font-weight: 400 700;
+  font-display: swap;
+}
+
+html {
+  background: var(--color-ink-950);
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: var(--color-bone-50);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  /* Never let the bottom nav sit under the iOS home indicator. */
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* Numbers in value slots must not jitter as they update. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum';
+}
+
+/* Visible focus for keyboard users. Never `outline: none` with no replacement. */
+:focus-visible {
+  outline: 2px solid var(--color-bone-50);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
