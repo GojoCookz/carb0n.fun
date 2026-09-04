@@ -1,4 +1,4 @@
-# hoodstonk
+# carb0n.fun
 
 A Uniswap v4 token launchpad on Ethereum where **holders are paid dividends in the pair currency**
 — hold `$GOLDFISH`, get paid in PAXG — rather than in more of the token they already hold.
@@ -24,8 +24,8 @@ app/         Vite + React + viem frontend (no wagmi)
 ## Getting started
 
 ```bash
-git clone --recursive https://github.com/GojoCookz/hoodstonk.git
-cd hoodstonk
+git clone --recursive https://github.com/GojoCookz/carb0n.fun.git
+cd carb0n.fun
 
 # contracts
 cd contracts
