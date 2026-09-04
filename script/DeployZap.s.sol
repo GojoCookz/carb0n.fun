@@ -64,7 +64,11 @@ contract DeployZap is Script {
 
         vm.startBroadcast(pk);
 
-        ZapRouter zap = new ZapRouter(mgr);
+        // `weth = address(0)` DISABLES the wrap shortcut, deliberately. Sepolia's `tWETH` is a
+        // plain `MockERC20` with no `deposit()`, so pointing this at it would make every
+        // WETH-paired zap revert inside a function that does not exist. On mainnet this is the
+        // real WETH9 and hop 1 for a WETH-paired launch becomes a free 1:1 wrap.
+        ZapRouter zap = new ZapRouter(mgr, address(0));
         PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(mgr);
 
         // Native ether is address(0), so it sorts to currency0 unconditionally. `ZapRouter`
@@ -77,21 +81,28 @@ contract DeployZap is Script {
             hooks: IHooks(address(0))
         });
 
-        mgr.initialize(ethKey, TickMath.getSqrtPriceAtTick(OPENING_TICK));
+        // **Idempotent on purpose.** `ZapRouter`'s constructor and entry points change more often
+        // than the pool does, so this script gets re-run to redeploy the router alone. `forge`
+        // aborts a broadcast if ANY call in the trace reverts — including a second `initialize` on
+        // a pool that already exists — so the pool legs are skipped when hop 1 is already there.
+        (uint160 existing,,,) = mgr.getSlot0(ethKey.toId());
+        if (existing == 0) {
+            mgr.initialize(ethKey, TickMath.getSqrtPriceAtTick(OPENING_TICK));
 
-        MockERC20(TPAXG).mint(me, TPAXG_FOR_SEED);
-        MockERC20(TPAXG).approve(address(lp), type(uint256).max);
+            MockERC20(TPAXG).mint(me, TPAXG_FOR_SEED);
+            MockERC20(TPAXG).approve(address(lp), type(uint256).max);
 
-        lp.modifyLiquidity{value: ETH_SENT}(
-            ethKey,
-            ModifyLiquidityParams({
-                tickLower: TickMath.minUsableTick(SPACING),
-                tickUpper: TickMath.maxUsableTick(SPACING),
-                liquidityDelta: LIQUIDITY,
-                salt: bytes32(0)
-            }),
-            ""
-        );
+            lp.modifyLiquidity{value: ETH_SENT}(
+                ethKey,
+                ModifyLiquidityParams({
+                    tickLower: TickMath.minUsableTick(SPACING),
+                    tickUpper: TickMath.maxUsableTick(SPACING),
+                    liquidityDelta: LIQUIDITY,
+                    salt: bytes32(0)
+                }),
+                ""
+            );
+        }
 
         vm.stopBroadcast();
 

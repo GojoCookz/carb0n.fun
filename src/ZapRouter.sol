@@ -14,6 +14,12 @@ import {TransientStateLibrary} from "v4-core/libraries/TransientStateLibrary.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+/// @notice The two functions that make WETH a wrapper rather than just an ERC-20.
+interface IWETH9 {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
 /// @title ZapRouter
 /// @notice Buy a launch with ETH. Sell a launch for ETH. The pair currency never touches the
 ///         user's wallet.
@@ -64,8 +70,25 @@ contract ZapRouter is IUnlockCallback {
 
     IPoolManager public immutable poolManager;
 
+    /// @notice The canonical wrapped-ether contract, or `address(0)` to disable the wrap path.
+    ///
+    /// @dev **Why this is a constructor argument and not a constant.** On a network where no real
+    ///      WETH9 exists — Sepolia here, whose `tWETH` is a plain `MockERC20` with no `deposit()` —
+    ///      passing an address would make every WETH-paired zap revert inside a `deposit` call that
+    ///      does not exist. Zero disables the shortcut and the router falls back to routing hop 1
+    ///      through a pool like any other pair, which is exactly the behaviour that shipped first.
+    address public immutable weth;
+
     error NotPoolManager();
     error ZeroAmount();
+    /// @notice Above this an exact-input swap would wrap into an exact-output one.
+    error AmountTooLarge(uint256 amountIn);
+    /// @notice The router is a conduit; naming it as the recipient parks value it cannot return.
+    error RecipientIsTheRouter();
+    /// @notice The transaction sat in the mempool past the deadline the sender set.
+    error Expired(uint256 deadline, uint256 nowTimestamp);
+    /// @notice Only the wrapped-ether contract may send this router ether.
+    error UnexpectedEther();
     /// @notice A swap with no floor is an instruction to be sandwiched.
     error NoSlippageFloor();
     error TooLittleReceived(uint256 got, uint256 minOut);
@@ -100,7 +123,8 @@ contract ZapRouter is IUnlockCallback {
     );
 
     struct ZapData {
-        /// ETH / pair. `currency0` is native ether.
+        /// ETH / pair. `currency0` is native ether. **Ignored entirely when the pair IS weth** —
+        /// see `_isWrapPair`.
         PoolKey ethKey;
         /// pair / launch token, in whichever order they sorted. Carries `FeeHook`.
         PoolKey tokenKey;
@@ -111,8 +135,25 @@ contract ZapRouter is IUnlockCallback {
         address recipient;
     }
 
-    constructor(IPoolManager _poolManager) {
+    constructor(IPoolManager _poolManager, address _weth) {
         poolManager = _poolManager;
+        weth = _weth;
+    }
+
+    /// @dev Refuses ether from everyone except the wrapper.
+    ///
+    ///      **This is NOT a guarantee that the router's balance is always its current caller's.**
+    ///      `selfdestruct` and a coinbase payout both credit an address without executing code, so
+    ///      a `receive()` guard cannot keep the balance clean and nothing built on top of it may
+    ///      assume otherwise. That assumption was written here and was wrong; the refund path now
+    ///      measures what THIS call brought instead of trusting the balance.
+    receive() external payable {
+        if (msg.sender != weth) revert UnexpectedEther();
+    }
+
+    modifier before(uint256 deadline) {
+        if (block.timestamp > deadline) revert Expired(deadline, block.timestamp);
+        _;
     }
 
     // ===============================================================================================
@@ -121,13 +162,37 @@ contract ZapRouter is IUnlockCallback {
 
     /// @notice Spend ETH, receive the launch token. `msg.value` is the amount in.
     /// @param minAmountOut Floor in launch-token units. Must not be zero.
-    function zapBuy(PoolKey calldata ethKey, PoolKey calldata tokenKey, uint256 minAmountOut, address recipient)
-        external
-        payable
-        returns (uint256 amountOut)
-    {
+    /// @param deadline Unix seconds after which this must not execute.
+    ///
+    /// @dev **`minAmountOut` bounds price; `deadline` bounds TIME, and they are not the same
+    ///      guard.** A transaction can sit unmined for hours and then land into a market that has
+    ///      moved far enough that the floor derived from a stale quote is no longer protective.
+    ///      Every production router takes one; omitting it was an oversight in the first version.
+    function zapBuy(
+        PoolKey calldata ethKey,
+        PoolKey calldata tokenKey,
+        uint256 minAmountOut,
+        address recipient,
+        uint256 deadline
+    ) external payable before(deadline) returns (uint256 amountOut) {
         if (msg.value == 0) revert ZeroAmount();
         if (minAmountOut == 0) revert NoSlippageFloor();
+
+        // **Baselines taken BEFORE anything moves.** Everything refunded below is measured against
+        // these, so this call can only ever hand back what it itself brought. Value that was
+        // already sitting here — forced in with `selfdestruct`, or an ERC-20 sent to the wrong
+        // address — stays exactly where it is instead of being paid to whoever calls next.
+        uint256 etherBefore = address(this).balance - msg.value;
+
+        Currency pair = ethKey.currency1;
+        bool wrap = _isWrapPair(pair);
+        // Hop 1 for a WETH-paired launch is a WRAP, not a swap: 1:1, no fee, no price impact, no
+        // pool required. Doing it out here keeps the unlock callback to a single leg.
+        uint256 wrappedBefore;
+        if (wrap) {
+            wrappedBefore = IERC20(weth).balanceOf(address(this));
+            IWETH9(weth).deposit{value: msg.value}();
+        }
 
         amountOut = _run(ethKey, tokenKey, true, false, msg.value, recipient);
 
@@ -136,24 +201,41 @@ contract ZapRouter is IUnlockCallback {
         // cleanly and names both numbers.
         if (amountOut < minAmountOut) revert TooLittleReceived(amountOut, minAmountOut);
 
-        _refundEth();
+        // A hop cut short by its price limit leaves wrapped ether behind. Unwrap only what this
+        // call is still holding of its own, so the refund reaches the caller as the asset they sent.
+        if (wrap) {
+            uint256 held = IERC20(weth).balanceOf(address(this));
+            if (held > wrappedBefore) IWETH9(weth).withdraw(held - wrappedBefore);
+        }
+        _refundEth(etherBefore);
     }
 
     /// @notice Spend the launch token, receive ETH.
     /// @param minAmountOut Floor in wei. Must not be zero.
+    /// @param deadline Unix seconds after which this must not execute.
     function zapSell(
         PoolKey calldata ethKey,
         PoolKey calldata tokenKey,
         uint256 amountIn,
         uint256 minAmountOut,
-        address recipient
-    ) external returns (uint256 amountOut) {
+        address recipient,
+        uint256 deadline
+    ) external before(deadline) returns (uint256 amountOut) {
         if (amountIn == 0) revert ZeroAmount();
         if (minAmountOut == 0) revert NoSlippageFloor();
 
-        amountOut = _run(ethKey, tokenKey, false, false, amountIn, recipient);
+        address to = recipient == address(0) ? msg.sender : recipient;
+        amountOut = _run(ethKey, tokenKey, false, false, amountIn, to);
 
         if (amountOut < minAmountOut) revert TooLittleReceived(amountOut, minAmountOut);
+
+        // On the wrap path the callback took WETH to this contract rather than native ether to the
+        // recipient, because unwrapping cannot happen inside the unlock cycle.
+        if (_isWrapPair(ethKey.currency1)) {
+            IWETH9(weth).withdraw(amountOut);
+            (bool ok,) = to.call{value: amountOut}("");
+            if (!ok) revert EthRefundFailed();
+        }
     }
 
     /// @notice Simulation only. **Always reverts** with `ZapQuote(amountOut)`.
@@ -184,6 +266,10 @@ contract ZapRouter is IUnlockCallback {
         uint256 amountIn,
         address recipient
     ) internal returns (uint256) {
+        // The router has no rescue function, so anything delivered to it is stranded. `address(0)`
+        // already resolves to the caller; naming the router explicitly is the one case that would
+        // silently park somebody's output here forever.
+        if (recipient == address(this)) revert RecipientIsTheRouter();
         bytes memory result = poolManager.unlock(
             abi.encode(
                 ZapData({
@@ -213,18 +299,22 @@ contract ZapRouter is IUnlockCallback {
         if (!pairIsCurrency0 && !(d.tokenKey.currency1 == pair)) revert PairIsNotInTheLaunchPool();
         Currency launchToken = pairIsCurrency0 ? d.tokenKey.currency1 : d.tokenKey.currency0;
 
-        // SWAP BOTH HOPS FIRST. Nothing is paid or collected until every swap is done; see the
+        // When the pair IS wrapped ether there is no hop 1 at all — wrapping is 1:1 and happens
+        // outside this cycle, so the router arrives already holding the pair currency.
+        bool wrap = _isWrapPair(pair);
+
+        // SWAP EVERY HOP FIRST. Nothing is paid or collected until every swap is done; see the
         // contract docstring for the 8.5x that this ordering is the only defence against.
         if (d.isBuy) {
             // hop 1: ETH -> pair. Native ether is currency0, so spending it is zeroForOne.
-            uint256 pairOut = _hop(d.ethKey, true, d.amountIn);
+            uint256 pairIn = wrap ? d.amountIn : _hop(d.ethKey, true, d.amountIn);
             // hop 2: pair -> launch token.
-            _hop(d.tokenKey, pairIsCurrency0, pairOut);
+            _hop(d.tokenKey, pairIsCurrency0, pairIn);
         } else {
             // hop 2 reversed: launch token -> pair.
             uint256 pairOut = _hop(d.tokenKey, !pairIsCurrency0, d.amountIn);
             // hop 1 reversed: pair -> ETH.
-            _hop(d.ethKey, false, pairOut);
+            if (!wrap) _hop(d.ethKey, false, pairOut);
         }
 
         // Read what the manager says we owe and are owed, rather than inferring it from the two
@@ -234,13 +324,31 @@ contract ZapRouter is IUnlockCallback {
         int256 pairDelta = poolManager.currencyDelta(address(this), pair);
         int256 tokenDelta = poolManager.currencyDelta(address(this), launchToken);
 
-        if (pairDelta != 0) revert IntermediateLegDidNotNet(pairDelta);
-
-        uint256 amountOut = uint256(d.isBuy ? tokenDelta : ethDelta);
+        // **Off the wrap path the pair must cancel exactly**; on it, the pair IS a settled leg
+        // because the router holds wrapped ether directly instead of routing through a pool.
+        uint256 amountOut;
+        if (wrap) {
+            // A buy owes wrapped ether and can only owe LESS than it wrapped (a truncated hop 2
+            // spends less), which the caller gets back as ether. A sell is owed it.
+            if (d.isBuy ? pairDelta > 0 : pairDelta < 0) revert IntermediateLegDidNotNet(pairDelta);
+            amountOut = uint256(d.isBuy ? tokenDelta : pairDelta);
+        } else {
+            if (pairDelta != 0) revert IntermediateLegDidNotNet(pairDelta);
+            amountOut = uint256(d.isBuy ? tokenDelta : ethDelta);
+        }
         if (d.quoteOnly) revert ZapQuote(amountOut);
 
         // Pay the debts. Each `sync -> transfer -> settle` is contiguous on purpose: anything that
         // moves the singleton's balance in between is money we do not get credited for.
+        if (wrap && pairDelta < 0) {
+            // Paid from the router's OWN balance, not pulled from the payer: the wrap already
+            // moved their ether into this contract.
+            uint256 owed = uint256(-pairDelta);
+            poolManager.sync(pair);
+            IERC20(Currency.unwrap(pair)).safeTransfer(address(poolManager), owed);
+            uint256 credited = poolManager.settle();
+            if (credited != owed) revert SettlementShortfall(owed, credited);
+        }
         if (tokenDelta < 0) {
             uint256 owed = uint256(-tokenDelta);
             poolManager.sync(launchToken);
@@ -264,6 +372,9 @@ contract ZapRouter is IUnlockCallback {
         // Collect, straight to the recipient.
         if (tokenDelta > 0) poolManager.take(launchToken, d.recipient, uint256(tokenDelta));
         if (ethDelta > 0) poolManager.take(CurrencyLibrary.ADDRESS_ZERO, d.recipient, uint256(ethDelta));
+        // The wrapped-ether leg of a sell comes HERE, not to the recipient: it has to be unwrapped
+        // first, and `WETH.withdraw` cannot run inside an open unlock cycle.
+        if (wrap && pairDelta > 0) poolManager.take(pair, address(this), uint256(pairDelta));
 
         emit Zapped(
             d.payer, d.recipient, Currency.unwrap(launchToken), d.isBuy, d.amountIn, amountOut
@@ -276,9 +387,25 @@ contract ZapRouter is IUnlockCallback {
     // Internals
     // ===============================================================================================
 
+    /// @dev True when hop 1 is a wrap rather than a swap.
+    ///
+    ///      **The pool is deliberately ignored even when one exists.** There IS a live ETH/WETH v4
+    ///      pool on mainnet with real liquidity, and routing through it would cost the LP fee plus
+    ///      the protocol fee plus price impact — measured at 6.3 bps — to perform an operation
+    ///      `WETH.deposit()` does for free at exactly 1:1. When `weth` is zero the shortcut is off
+    ///      and hop 1 goes through a pool like every other pair.
+    function _isWrapPair(Currency pair) internal view returns (bool) {
+        return weth != address(0) && Currency.unwrap(pair) == weth;
+    }
+
     /// @dev One exact-input leg. Returns how much of the OUTPUT currency this swap produced.
     function _hop(PoolKey memory key, bool zeroForOne, uint256 amountIn) internal returns (uint256) {
         if (amountIn == 0) revert ZeroAmount();
+        // **`-int256(amountIn)` is only an exact-INPUT swap while the value fits.** At or above
+        // 2**255 the negation wraps positive and v4 reads it as exact OUTPUT — the pool would then
+        // choose the input rather than the caller, silently, on the "sell everything" idiom
+        // (`type(uint256).max`). Bounded to int128 because every v4 delta is an int128 anyway.
+        if (amountIn > uint256(uint128(type(int128).max))) revert AmountTooLarge(amountIn);
         _requireNotPinned(key, zeroForOne);
 
         uint160 limit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
@@ -313,13 +440,18 @@ contract ZapRouter is IUnlockCallback {
         }
     }
 
-    /// @dev A hop cut short by its price limit leaves ETH unspent. The router is a conduit and has
-    ///      no rescue function, so anything it still holds after the unlock goes back to the caller
-    ///      in the same transaction.
-    function _refundEth() internal {
-        uint256 left = address(this).balance;
-        if (left == 0) return;
-        (bool ok,) = msg.sender.call{value: left}("");
+    /// @dev A hop cut short by its price limit leaves ether unspent, and it goes back in the same
+    ///      transaction.
+    ///
+    ///      **Refunds the delta against a baseline, never the whole balance.** Paying out
+    ///      `address(this).balance` hands this caller anything that was already here, and — worse
+    ///      — makes `zapBuy` revert `EthRefundFailed` for every contract caller without a payable
+    ///      fallback the moment somebody forces one wei in, since the refund call runs even when
+    ///      there is nothing to refund. Both are closed by measuring instead of trusting.
+    function _refundEth(uint256 baseline) internal {
+        uint256 balance = address(this).balance;
+        if (balance <= baseline) return;
+        (bool ok,) = msg.sender.call{value: balance - baseline}("");
         if (!ok) revert EthRefundFailed();
     }
 }

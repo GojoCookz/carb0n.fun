@@ -7,6 +7,7 @@ import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
 
@@ -14,6 +15,29 @@ import {ZapRouter} from "../src/ZapRouter.sol";
 import {TradeRouter} from "../src/TradeRouter.sol";
 import {FeeHook} from "../src/FeeHook.sol";
 import {FeeHookHarness} from "./FeeHook.t.sol";
+import {MockERC20} from "./mocks/MockERC20.sol";
+
+/// @notice A real WETH9: an ERC-20 that also wraps and unwraps native ether.
+/// @dev Storage layout is IDENTICAL to `MockERC20` — it adds no state, only two functions. That is
+///      what lets `ZapWrapHarness` swap it in over an existing pair's code without disturbing a
+///      single balance.
+contract MockWETH9 is MockERC20 {
+    constructor(string memory n, string memory s, uint8 d) MockERC20(n, s, d) {}
+
+    function deposit() external payable {
+        _mint(msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 amount) external {
+        _burn(msg.sender, amount);
+        (bool ok,) = msg.sender.call{value: amount}("");
+        require(ok, "weth: ether transfer failed");
+    }
+
+    receive() external payable {
+        _mint(msg.sender, msg.value);
+    }
+}
 
 /// @notice ETH in, launch token out. The pair currency never reaches the buyer.
 ///
@@ -50,6 +74,9 @@ abstract contract ZapBase is FeeHookHarness {
     /// A normal v4 fee tier. Nothing about hop 1 is ours — it is somebody else's pool.
     uint24 internal constant ETH_POOL_FEE = 3000;
 
+    /// Far enough out that no test is measuring the deadline unless it means to.
+    uint256 internal constant DEADLINE = type(uint256).max;
+
     /// @dev Refunds arrive here from `PoolSwapTest`/`PoolModifyLiquidityTest`, which hand back any
     ///      native ether they did not spend.
     receive() external payable {}
@@ -57,7 +84,7 @@ abstract contract ZapBase is FeeHookHarness {
     function setUp() public virtual override {
         super.setUp();
 
-        zap = new ZapRouter(IPoolManager(address(manager)));
+        zap = new ZapRouter(IPoolManager(address(manager)), address(0));
         tradeRouter = new TradeRouter(IPoolManager(address(manager)));
 
         ethKey = PoolKey({
@@ -163,7 +190,7 @@ abstract contract ZapBase is FeeHookHarness {
     /// @dev Buy through the zap so there is something to sell. Returns the tokens received.
     function _zapBuy(address who, uint256 ethIn) internal returns (uint256) {
         vm.prank(who);
-        return zap.zapBuy{value: ethIn}(ethKey, key, 1, who);
+        return zap.zapBuy{value: ethIn}(ethKey, key, 1, who, DEADLINE);
     }
 
     /// @dev Strips the 4-byte selector so a custom error's arguments can be decoded.
@@ -188,7 +215,7 @@ abstract contract ZapRouterHarness is ZapBase {
         uint256 tokenBefore = token.balanceOf(alice);
 
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 10 ether}(ethKey, key, 1, alice);
+        uint256 out = zap.zapBuy{value: 10 ether}(ethKey, key, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the zap returned nothing");
         assertEq(token.balanceOf(alice) - tokenBefore, out, "the reported output is not what arrived");
@@ -204,7 +231,7 @@ abstract contract ZapRouterHarness is ZapBase {
         uint256 pairBefore = pair.balanceOf(alice);
 
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held / 2, 1, alice);
+        uint256 out = zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the sell returned nothing");
         assertEq(alice.balance - ethBefore, out, "the reported output is not what arrived");
@@ -222,7 +249,7 @@ abstract contract ZapRouterHarness is ZapBase {
         assertEq(pair.balanceOf(bob), 0, "precondition: bob holds no pair currency");
 
         vm.prank(bob);
-        uint256 out = zap.zapBuy{value: 5 ether}(ethKey, key, 1, bob);
+        uint256 out = zap.zapBuy{value: 5 ether}(ethKey, key, 1, bob, DEADLINE);
 
         assertGt(out, 0, "a pairless wallet could not buy");
         assertEq(pair.balanceOf(bob), 0, "bob ended up holding the pair currency");
@@ -243,7 +270,7 @@ abstract contract ZapRouterHarness is ZapBase {
         uint256 snap = vm.snapshotState();
 
         vm.prank(alice);
-        uint256 viaZap = zap.zapBuy{value: spend}(ethKey, key, 1, alice);
+        uint256 viaZap = zap.zapBuy{value: spend}(ethKey, key, 1, alice, DEADLINE);
 
         vm.revertToState(snap);
 
@@ -262,7 +289,7 @@ abstract contract ZapRouterHarness is ZapBase {
         uint256 snap = vm.snapshotState();
 
         vm.prank(alice);
-        uint256 viaZap = zap.zapSell(ethKey, key, sell, 1, alice);
+        uint256 viaZap = zap.zapSell(ethKey, key, sell, 1, alice, DEADLINE);
 
         vm.revertToState(snap);
 
@@ -307,7 +334,7 @@ abstract contract ZapRouterHarness is ZapBase {
 
         uint256 feeBefore = hook.totalFeesTaken(poolId);
         vm.prank(alice);
-        zap.zapBuy{value: spend}(ethKey, key, 1, alice);
+        zap.zapBuy{value: spend}(ethKey, key, 1, alice, DEADLINE);
         uint256 charged = hook.totalFeesTaken(poolId) - feeBefore;
 
         assertGt(pairIntoTheLaunchPool, 0, "hop 1 produced nothing, so this proves nothing");
@@ -349,7 +376,7 @@ abstract contract ZapRouterHarness is ZapBase {
         uint256 feesEverywhereBefore = hook.totalFeesTaken(poolId) + hook.totalFeesTaken(unhooked.toId());
 
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 10 ether}(ethKey, unhooked, 1, alice);
+        uint256 out = zap.zapBuy{value: 10 ether}(ethKey, unhooked, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the unhooked route did not even deliver tokens");
         assertEq(
@@ -366,7 +393,7 @@ abstract contract ZapRouterHarness is ZapBase {
         uint256 before = pair.balanceOf(address(dist));
 
         vm.prank(alice);
-        zap.zapBuy{value: 40 ether}(ethKey, key, 1, alice);
+        zap.zapBuy{value: 40 ether}(ethKey, key, 1, alice, DEADLINE);
         // Fees accrue as ERC-6909 claims inside the swap and become real ERC-20 on the sweep. That
         // is a property of single-sided seeding, not of the zap.
         hook.sweep(key);
@@ -385,26 +412,26 @@ abstract contract ZapRouterHarness is ZapBase {
     function test_aBuyWithNoFloorIsRejected() public {
         vm.prank(alice);
         vm.expectRevert(ZapRouter.NoSlippageFloor.selector);
-        zap.zapBuy{value: 1 ether}(ethKey, key, 0, alice);
+        zap.zapBuy{value: 1 ether}(ethKey, key, 0, alice, DEADLINE);
     }
 
     function test_aSellWithNoFloorIsRejected() public {
         uint256 held = _zapBuy(alice, 5 ether);
         vm.prank(alice);
         vm.expectRevert(ZapRouter.NoSlippageFloor.selector);
-        zap.zapSell(ethKey, key, held / 2, 0, alice);
+        zap.zapSell(ethKey, key, held / 2, 0, alice, DEADLINE);
     }
 
     /// Slippage protection has to bind, or it is decoration.
     function test_theFloorBinds() public {
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 fair = zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice);
+        uint256 fair = zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, DEADLINE);
         vm.revertToState(snap);
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(ZapRouter.TooLittleReceived.selector, fair, fair * 2));
-        zap.zapBuy{value: 1 ether}(ethKey, key, fair * 2, alice);
+        zap.zapBuy{value: 1 ether}(ethKey, key, fair * 2, alice, DEADLINE);
     }
 
     // ===============================================================================================
@@ -420,7 +447,7 @@ abstract contract ZapRouterHarness is ZapBase {
 
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 actual = zap.zapBuy{value: 3 ether}(ethKey, key, 1, alice);
+        uint256 actual = zap.zapBuy{value: 3 ether}(ethKey, key, 1, alice, DEADLINE);
         vm.revertToState(snap);
 
         vm.prank(broke);
@@ -439,7 +466,7 @@ abstract contract ZapRouterHarness is ZapBase {
 
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 actual = zap.zapSell(ethKey, key, sell, 1, alice);
+        uint256 actual = zap.zapSell(ethKey, key, sell, 1, alice, DEADLINE);
         vm.revertToState(snap);
 
         vm.prank(alice);
@@ -466,7 +493,7 @@ abstract contract ZapRouterHarness is ZapBase {
         vm.expectRevert(
             abi.encodeWithSelector(ZapRouter.PoolIsPinnedAtItsPriceLimit.selector, _tokenIsCurrency0())
         );
-        zap.zapSell(ethKey, pinned, held / 2, 1, alice);
+        zap.zapSell(ethKey, pinned, held / 2, 1, alice, DEADLINE);
     }
 
     /// The same guard on the other leg: an ETH pool sitting on its ceiling cannot absorb a sell.
@@ -476,7 +503,7 @@ abstract contract ZapRouterHarness is ZapBase {
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(ZapRouter.PoolIsPinnedAtItsPriceLimit.selector, false));
-        zap.zapSell(pinnedEth, key, held / 2, 1, alice);
+        zap.zapSell(pinnedEth, key, held / 2, 1, alice, DEADLINE);
     }
 
     function test_aPinnedEthPoolCannotBeBoughtThroughEither() public {
@@ -484,7 +511,7 @@ abstract contract ZapRouterHarness is ZapBase {
 
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(ZapRouter.PoolIsPinnedAtItsPriceLimit.selector, true));
-        zap.zapBuy{value: 1 ether}(pinnedEth, key, 1, alice);
+        zap.zapBuy{value: 1 ether}(pinnedEth, key, 1, alice, DEADLINE);
     }
 
     // ===============================================================================================
@@ -494,11 +521,11 @@ abstract contract ZapRouterHarness is ZapBase {
     function test_zeroAmountIsRejected() public {
         vm.prank(alice);
         vm.expectRevert(ZapRouter.ZeroAmount.selector);
-        zap.zapBuy{value: 0}(ethKey, key, 1, alice);
+        zap.zapBuy{value: 0}(ethKey, key, 1, alice, DEADLINE);
 
         vm.prank(alice);
         vm.expectRevert(ZapRouter.ZeroAmount.selector);
-        zap.zapSell(ethKey, key, 0, 1, alice);
+        zap.zapSell(ethKey, key, 0, 1, alice, DEADLINE);
     }
 
     function test_onlyThePoolManagerMayDriveTheCallback() public {
@@ -507,13 +534,67 @@ abstract contract ZapRouterHarness is ZapBase {
         zap.unlockCallback("");
     }
 
+    // ===============================================================================================
+    // The deadline — a price floor is not a time bound
+    // ===============================================================================================
+
+    /// `minAmountOut` stops a bad price. It does NOT stop a transaction sitting unmined for hours
+    /// and then landing into a market the quote no longer describes.
+    function test_anExpiredDeadlineIsRejectedOnABuy() public {
+        uint256 past = vm.getBlockTimestamp() - 1;
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(ZapRouter.Expired.selector, past, vm.getBlockTimestamp())
+        );
+        zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, past);
+    }
+
+    function test_anExpiredDeadlineIsRejectedOnASell() public {
+        uint256 held = _zapBuy(alice, 5 ether);
+        uint256 past = vm.getBlockTimestamp() - 1;
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(ZapRouter.Expired.selector, past, vm.getBlockTimestamp())
+        );
+        zap.zapSell(ethKey, key, held / 2, 1, alice, past);
+    }
+
+    /// The boundary is `>`, not `>=` — a deadline of exactly now is still valid, which is what a
+    /// caller who sets `deadline = block.timestamp` in the same block expects.
+    function test_aDeadlineOfExactlyNowStillExecutes() public {
+        vm.prank(alice);
+        uint256 out = zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, vm.getBlockTimestamp());
+        assertGt(out, 0, "a deadline equal to the current timestamp was rejected");
+    }
+
+    /// The guard has to bind on TIME PASSING, not just on a number in the past at call time.
+    function test_aDeadlineThatPassesWhileWaitingIsRejected() public {
+        uint256 deadline = vm.getBlockTimestamp() + 300;
+        skip(301);
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(ZapRouter.Expired.selector, deadline, vm.getBlockTimestamp())
+        );
+        zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, deadline);
+    }
+
+    /// Nothing may send this router ether except a caller's `msg.value` and `WETH.withdraw`.
+    /// Otherwise the refund sweep could be pointed at somebody else's money.
+    function test_strayEtherIsRefused() public {
+        vm.deal(address(0xBEEF), 1 ether);
+        vm.prank(address(0xBEEF));
+        (bool ok,) = address(zap).call{value: 1 ether}("");
+        assertFalse(ok, "the router accepted ether from a stranger");
+        assertEq(address(zap).balance, 0, "the router is holding ether it should have refused");
+    }
+
     /// The first key has to be an ETH pool. If it is not, the router would be quietly zapping
     /// through some other asset while the caller believes they are spending ether.
     function test_anEthKeyThatIsNotNativeIsRejected() public {
         PoolKey memory notEth = key; // the launch pool, which contains no native ether
         vm.prank(alice);
         vm.expectRevert(ZapRouter.EthLegIsNotNative.selector);
-        zap.zapBuy{value: 1 ether}(notEth, key, 1, alice);
+        zap.zapBuy{value: 1 ether}(notEth, key, 1, alice, DEADLINE);
     }
 
     /// The two keys have to share the pair currency, or there is no route between them.
@@ -527,13 +608,13 @@ abstract contract ZapRouterHarness is ZapBase {
         });
         vm.prank(alice);
         vm.expectRevert(ZapRouter.PairIsNotInTheLaunchPool.selector);
-        zap.zapBuy{value: 1 ether}(ethKey, unrelated, 1, alice);
+        zap.zapBuy{value: 1 ether}(ethKey, unrelated, 1, alice, DEADLINE);
     }
 
     function test_outputCanGoToSomebodyElse() public {
         uint256 before = token.balanceOf(bob);
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 4 ether}(ethKey, key, 1, bob);
+        uint256 out = zap.zapBuy{value: 4 ether}(ethKey, key, 1, bob, DEADLINE);
         assertEq(token.balanceOf(bob) - before, out, "the recipient did not receive the output");
     }
 
@@ -545,7 +626,7 @@ abstract contract ZapRouterHarness is ZapBase {
         _zapBuy(alice, 15 ether);
         uint256 held = token.balanceOf(alice);
         vm.prank(alice);
-        zap.zapSell(ethKey, key, held / 2, 1, alice);
+        zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
 
         assertEq(address(zap).balance, 0, "the router kept ether");
         assertEq(pair.balanceOf(address(zap)), 0, "the router kept pair currency");
@@ -561,7 +642,7 @@ abstract contract ZapRouterHarness is ZapBase {
         uint256 held = token.balanceOf(alice);
         for (uint256 i = 0; i < 3; i++) {
             vm.prank(alice);
-            zap.zapSell(ethKey, key, held / 10, 1, alice);
+            zap.zapSell(ethKey, key, held / 10, 1, alice, DEADLINE);
         }
         assertEq(address(zap).balance, 0, "the router kept ether");
         assertEq(pair.balanceOf(address(zap)), 0, "the router kept pair currency");
@@ -649,7 +730,7 @@ abstract contract ZapThinEthPoolHarness is ZapBase {
         uint256 ethBefore = alice.balance;
 
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 200 ether}(ethKey, key, 1, alice);
+        uint256 out = zap.zapBuy{value: 200 ether}(ethKey, key, 1, alice, DEADLINE);
 
         uint256 spent = ethBefore - alice.balance;
         assertGt(out, 0, "the truncated buy delivered nothing");
@@ -671,7 +752,7 @@ abstract contract ZapThinEthPoolHarness is ZapBase {
         assertGt(held, 0, "precondition: alice holds tokens to dump");
 
         vm.prank(alice);
-        try zap.zapSell(ethKey, key, held, 1, alice) returns (uint256) {
+        try zap.zapSell(ethKey, key, held, 1, alice, DEADLINE) returns (uint256) {
             revert("a dump that exhausts hop 1 was allowed to settle");
         } catch (bytes memory err) {
             assertEq(
@@ -696,7 +777,7 @@ abstract contract ZapThinEthPoolHarness is ZapBase {
 
         uint256 ethBefore = alice.balance;
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held / 20, 1, alice);
+        uint256 out = zap.zapSell(ethKey, key, held / 20, 1, alice, DEADLINE);
 
         assertGt(out, 0, "a sell the band can absorb returned nothing");
         assertEq(alice.balance - ethBefore, out, "the reported output is not what arrived");
@@ -710,6 +791,167 @@ contract ZapThinEthPoolTokenIsCurrency0Test is ZapThinEthPoolHarness {
 }
 
 contract ZapThinEthPoolTokenIsCurrency1Test is ZapThinEthPoolHarness {
+    function _tokenIsCurrency0() internal pure override returns (bool) {
+        return false;
+    }
+}
+
+// ===================================================================================================
+// The pair IS wrapped ether, so hop 1 is a wrap and not a swap
+// ===================================================================================================
+
+/// @notice WETH is `DEFAULT_PAIR`, which makes this the most common launch on mainnet.
+///
+/// @dev Routing `ETH -> WETH` through a pool is legal and it works — there is a live v4 ETH/WETH
+///      pool with real liquidity, measured at 6.3 bps all-in. But `WETH.deposit()` does the same
+///      thing for free, at exactly 1:1, with no pool and no price impact. Paying a fee to a market
+///      maker to perform an identity function is not a trade, it is a leak.
+///
+///      Swapping the pair's CODE rather than rebuilding the world: `MockWETH9` adds no storage over
+///      `MockERC20`, so `deployCodeTo` gives the existing pair real `deposit`/`withdraw` while every
+///      balance, allowance and the launch token's `payoutToken` wiring survive untouched.
+abstract contract ZapWrapHarness is ZapBase {
+    /// The un-wrapped router, kept for the side-by-side price comparison.
+    ZapRouter internal poolRouter;
+
+    function setUp() public virtual override {
+        super.setUp();
+
+        // `poolRouter` is the shipped behaviour: `weth == address(0)`, hop 1 goes through a pool.
+        poolRouter = zap;
+
+        deployCodeTo(
+            "ZapRouter.t.sol:MockWETH9",
+            abi.encode("Wrapped Ether", "WETH", uint8(18)),
+            address(pair)
+        );
+        // The harness minted this "WETH" without ever depositing ether, so back it now or
+        // `withdraw` has nothing to pay out. A test artefact, not a property of WETH9.
+        vm.deal(address(pair), 1_000_000 ether);
+
+        zap = new ZapRouter(IPoolManager(address(manager)), address(pair));
+        vm.startPrank(alice);
+        token.approve(address(zap), type(uint256).max);
+        vm.stopPrank();
+    }
+
+    function test_wrap_aBuyNeverTouchesTheEthPool() public {
+        (uint160 priceBefore,,,) = _ethPoolPrice();
+
+        uint256 tokenBefore = token.balanceOf(alice);
+        uint256 ethBefore = alice.balance;
+        vm.prank(alice);
+        uint256 out = zap.zapBuy{value: 10 ether}(ethKey, key, 1, alice, DEADLINE);
+
+        (uint160 priceAfter,,,) = _ethPoolPrice();
+
+        assertGt(out, 0, "the wrapped buy delivered nothing");
+        assertEq(token.balanceOf(alice) - tokenBefore, out, "the reported output is not what arrived");
+        assertEq(ethBefore - alice.balance, 10 ether, "the buyer paid something other than msg.value");
+        assertEq(priceAfter, priceBefore, "hop 1 went through the pool instead of wrapping");
+    }
+
+    function test_wrap_aSellReturnsEther() public {
+        vm.prank(alice);
+        uint256 held = zap.zapBuy{value: 20 ether}(ethKey, key, 1, alice, DEADLINE);
+        assertGt(held, 0, "precondition: alice holds tokens to sell");
+
+        (uint160 priceBefore,,,) = _ethPoolPrice();
+        uint256 ethBefore = alice.balance;
+
+        vm.prank(alice);
+        uint256 out = zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
+
+        (uint160 priceAfter,,,) = _ethPoolPrice();
+
+        assertGt(out, 0, "the wrapped sell returned nothing");
+        assertEq(alice.balance - ethBefore, out, "the seller did not receive the reported ether");
+        assertEq(priceAfter, priceBefore, "hop 1 went through the pool instead of unwrapping");
+    }
+
+    /// **The reason the shortcut exists, measured.** Same trade, same state, one router wrapping
+    /// and one routing through the ETH/WETH pool. Wrapping must deliver strictly more, because the
+    /// pool charges a fee and moves a price to do what `deposit()` does for nothing.
+    function test_wrap_deliversStrictlyMoreThanRoutingThroughThePool() public {
+        uint256 spend = 25 ether;
+        uint256 snap = vm.snapshotState();
+
+        vm.prank(alice);
+        uint256 viaPool = poolRouter.zapBuy{value: spend}(ethKey, key, 1, alice, DEADLINE);
+
+        vm.revertToState(snap);
+
+        vm.prank(alice);
+        uint256 viaWrap = zap.zapBuy{value: spend}(ethKey, key, 1, alice, DEADLINE);
+
+        assertGt(viaWrap, viaPool, "wrapping did not beat paying an LP to perform an identity");
+        emit log_named_uint("tokens via the ETH/WETH pool", viaPool);
+        emit log_named_uint("tokens via a plain wrap     ", viaWrap);
+        emit log_named_uint("bps saved by wrapping       ", ((viaWrap - viaPool) * 10_000) / viaPool);
+    }
+
+    function test_wrap_theRouterRetainsNothing() public {
+        vm.prank(alice);
+        uint256 held = zap.zapBuy{value: 15 ether}(ethKey, key, 1, alice, DEADLINE);
+        vm.prank(alice);
+        zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
+
+        assertEq(address(zap).balance, 0, "the router kept ether");
+        assertEq(pair.balanceOf(address(zap)), 0, "the router kept wrapped ether");
+        assertEq(token.balanceOf(address(zap)), 0, "the router kept launch tokens");
+    }
+
+    /// The wrap path must still honour the floor and the deadline — it is a different hop 1, not a
+    /// different set of guarantees.
+    function test_wrap_stillHonoursTheFloorAndTheDeadline() public {
+        uint256 snap = vm.snapshotState();
+        vm.prank(alice);
+        uint256 fair = zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, DEADLINE);
+        vm.revertToState(snap);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(ZapRouter.TooLittleReceived.selector, fair, fair * 2));
+        zap.zapBuy{value: 1 ether}(ethKey, key, fair * 2, alice, DEADLINE);
+
+        uint256 past = vm.getBlockTimestamp() - 1;
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(ZapRouter.Expired.selector, past, vm.getBlockTimestamp()));
+        zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, past);
+    }
+
+    /// The fee is charged on the wrap path exactly as it is on the pool path — the shortcut changes
+    /// hop 1, and the hook lives on hop 2.
+    function test_wrap_theFeeStillReachesTheDistributor() public {
+        uint256 before = pair.balanceOf(address(dist));
+        uint256 feesBefore = hook.totalFeesTaken(poolId);
+
+        vm.prank(alice);
+        zap.zapBuy{value: 40 ether}(ethKey, key, 1, alice, DEADLINE);
+
+        // A wrap is 1:1, so the amount reaching the launch pool is exactly what was sent.
+        uint256 wrapped = 40 ether;
+        assertEq(
+            hook.totalFeesTaken(poolId) - feesBefore,
+            (wrapped * FEE_BPS) / 10_000,
+            "the fee is not the advertised rate on the wrapped amount"
+        );
+
+        hook.sweep(key);
+        assertGt(pair.balanceOf(address(dist)) - before, 0, "holders were not paid on a wrapped buy");
+    }
+
+    function _ethPoolPrice() internal view returns (uint160, int24, uint24, uint24) {
+        return StateLibrary.getSlot0(IPoolManager(address(manager)), ethKey.toId());
+    }
+}
+
+contract ZapWrapTokenIsCurrency0Test is ZapWrapHarness {
+    function _tokenIsCurrency0() internal pure override returns (bool) {
+        return true;
+    }
+}
+
+contract ZapWrapTokenIsCurrency1Test is ZapWrapHarness {
     function _tokenIsCurrency0() internal pure override returns (bool) {
         return false;
     }
