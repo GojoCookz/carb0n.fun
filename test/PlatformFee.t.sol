@@ -49,7 +49,9 @@ contract PlatformFeeTest is FeeHookHarness {
     /// The invariant that matters, across the whole legal range of fees: whatever a creator
     /// charges, the platform's slice of it is worth the same 1% of the trade.
     function testFuzz_platformAlwaysEarnsOnePercentOfVolume(uint16 feeBps) public {
-        feeBps = uint16(bound(feeBps, hook.PLATFORM_VOLUME_BPS(), hook.MAX_FEE_BPS()));
+        // Lower bound is the floor PLUS ONE: `feeBps == PLATFORM_VOLUME_BPS` is now refused
+        // outright, because at exactly the floor the creator and the holders receive nothing.
+        feeBps = uint16(bound(feeBps, hook.PLATFORM_VOLUME_BPS() + 1, hook.MAX_FEE_BPS()));
 
         FeeHook.FeeSetup memory s = FeeHook.FeeSetup({
             distributor: address(dist),
@@ -169,8 +171,27 @@ contract PlatformFeeTest is FeeHookHarness {
         hook.configurePoolFull(k, s);
     }
 
-    /// Exactly at the floor is legal, and hands the platform the entire fee.
-    function test_aFeeExactlyAtTheFloorIsAcceptedAndIsAllPlatform() public {
+    /// @notice REGRESSION GUARD for audit-05 E-09 / audit-03 A-9. A fee EXACTLY at the platform
+    ///         floor is now refused instead of quietly paying the creator and the holders zero.
+    ///
+    /// @dev THE BUG. The floor check was `feeBps < PLATFORM_VOLUME_BPS`, so `feeBps == 100` was
+    ///      accepted. `platformShareBps = PLATFORM_VOLUME_BPS * BPS / feeBps` then evaluates to
+    ///      exactly `BPS`, `_routeFee` sends the whole fee to the platform and `rest` is zero.
+    ///
+    ///      MEASURED on a 100-pair buy with the creator advertising `creatorBps = 8000`:
+    ///
+    ///        feeBps | platform | creator | holders
+    ///           100 |   0.9950 |  0.0000 |  0.0000   <- BEFORE: nothing, no revert, no warning
+    ///           110 |   0.9949 |  0.0796 |  0.0199
+    ///           300 |   0.9949 |  1.5920 |  0.3980
+    ///
+    ///      AFTER: `configurePoolFull` reverts `FeeBelowPlatformFloor(100)` and the launch does
+    ///      not happen. Silent trimming is banned in this codebase and silently zeroing two of
+    ///      the three recipients is worse than trimming.
+    ///
+    ///      The band above the floor is steep but CORRECT, so it is not rejected - `effectiveSplitBps`
+    ///      is what lets a UI show the real number there before anybody signs. Asserted below.
+    function test_fixed_aFeeExactlyAtTheFloorIsRejectedInsteadOfPayingHoldersNothing() public {
         FeeHook.FeeSetup memory s = FeeHook.FeeSetup({
             distributor: address(dist),
             pairCurrency: Currency.wrap(address(pair)),
@@ -178,16 +199,58 @@ contract PlatformFeeTest is FeeHookHarness {
             sellFeeBps: 0,
             burnBps: 0,
             creator: creator,
-            creatorBps: 5000,
+            creatorBps: 8000,
             rewardCurrency: Currency.wrap(address(0))
         });
 
         PoolKey memory k = key;
         k.tickSpacing = 61;
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                FeeHook.FeeBelowPlatformFloor.selector, hook.PLATFORM_VOLUME_BPS()
+            )
+        );
         hook.configurePoolFull(k, s);
 
-        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(k.toId());
-        assertEq(platformShareBps, hook.BPS(), "at the floor the platform takes the whole fee");
+        // Precondition that makes the revert meaningful: one basis point higher is accepted, and
+        // at that rate the creator and the holders really do get something.
+        s.feeBps = hook.PLATFORM_VOLUME_BPS() + 1;
+        hook.configurePoolFull(k, s);
+
+        (uint16 platformBps, uint16 creatorBps, uint16 holderBps) =
+            hook.effectiveSplitBps(k.toId());
+        assertEq(platformBps + creatorBps + holderBps, hook.BPS(), "the split must be exhaustive");
+        assertLt(platformBps, hook.BPS(), "the platform still takes the whole fee");
+        assertGt(creatorBps, 0, "the creator is still paid nothing");
+        assertGt(holderBps, 0, "holders are still paid nothing");
+    }
+
+    /// The companion to the guard above: the steep band is legal, and `effectiveSplitBps` reports
+    /// what it actually pays rather than what `creatorBps` looks like it pays.
+    function test_fixed_theEffectiveSplitIsReadableBeforeAnybodySigns() public {
+        FeeHook.FeeSetup memory s = FeeHook.FeeSetup({
+            distributor: address(dist),
+            pairCurrency: Currency.wrap(address(pair)),
+            feeBps: 200,
+            sellFeeBps: 0,
+            burnBps: 0,
+            creator: creator,
+            creatorBps: 8000,
+            rewardCurrency: Currency.wrap(address(0))
+        });
+
+        PoolKey memory k = key;
+        k.tickSpacing = 62;
+        hook.configurePoolFull(k, s);
+
+        (uint16 platformBps, uint16 creatorBps, uint16 holderBps) =
+            hook.effectiveSplitBps(k.toId());
+
+        // At 2% the platform takes half the fee, so "80% to the creator" is 80% of the OTHER half.
+        assertEq(platformBps, 5000, "platform share of the fee");
+        assertEq(creatorBps, 4000, "the creator's advertised 8000 is really 4000 of the fee");
+        assertEq(holderBps, 1000, "and holders get 1000, not 2000");
+        assertEq(platformBps + creatorBps + holderBps, hook.BPS(), "the split must be exhaustive");
     }
 
     // ===========================================================================================

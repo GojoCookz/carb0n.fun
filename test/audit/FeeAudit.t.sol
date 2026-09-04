@@ -336,19 +336,25 @@ abstract contract FeeAuditFindings is FeeAuditWorld {
     ///      pair currency in `unlockCallback`, merged into the same `totalPair`, and then handed to
     ///      `_routeFee`, which applies the buy-derived share to all of it.
     ///
-    ///      With `feeBps = 100` (the floor, share = 10_000 = the entire fee) and
-    ///      `sellFeeBps = 1000`, the platform takes 100% of a 10% sell tax: ~10% of sell volume,
-    ///      ten times the constant it is documented to be capped at, and the creator and the
-    ///      holders receive nothing at all from sells.
+    ///      With `feeBps = 101` (one basis point above the floor, share = 9,900 = 99% of the fee)
+    ///      and `sellFeeBps = 1000`, the platform takes ~99% of a 10% sell tax: ~9.9% of sell
+    ///      volume, an order of magnitude over the constant it is documented to be capped at, and
+    ///      the creator and the holders receive a rounding error from sells.
     ///
-    ///      `PlatformFee.t.sol:79` asserts `assertLe(volumeBpsEarned, PLATFORM_VOLUME_BPS,
+    ///      **STILL OPEN.** Only the harness moved: `feeBps = 100` used to be legal and produced
+    ///      the cleaner 100%/0%/0% version of this table. It is now refused outright
+    ///      (`FeeBelowPlatformFloor`), which closes E-09 but does nothing about F-02 - the
+    ///      buy-derived share is still applied to converted sell fees at one basis point higher,
+    ///      and at every rate above it.
+    ///
+    ///      `PlatformFee.t.sol` asserts `assertLe(volumeBpsEarned, PLATFORM_VOLUME_BPS,
     ///      "platform was overpaid")`. It passes only because that fuzz hardcodes `sellFeeBps: 0`.
     function test_F02_sellFeesArePaidToThePlatformAtTheBuyRateShare() public {
-        PoolKey memory k = _newPool(60, /*buy*/ 100, /*sell*/ 1000, 0, /*creatorBps*/ 5000, 0);
+        PoolKey memory k = _newPool(60, /*buy*/ 101, /*sell*/ 1000, 0, /*creatorBps*/ 5000, 0);
         PoolId id = k.toId();
 
         (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(id);
-        assertEq(platformShareBps, 10_000, "at the fee floor the platform takes the whole fee");
+        assertEq(platformShareBps, 9_900, "one bp above the floor the platform takes 99% of the fee");
 
         // Give alice a position to sell, without routing through the pool.
         token.transfer(alice, 1_000_000e18);
@@ -384,8 +390,13 @@ abstract contract FeeAuditFindings is FeeAuditWorld {
         // ~10% of volume, i.e. an order of magnitude over the documented flat rate.
         assertGt(platformBpsOfVolume, 500, "platform took over 5% of sell volume");
 
-        assertEq(pair.balanceOf(creator), creatorBefore, "creator got nothing from the sell tax");
-        assertEq(pair.balanceOf(address(dist)), distBefore, "holders got nothing from the sell tax");
+        // The creator and the holders split the 1% of the fee the platform did not take, so their
+        // combined share of a 10% sell tax is a rounding error against the platform's.
+        assertLt(
+            (pair.balanceOf(creator) - creatorBefore) + (pair.balanceOf(address(dist)) - distBefore),
+            platformGot / 50,
+            "creator and holders got a meaningful share of the sell tax"
+        );
     }
 
     /// @dev The mirror image: a high buy rate with a low sell rate UNDERPAYS the platform on sell

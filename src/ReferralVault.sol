@@ -127,10 +127,26 @@ contract ReferralVault {
     ///      cost of that is that this trusts the hook about the amount - which is why only the
     ///      hook may call it.
     ///
-    ///      Walks up the referral chain, paying each tier a share. **Cycles are impossible**
-    ///      because `referrerOf` is write-once and a referrer must already exist when they refer
-    ///      someone, but the loop is bounded by `tierCount` regardless: an unbounded walk over
-    ///      attacker-shaped data is how this function would become a denial of service.
+    ///      Walks up the referral chain, paying each tier a share.
+    ///
+    ///      **CYCLES ARE LEGAL AND THE WALK IS WHAT MAKES THEM HARMLESS.** This used to claim
+    ///      cycles were impossible "because `referrerOf` is write-once and a referrer must
+    ///      already exist when they refer someone". Only the first half was ever enforced.
+    ///      `setReferrer` has no check that the referrer is already in the graph - and it cannot
+    ///      have one, or the first referrer of all could never be recorded - so
+    ///      `A -> B` then `B -> A` is two ordinary legal launches. The walk then alternated
+    ///      `B, A, B, A, B` and paid a creator's own two wallets **the entire 40% schedule**,
+    ///      measured, and withdrawable.
+    ///
+    ///      The fix is here rather than in `setReferrer`: **no address is paid twice in one walk,
+    ///      and the creator is never paid at all.** A cycle now earns exactly what one honest
+    ///      referrer earns - tier 0 - and the walk terminates at the first repeat. The seen-set is
+    ///      a fixed `MAX_TIERS + 1` memory array, so the quadratic scan is at most 21 comparisons
+    ///      and cannot be grown by attacker-shaped data.
+    ///
+    ///      What this does NOT close is a chain of five DISTINCT sybil wallets, which is a bounded,
+    ///      known 40% haircut on referral revenue (`sum(schedule)`, `MAX_TIERS` both fixed in the
+    ///      bytecode) and is a schedule-design question, not a correctness one.
     function credit(address currency, uint256 amount, address creator) external {
         if (msg.sender != feeHook) revert OnlyFeeHook();
         if (amount == 0) return;
@@ -140,8 +156,28 @@ contract ReferralVault {
         uint256 remaining = amount;
         address walker = referrerOf[creator];
 
+        // Seeded with the creator, so a cycle can never route the platform's cut back to the
+        // person whose launch generated it.
+        address[MAX_TIERS + 1] memory seen;
+        seen[0] = creator;
+        uint256 seenCount = 1;
+
         for (uint8 i = 0; i < tierCount; i++) {
             if (walker == address(0)) break;
+
+            bool alreadyPaid;
+            for (uint256 j = 0; j < seenCount; j++) {
+                if (seen[j] == walker) {
+                    alreadyPaid = true;
+                    break;
+                }
+            }
+            // The chain has run out of distinct people. Everything left goes to the treasury.
+            if (alreadyPaid) break;
+            seen[seenCount] = walker;
+            unchecked {
+                ++seenCount;
+            }
 
             uint256 cut = (amount * _tierBps[i]) / BPS;
             if (cut != 0) {

@@ -550,11 +550,27 @@ contract AccessAuditTest is AccessAuditHarness {
     }
 
     // -------------------------------------------------------------------------------------------
-    // FINDING A-3 (MEDIUM): `VestingVault.addSchedule` is permissionless AND takes an unbounded
-    // caller-chosen `start`, so anyone can lock any top-up in anyone's vault for any length of
-    // time - irreversibly, because `extend` cannot move `start` and nothing can shorten.
+    // FINDING A-3 (MEDIUM) - REGRESSION GUARD. `VestingVault.addSchedule` USED TO be
+    // permissionless AND take an unbounded caller-chosen `start`.
     // -------------------------------------------------------------------------------------------
-    function test_finding_anyoneCanPermanentlyLockATopUpInSomeoneElsesVault() public {
+    //
+    // THE BUG. The docstring justified the missing guard with "the launcher calls it during the
+    // launch transaction, before a beneficiary could possibly front-run anything". True of the
+    // launch and of nothing else: the contract also advertises top-ups, and every top-up is a
+    // two-step transfer-then-schedule with an open window in between.
+    //
+    // MEASURED BEFORE, both abuses:
+    //   - a stranger front-ran a 1,000e18 top-up with `start = now + 100 years`. Fifty years
+    //     later `release()` moved none of it and `extend(1, 0, 1 days)` reverted `CannotShorten`,
+    //     because `extend` takes only `cliff` and `duration` and `start` is unreachable once
+    //     written. Permanent, for the price of gas.
+    //   - 31 schedules over 1 wei each filled `MAX_SCHEDULES = 32`, and the beneficiary's own
+    //     500e18 top-up then reverted `TooManySchedules`, forever. Cost: 31 wei plus gas.
+    //
+    // THE FIX. `addSchedule` is now `launcher || beneficiary`, and `start` may not be in the
+    // future - a lock that should begin later is a CLIFF, which is visible in `scheduleAt` and
+    // which `extend` can lengthen, rather than a start date nothing can ever move.
+    function test_fixed_aStrangerCannotLockATopUpInSomeoneElsesVault() public {
         (address token, VestingVault vault) = _launchVested(5e18, 90 days, 0);
         uint256 t0 = block.timestamp;
 
@@ -565,63 +581,75 @@ contract AccessAuditTest is AccessAuditHarness {
         vm.prank(trader);
         IERC20(token).transfer(address(vault), topUp);
 
-        // ...and are front-run. `start` has no upper bound and no relationship to now.
+        // The front-run is refused on the CALLER.
         uint64 farFuture = uint64(t0 + 100 * 365 days);
         vm.prank(attacker);
+        vm.expectRevert(VestingVault.OnlyLauncherOrBeneficiary.selector);
         vault.addSchedule(uint128(topUp), farFuture, 0, 7 days);
 
-        assertEq(vault.scheduleCount(), 2, "the attacker's schedule was accepted");
-        assertEq(vault.scheduleAt(1).start, farFuture, "with a start a century out");
+        // And even the beneficiary cannot write a start a century out, so the same irreversible
+        // shape cannot be reached by a compromised or careless key either.
+        vm.prank(creator);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VestingVault.StartInTheFuture.selector, farFuture, uint64(block.timestamp)
+            )
+        );
+        vault.addSchedule(uint128(topUp), farFuture, 0, 7 days);
+
+        assertEq(vault.scheduleCount(), 1, "only the launch's own schedule exists");
+
+        // The legitimate top-up still works, from the person whose vault it is.
+        vm.prank(creator);
+        vault.addSchedule(uint128(topUp), uint64(block.timestamp), 0, 30 days);
+        assertEq(vault.scheduleCount(), 2, "the beneficiary's own top-up was refused");
         assertEq(vault.scheduleAt(1).total, topUp, "over the whole top-up");
 
-        // Fifty years later it has still not begun to vest.
-        vm.warp(t0 + 50 * 365 days);
-        vm.prank(creator);
+        // ...and it really does vest, rather than sitting inert for a century. Measured on the
+        // top-up's OWN schedule, not on the vault's balance: the vault also holds the launch's
+        // 30M-token dev-buy schedule, which would swamp a balance comparison.
+        vm.warp(t0 + 31 days);
         vault.release();
         assertEq(
-            IERC20(token).balanceOf(address(vault)),
+            vault.scheduleAt(1).released,
             topUp,
-            "the top-up is untouched half a century later"
+            "the top-up did not fully vest over its own 30-day schedule"
         );
-
-        // And it cannot be undone. `extend` is the only mutator, it refuses to shorten, and
-        // `start` is not a parameter of it at all.
-        vm.prank(creator);
-        vm.expectRevert(VestingVault.CannotShorten.selector);
-        vault.extend(1, 0, 1 days);
     }
 
-    /// Same door, a cheaper abuse: 31 dust schedules fill `MAX_SCHEDULES` and the beneficiary can
-    /// never lock anything again. Cost to the attacker: 31 wei of the launch token plus gas.
-    function test_finding_anyoneCanFillMaxSchedulesAndBlockAllFutureLocks() public {
+    /// Same door, the cheaper abuse: 31 dust schedules used to fill `MAX_SCHEDULES` so the
+    /// beneficiary could never lock anything again, for 31 wei plus gas. The very first one is now
+    /// refused.
+    function test_fixed_aStrangerCannotFillMaxSchedules() public {
         (address token, VestingVault vault) = _launchVested(5e18, 90 days, 0);
 
         _buyAndSweep(trader, token, 20e18);
         vm.prank(trader);
         IERC20(token).transfer(attacker, 1_000e18);
 
-        // Slot 0 is the launch's own schedule; 31 more fills the array.
-        for (uint256 i = 0; i < 31; i++) {
-            vm.startPrank(attacker);
-            IERC20(token).transfer(address(vault), 1);
-            vault.addSchedule(1, uint64(block.timestamp), 0, 7 days);
-            vm.stopPrank();
-        }
-        assertEq(vault.scheduleCount(), vault.MAX_SCHEDULES(), "array is full");
+        vm.startPrank(attacker);
+        IERC20(token).transfer(address(vault), 1);
+        vm.expectRevert(VestingVault.OnlyLauncherOrBeneficiary.selector);
+        vault.addSchedule(1, uint64(block.timestamp), 0, 7 days);
+        vm.stopPrank();
 
-        // The beneficiary's own top-up is now impossible, permanently.
+        assertEq(vault.scheduleCount(), 1, "a stranger got a schedule in");
+
+        // The beneficiary's own top-up is unaffected - which is what makes the guard a fix rather
+        // than a lockout.
         vm.prank(trader);
         IERC20(token).transfer(address(vault), 500e18);
-
         vm.prank(creator);
-        vm.expectRevert(VestingVault.TooManySchedules.selector);
         vault.addSchedule(uint128(500e18), uint64(block.timestamp), 0, 30 days);
+        assertEq(vault.scheduleCount(), 2, "the beneficiary could not lock their own top-up");
     }
 
-    /// INFO, same function: `addSchedule` SILENTLY TRIMS an over-large amount instead of
-    /// reverting. The project's own stated rule ("silent trimming is banned", `Launcher` docs) is
-    /// not applied here.
-    function test_info_addScheduleSilentlyTrimsInsteadOfReverting() public {
+    /// REGRESSION GUARD, same function: `addSchedule` used to SILENTLY TRIM an over-large amount.
+    /// Asking for `type(uint128).max` against a 100e18 balance produced a 100e18 schedule with no
+    /// revert and only a well-formed event to notice it by. The project's own rule is the
+    /// opposite - `Launcher` reverts `DevBuyTooLarge` rather than clamping - and it is applied
+    /// here now.
+    function test_fixed_addScheduleRevertsInsteadOfSilentlyTrimming() public {
         (address token, VestingVault vault) = _launchVested(5e18, 90 days, 0);
 
         _buyAndSweep(trader, token, 20e18);
@@ -629,11 +657,19 @@ contract AccessAuditTest is AccessAuditHarness {
         IERC20(token).transfer(address(vault), 100e18);
 
         vm.prank(creator);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                VestingVault.AmountExceedsUnscheduled.selector, type(uint128).max, uint256(100e18)
+            )
+        );
         vault.addSchedule(type(uint128).max, uint64(block.timestamp), 0, 30 days);
 
-        assertEq(
-            vault.scheduleAt(1).total, 100e18, "asked for uint128 max, got a silently different lock"
-        );
+        assertEq(vault.scheduleCount(), 1, "a trimmed schedule was written anyway");
+
+        // The exact amount is accepted, so this is a refusal to guess and not a refusal to work.
+        vm.prank(creator);
+        vault.addSchedule(uint128(100e18), uint64(block.timestamp), 0, 30 days);
+        assertEq(vault.scheduleAt(1).total, 100e18, "the exact amount was refused too");
     }
 
     // -------------------------------------------------------------------------------------------
@@ -668,24 +704,40 @@ contract AccessAuditTest is AccessAuditHarness {
     }
 
     // -------------------------------------------------------------------------------------------
-    // FINDING A-5 (LOW): `PairRegistry` ownership can be destroyed in ONE unconfirmed call.
-    // `Ownable2Step` protects `transferOwnership` and leaves `renounceOwnership` single-step.
+    // FINDING A-5 (LOW) - REGRESSION GUARD. `PairRegistry` ownership USED TO be destroyable in
+    // ONE unconfirmed call. `Ownable2Step` guards `transferOwnership` with a handshake and leaves
+    // `renounceOwnership` exactly as `Ownable` defines it: single step, no confirmation.
     // -------------------------------------------------------------------------------------------
-    function test_finding_registryOwnershipCanBeRenouncedInOneCallAndFreezesTheAllowlist() public {
+    //
+    // MEASURED BEFORE: one call set `owner()` to `address(0)`, after which
+    // `approvePairWithoutOracle` AND `revokePair` both reverted `OwnableUnauthorizedAccount`
+    // forever. The second of those is the one that matters - the registry is the only gate on
+    // which currencies may be launched or paid against, so a pair currency that later paused,
+    // blacklisted or got exploited would have stayed launchable for the life of the deployment.
+    //
+    // AFTER: `renounceOwnership` is overridden to revert `OwnershipCannotBeRenounced`, ownership
+    // survives, and both admin paths still work. Transferring it away is unaffected, which is the
+    // same outcome for an operator who genuinely wants to walk away - with a second step in front
+    // of it.
+    function test_fixed_registryOwnershipCannotBeRenounced() public {
         assertEq(registry.owner(), address(this));
 
+        vm.expectRevert(PairRegistry.OwnershipCannotBeRenounced.selector);
         registry.renounceOwnership();
-        assertEq(registry.owner(), address(0), "ownership gone, with no second step");
+        assertEq(registry.owner(), address(this), "ownership was destroyed after all");
 
+        // Both halves of the allowlist still work, which is what the revert is protecting.
         MockERC20 newPair = new MockERC20("New", "NEW", 18);
-        vm.expectRevert(
-            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this))
-        );
         registry.approvePairWithoutOracle(address(newPair), 18);
+        assertTrue(registry.isApproved(address(newPair)), "a pair could not be added");
 
-        // And nothing can be delisted either - the allowlist is frozen in whatever state it was in.
+        registry.revokePair(address(newPair));
+        assertFalse(registry.isApproved(address(newPair)), "a pair could not be REVOKED");
+
+        // And a non-owner still cannot reach it, so the override did not widen anything.
+        vm.prank(attacker);
         vm.expectRevert(
-            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this))
+            abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker)
         );
         registry.revokePair(address(pair));
     }
@@ -892,17 +944,27 @@ contract ReferralAccessAuditTest is AccessAuditHarness {
     }
 
     // -------------------------------------------------------------------------------------------
-    // FINDING A-7 (MEDIUM): a creator can credit THEMSELVES the whole referral schedule on their
-    // own launch, using two wallets, because `setReferrer` never checks that the referrer already
-    // exists in the graph.
+    // FINDING A-7 (MEDIUM) - REGRESSION GUARD. A creator USED TO be able to credit THEMSELVES the
+    // whole referral schedule on their own launch, using two wallets.
     // -------------------------------------------------------------------------------------------
     //
-    // `ReferralVault.credit` documents the opposite at ReferralVault.sol:130 - "**Cycles are
-    // impossible** because `referrerOf` is write-once and a referrer must already exist when they
-    // refer someone". `setReferrer` enforces the write-once half and NOT the must-already-exist
-    // half, so A->B and B->A is a legal two-transaction construction, and the tier walk then
-    // alternates between the two wallets until it exhausts the schedule.
-    function test_finding_aTwoWalletCycleLetsACreatorCreditThemselvesTheWholeSchedule() public {
+    // THE BUG. `ReferralVault.credit` claimed "**Cycles are impossible** because `referrerOf` is
+    // write-once and a referrer must already exist when they refer someone". Only the write-once
+    // half was ever enforced, and the other half CANNOT be enforced in `setReferrer` - the first
+    // referrer of all has no referrer, so requiring one makes the graph unbootstrappable. So
+    // `A -> B` then `B -> A` was two ordinary legal launches and the tier walk alternated
+    // `B, A, B, A, B` through the whole 20/10/5/3/2 schedule.
+    //
+    // MEASURED BEFORE: **4,000 of 10,000 bps** of the platform's cut landed on the launcher's own
+    // two wallets, and was claimed out to prove it was spendable rather than an accounting
+    // artefact. The treasury got 6,000 instead of 10,000. The honest single-referrer case is
+    // 2,000, so the cycle DOUBLED it.
+    //
+    // THE FIX is in the walk, not in `setReferrer`: the seen-set is seeded with the creator and no
+    // address is paid twice, so the walk terminates at the first repeat.
+    // MEASURED AFTER: **2,000 bps** - exactly what one honest referrer earns - and the creator's
+    // own wallet earns zero from their own launch.
+    function test_fixed_aTwoWalletCycleEarnsNoMoreThanOneHonestReferrer() public {
         // Both wallets belong to the same person. Two ordinary launches, each naming the other.
         Launcher.LaunchParams memory pa = _params();
         pa.salt = bytes32(uint256(101));
@@ -925,36 +987,71 @@ contract ReferralAccessAuditTest is AccessAuditHarness {
 
         _buyAndSweep(trader, tokenA, 10e18);
 
-        uint256 toSelf =
-            refVault.owed(creator, address(pair)) + refVault.owed(creator2, address(pair));
+        uint256 toWalletB = refVault.owed(creator2, address(pair));
+        uint256 toSelf = refVault.owed(creator, address(pair));
         uint256 toTreasury = refVault.owed(treasury, address(pair));
-        assertGt(toSelf, 0, "no self-credit occurred");
+        assertGt(toWalletB, 0, "precondition: tier 0 really was paid, so the walk did run");
 
-        // The full 40% schedule was captured by the launcher's own two wallets.
+        // The creator's OWN wallet - the one whose launch generated the fee - earns nothing.
+        assertEq(toSelf, 0, "the cycle routed the cut back to the creator");
+
+        // And the pair of wallets together take exactly the honest single-referrer tier.
         assertApproxEqAbs(
-            (toSelf * 10_000) / (toSelf + toTreasury),
-            4000,
+            ((toSelf + toWalletB) * 10_000) / (toSelf + toWalletB + toTreasury),
+            2000,
             2,
-            "expected the whole schedule to land on the creator's own wallets"
+            "the cycle earned more than one honest referrer"
         );
 
-        // And it is really withdrawable, not just an accounting artefact.
+        // CONTROL: an ordinary, unrelated referrer on an otherwise identical launch earns the
+        // same 2,000 bps. Without this the assertion above would also pass on a build that had
+        // simply stopped paying referrers at all.
+        Launcher.LaunchParams memory pc = _params();
+        pc.salt = bytes32(uint256(103));
+        pc.referrer = address(0x8EEF);
+        vm.prank(trader);
+        (address tokenC,) = launcher.launch(pc);
+        uint256 honestBefore = refVault.owed(address(0x8EEF), address(pair));
+        uint256 treasuryBefore = refVault.owed(treasury, address(pair));
+        _buyAndSweep(stranger, tokenC, 10e18);
+        uint256 honestGot = refVault.owed(address(0x8EEF), address(pair)) - honestBefore;
+        uint256 treasuryGot = refVault.owed(treasury, address(pair)) - treasuryBefore;
+        assertApproxEqAbs(
+            (honestGot * 10_000) / (honestGot + treasuryGot),
+            2000,
+            2,
+            "control: an honest single referrer no longer earns tier 0"
+        );
+
+        // Tier 0 is still really withdrawable, not just an accounting artefact.
         uint256 before2 = pair.balanceOf(creator2);
         vm.prank(creator2);
         refVault.claim(address(pair));
-        assertGt(pair.balanceOf(creator2) - before2, 0, "the second wallet was paid out for real");
+        assertGt(pair.balanceOf(creator2) - before2, 0, "the referrer was not paid out for real");
     }
 
     // -------------------------------------------------------------------------------------------
-    // FINDING A-8 (MEDIUM): setting `feeRecipient` silently destroys the referrer's entire claim.
+    // FINDING A-8 (MEDIUM) - REGRESSION GUARD. Setting `feeRecipient` USED TO silently destroy the
+    // referrer's entire claim.
     // -------------------------------------------------------------------------------------------
     //
-    // `Launcher._configureHook` records `setReferrer(msg.sender, referrer)` - keyed on the
-    // LAUNCHING WALLET - but stores `creator: feeRecipient == 0 ? msg.sender : feeRecipient` in the
-    // pool config. `FeeHook._routeFee` then calls `credit(..., cfg.creator)`, so the chain is
-    // looked up under the FEE RECIPIENT. A creator who routes fees to a multisig - which the
-    // launch params explicitly invite - unknowingly zeroes out whoever referred them.
-    function test_finding_aFeeRecipientBreaksTheReferralChainSilently() public {
+    // THE BUG. Two different keys for the same person: `Launcher._configureHook` recorded
+    // `setReferrer(msg.sender, referrer)` - the LAUNCHING WALLET - but stored
+    // `creator: feeRecipient == 0 ? msg.sender : feeRecipient` in the pool config, and
+    // `FeeHook._routeFee` then called `credit(..., cfg.creator)`. A creator who routed fees to a
+    // multisig - which the launch params explicitly invite them to do, "a team splitter, a
+    // multisig or a cold wallet" - unknowingly zeroed out whoever referred them:
+    // `referrerOf[multisig]` was empty, the walk terminated immediately, and 100% of the platform
+    // cut went to the treasury. No revert, no event, no view showed it.
+    //
+    // MEASURED BEFORE, side by side in one world: on the control launch the referrer earned tier 0
+    // and on the `feeRecipient` launch their balance did not move by ONE WEI while the treasury's
+    // did.
+    //
+    // THE FIX: record the referral under the same key the hook looks it up by - the fee recipient.
+    // MEASURED AFTER: the two launches pay the referrer the same share, asserted as a ratio so a
+    // difference in trade size cannot hide a difference in entitlement.
+    function test_fixed_aFeeRecipientNoLongerBreaksTheReferralChain() public {
         address referrer = address(0x8EEF);
         address multisig = address(0x115516);
 
@@ -964,10 +1061,13 @@ contract ReferralAccessAuditTest is AccessAuditHarness {
         p1.referrer = referrer;
         vm.prank(creator);
         (address tokenA,) = launcher.launch(p1);
+
+        uint256 refBefore1 = refVault.owed(referrer, address(pair));
+        uint256 treaBefore1 = refVault.owed(treasury, address(pair));
         _buyAndSweep(trader, tokenA, 10e18);
-        assertGt(
-            refVault.owed(referrer, address(pair)), 0, "control: the referrer earns on a plain launch"
-        );
+        uint256 controlRef = refVault.owed(referrer, address(pair)) - refBefore1;
+        uint256 controlTrea = refVault.owed(treasury, address(pair)) - treaBefore1;
+        assertGt(controlRef, 0, "control: the referrer earns on a plain launch");
 
         // Same launch, same referrer, fees routed to a team wallet.
         Launcher.LaunchParams memory p2 = _params();
@@ -977,21 +1077,25 @@ contract ReferralAccessAuditTest is AccessAuditHarness {
         vm.prank(creator2);
         (address tokenB,) = launcher.launch(p2);
 
-        assertEq(refVault.referrerOf(creator2), referrer, "the referral WAS recorded");
+        // Recorded under the FEE RECIPIENT now, which is the key `credit` resolves.
+        assertEq(
+            refVault.referrerOf(multisig), referrer, "the referral was recorded under the wrong key"
+        );
 
         uint256 referrerBefore = refVault.owed(referrer, address(pair));
         uint256 treasuryBefore = refVault.owed(treasury, address(pair));
         _buyAndSweep(trader, tokenB, 10e18);
+        uint256 caseRef = refVault.owed(referrer, address(pair)) - referrerBefore;
+        uint256 caseTrea = refVault.owed(treasury, address(pair)) - treasuryBefore;
 
-        assertEq(
-            refVault.owed(referrer, address(pair)),
-            referrerBefore,
-            "the recorded referrer earned nothing from the launch they referred"
-        );
-        assertGt(
-            refVault.owed(treasury, address(pair)),
-            treasuryBefore,
-            "the treasury silently took their share too"
+        assertGt(caseRef, 0, "the recorded referrer STILL earns nothing from the launch");
+        // A ratio, not an absolute: the two launches are separate pools with separate price
+        // impact, so equal absolutes would be a coincidence and equal SHARES is the property.
+        assertApproxEqAbs(
+            (caseRef * 10_000) / (caseRef + caseTrea),
+            (controlRef * 10_000) / (controlRef + controlTrea),
+            2,
+            "routing fees to a multisig changed the referrer's share"
         );
     }
 

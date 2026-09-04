@@ -514,24 +514,43 @@ abstract contract EconAuditCases is EconWorld {
         assertLt(-cost, int256((notional * 320) / 10_000), "cost is the buy fee and nothing else");
     }
 
-    /// @dev And the bar can be set arbitrarily close to the open. `Launcher._validate` only
-    ///      requires `graduationThreshold > openingMarketCap`, so a creator who wants a green tick
-    ///      on day one can have it for a rounding error.
-    function test_E02b_theCheapestLegalGraduationBarIsOneWeiAboveTheOpen() public {
+    /// @dev **PARTIALLY FIXED, and the residue is the point.** The bar used to be settable one wei
+    ///      above `openingMarketCap`, which `_validate` compared against the number the creator
+    ///      TYPED. The opening tick is snapped, so the pool really opens at 100.2905 pair, and a
+    ///      100.000000000000000001 bar meant the launch was **born graduated**: measured cost to
+    ///      latch it was -0.0003 pair, a third of a basis point of the opening cap.
+    ///
+    ///      `Launcher._assertNotBornGraduated` now refuses that launch outright (asserted first
+    ///      below). What it does NOT and cannot fix is E-02 itself: the bar may still sit just
+    ///      above the REAL opening price, and latching it is still a spot-price push that costs
+    ///      only the buy fee. Graduation is a spot read, and only a TWAP or a cumulative-volume
+    ///      measure changes that.
+    function test_E02b_theCheapestLegalGraduationBarIsJustAboveTheRealOpen() public {
+        // The old configuration is now refused: the pool would open above its own bar.
+        Launcher.LaunchParams memory refused = _baseParams();
+        refused.graduationThreshold = M + 1;
+        vm.prank(creator);
+        vm.expectPartialRevert(Launcher.BornGraduated.selector);
+        launcher.launch(refused);
+
+        // The cheapest bar that IS legal sits just above the snapped opening price - and it is
+        // still latchable for the buy fee on a small push.
         Launcher.LaunchParams memory p = _baseParams();
-        p.graduationThreshold = M + 1;
+        p.graduationThreshold = M + M / 50; // 2% above the requested open, ~1.7% above the real one
         (address t, PoolKey memory k, PoolId id) = _launch(p);
         _approveTrader(t, attacker);
 
+        assertLt(hook.marketCapOf(id), p.graduationThreshold, "precondition: not born graduated");
+
         uint256 start = pair.balanceOf(attacker);
-        _buy(k, attacker, 0.01e18);
+        _buy(k, attacker, 1e18);
         hook.checkGraduation(id);
         _sell(k, attacker, IERC20(t).balanceOf(attacker));
 
         int256 cost = int256(pair.balanceOf(attacker)) - int256(start);
-        console2.log("E-02b  cost to latch a 1-wei bar    :", _p(cost));
-        assertTrue(hook.hasGraduated(id), "graduated on a 0.01 pair buy");
-        assertLt(-cost, int256(0.0004e18), "for a third of a basis point of the opening cap");
+        console2.log("E-02b  cost to latch the cheapest legal bar:", _p(cost));
+        assertTrue(hook.hasGraduated(id), "graduated on a 1 pair buy");
+        assertLt(-cost, int256(0.05e18), "for the buy fee on a one-pair push and nothing else");
     }
 
     /// @dev **THIS FINDING IS FIXED. The test is now the regression guard, not the exploit.**
@@ -873,7 +892,9 @@ abstract contract EconAuditCases is EconWorld {
     ///      raising `feeBps` only raises the attacker's own cost. The band runs one way.
     function test_E03d_aHigherFeeNowOnlyMakesTheAttackWorseForTheAttacker() public {
         console2.log("E-03d  feeBps | creatorBps | attacker profit");
-        uint16[4] memory fees = [uint16(100), 300, 600, 1000];
+        // 110, not 100: `feeBps == PLATFORM_VOLUME_BPS` is now refused outright by the platform
+        // floor (E-09), because at exactly the floor the creator and the holders receive nothing.
+        uint16[4] memory fees = [uint16(110), 300, 600, 1000];
         int256 previous = type(int256).max;
         for (uint256 i = 0; i < fees.length; ++i) {
             uint256 snap = vm.snapshotState();
@@ -1197,51 +1218,85 @@ abstract contract EconAuditCases is EconWorld {
     // E-06  maxWallet
     // ============================================================================================
 
-    /// @dev `LaunchToken._update` only checks the cap when `from == poolManager`. Wallet-to-wallet
-    ///      transfers are explicitly uncapped, which is correct for a token that must not be a
-    ///      honeypot - but it means the cap does not even bound the FINAL holding. Buy across N
-    ///      wallets, then consolidate. Measured: the marginal cost of evasion is one ERC-20
-    ///      transfer's gas per wallet.
-    function test_E06_maxWalletIsBypassedByBuyingWideAndConsolidating() public {
+    /// @notice REGRESSION GUARD. `maxWallet` now bounds the FINAL HOLDING, not just one purchase.
+    ///
+    /// @dev THE BUG. `LaunchToken._update` checked the cap only when `from == poolManager`, so
+    ///      wallet-to-wallet transfers were uncapped and the cap did not bound what anyone could
+    ///      end up owning. Buy wide, then consolidate.
+    ///
+    ///      MEASURED BEFORE, this exact scenario, both currency orderings:
+    ///
+    ///        advertised cap                : 200 bps of supply   ("2% max wallet")
+    ///        wallets used                  : 12
+    ///        final SINGLE-wallet holding   : 2,376 bps of supply (23.76% - 11.9x the cap)
+    ///        gas per extra wallet          : 243,636   (~$17 at 20 gwei)
+    ///
+    ///      MEASURED AFTER: the twelve buys still succeed (each is under the cap and the cap has
+    ///      not changed), and the FIRST consolidating transfer reverts
+    ///      `MaxWalletExceeded(attacker, 3.96e25, 2e25)`. The attacker's final holding is 0.
+    ///
+    ///      THE FIX, and the property it must not break. The check now fires on every inbound
+    ///      transfer to a non-exempt address instead of only on the pool's. **A sell can still
+    ///      never be blocked** - a sell moves tokens INTO the PoolManager, which is exempt - so
+    ///      this is not a honeypot, and that is asserted below rather than argued. The dead
+    ///      address is exempt too, or a launch with both a burn wedge and a cap would brick its
+    ///      own `sweep` once cumulative burns crossed the cap. Deliveries out of the launcher
+    ///      (the dev buy, bounded by its own stricter rules) are the one exception.
+    function test_E06_fixed_maxWalletNowBoundsTheFinalHoldingNotJustOneBuy() public {
         Launcher.LaunchParams memory p = _baseParams();
         p.maxWalletBps = 200; // "2% max wallet"
         (address t, PoolKey memory k,) = _launch(p);
         uint256 cap = LaunchToken(t).maxWallet();
 
-        // A single buy above the cap is refused - the cap does what it says on one wallet.
+        // A single buy above the cap is refused - unchanged.
         vm.expectRevert();
         _buy(k, attacker, 60e18);
 
-        // Twelve wallets, each buying just under the cap.
+        // Twelve wallets, each buying just under the cap. Still entirely legal.
         uint256 wallets = 12;
-        uint256 gasSpread;
         for (uint256 i = 0; i < wallets; ++i) {
             address w = address(uint160(0x200000 + i));
             _fund(w);
-            uint256 g = gasleft();
             _buyExactOut(k, w, (cap * 99) / 100);
-            gasSpread += g - gasleft();
+            assertGt(IERC20(t).balanceOf(w), 0, "precondition: the spread buy worked");
         }
 
-        // Consolidate. Wallet-to-wallet is free, untaxed and UNCAPPED.
-        uint256 gasConsolidate;
-        for (uint256 i = 0; i < wallets; ++i) {
-            address w = address(uint160(0x200000 + i));
-            uint256 bal = IERC20(t).balanceOf(w);
-            uint256 g = gasleft();
-            vm.prank(w);
-            IERC20(t).transfer(attacker, bal);
-            gasConsolidate += g - gasleft();
-        }
+        // Consolidating is what used to be free. The FIRST transfer over the cap now reverts.
+        address w0 = address(uint160(0x200000));
+        uint256 bal0 = IERC20(t).balanceOf(w0);
+        vm.prank(w0);
+        IERC20(t).transfer(attacker, bal0);
+        assertEq(IERC20(t).balanceOf(attacker), bal0, "the first consolidation is under the cap");
+
+        address w1 = address(uint160(0x200001));
+        uint256 bal1 = IERC20(t).balanceOf(w1);
+        assertGt(bal0 + bal1, cap, "precondition: two wallets really do exceed the cap");
+        vm.prank(w1);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LaunchToken.MaxWalletExceeded.selector, attacker, bal0 + bal1, cap
+            )
+        );
+        IERC20(t).transfer(attacker, bal1);
 
         uint256 finalHolding = IERC20(t).balanceOf(attacker);
         console2.log("E-06   advertised cap (bps supply)  :", _bpsOfSupply(cap));
         console2.log("E-06   final single-wallet holding  :", _bpsOfSupply(finalHolding));
-        console2.log("E-06   evasion gas, buy leg         :", gasSpread);
-        console2.log("E-06   evasion gas, consolidate leg :", gasConsolidate);
-        console2.log("E-06   gas per extra wallet         :", (gasSpread + gasConsolidate) / wallets);
+        assertLe(finalHolding, cap, "a wallet ended up over the advertised 'max wallet'");
 
-        assertGt(finalHolding, cap * 10, "one wallet ends up holding ten times the 'max wallet'");
+        // NOT A HONEYPOT. The whole reason the old check was narrow was that a cap which can block
+        // a sell is a trap. Every one of these wallets can still sell its entire position, and the
+        // over-cap attacker can sell theirs.
+        _approveTrader(t, attacker);
+        uint256 pairBefore = pair.balanceOf(attacker);
+        _sell(k, attacker, IERC20(t).balanceOf(attacker));
+        assertGt(pair.balanceOf(attacker) - pairBefore, 0, "SELLING WAS BLOCKED - honeypot");
+        assertEq(IERC20(t).balanceOf(attacker), 0, "the whole position could not be sold");
+
+        _approveTrader(t, w1);
+        uint256 w1PairBefore = pair.balanceOf(w1);
+        _sell(k, w1, IERC20(t).balanceOf(w1));
+        assertGt(pair.balanceOf(w1) - w1PairBefore, 0, "a capped wallet could not sell");
     }
 
     // ============================================================================================
@@ -1257,6 +1312,21 @@ abstract contract EconAuditCases is EconWorld {
     ///        2. the dev buy itself carries the spot price past the graduation bar INSIDE the
     ///           launch transaction, so the launch is born graduated - which is exactly the
     ///           outcome `GraduationThresholdTooLow` exists to prevent.
+    ///
+    /// @dev **HALF FIXED, and the half that is not is the product decision.**
+    ///
+    ///      (2) IS FIXED. `Launcher._assertNotBornGraduated` reads the pool's real market cap
+    ///      after the seed and the dev buy have both happened and refuses the launch. MEASURED:
+    ///      this configuration used to launch with `marketCapOf == 2,112.5357 pair` against a
+    ///      500 pair bar (**4.2x**), `checkGraduation` succeeding in the launch block and
+    ///      `graduationProgressBps == 10,000` before the first buyer existed. It now reverts
+    ///      `BornGraduated(500e18, 2112535799871658722160)`, asserted below.
+    ///
+    ///      (1) IS NOT FIXED AND IS NOT A DEFECT. A vested dev buy is UNCAPPED on purpose and
+    ///      `VestingVault`'s own docstring says so: the cap and the vault protect against the same
+    ///      thing by different means. The rest of this test is therefore rerun with an honest bar,
+    ///      so the 78%-supply / 10%-fee / 100%-to-creator parameter space is still measured rather
+    ///      than deleted - it is a disclosure problem for the front end, not an arithmetic one.
     function test_E07_theWorstHonestLookingLaunch() public {
         Launcher.LaunchParams memory p = _baseParams();
         p.feeBps = 1000; // the 10% ceiling
@@ -1268,6 +1338,13 @@ abstract contract EconAuditCases is EconWorld {
         p.vestDuration = 365 days;
         p.vestCliff = 30 days;
 
+        // THE FIX: the "5x to graduate" badge on a launch that opens at 21x is refused outright.
+        vm.prank(creator);
+        vm.expectPartialRevert(Launcher.BornGraduated.selector);
+        launcher.launch(p);
+
+        // Everything else about this launch is still legal, so measure it against an honest bar.
+        p.graduationThreshold = M * 50;
         (address t, PoolKey memory k, PoolId id) = _launch(p);
         address v = launcher.vaultOf(t);
         uint256 creatorHeld = IERC20(t).balanceOf(v);
@@ -1280,10 +1357,10 @@ abstract contract EconAuditCases is EconWorld {
 
         assertGt(_bpsOfSupply(creatorHeld), 7000, "the creator owns most of the supply");
 
-        // Born graduated. Anybody may latch it in the very next transaction.
-        assertGe(hook.marketCapOf(id), p.graduationThreshold, "already past the bar");
-        hook.checkGraduation(id);
-        assertTrue(hook.hasGraduated(id), "GRADUATED IN THE LAUNCH BLOCK");
+        // NOT born graduated any more, and that is the whole guard.
+        assertLt(hook.marketCapOf(id), p.graduationThreshold, "still born graduated");
+        assertFalse(hook.checkGraduation(id), "GRADUATED IN THE LAUNCH BLOCK");
+        assertLt(hook.graduationProgressBps(id), 10_000, "the UI bar is full before anyone bought");
 
         // And the creator is now the counterparty on both sides of a 10%/10% fee that pays them
         // 100% of everything after the platform's flat cut.
@@ -1317,6 +1394,11 @@ abstract contract EconAuditCases is EconWorld {
         p.devBuyPairAmount = 900e18; // 9x the opening market cap -> ~90% of supply
         p.vestDuration = 7 days;
         p.vestCliff = 0;
+        // A 9x dev buy carries the spot cap to ~9,445 pair inside the launch transaction, so the
+        // default `M * 5` bar is now refused `BornGraduated`. That is E-07's other half and it is
+        // fixed; this test is about the SEVEN-DAY FLOOR, so give it an honest bar and keep
+        // measuring the thing it exists to measure.
+        p.graduationThreshold = M * 200;
 
         (address t,,) = _launch(p);
         address v = launcher.vaultOf(t);
@@ -1336,21 +1418,48 @@ abstract contract EconAuditCases is EconWorld {
     //       legal band.
     // ============================================================================================
 
-    /// @dev `platformShareBps = PLATFORM_VOLUME_BPS * BPS / feeBps` (`FeeHook.sol:345`). At the
-    ///      minimum legal `feeBps = 100` that is exactly `BPS`, so `_routeFee` sends 100% to the
-    ///      platform and `rest` is ZERO - the creator and the holders receive nothing at all, no
-    ///      matter what `creatorBps` says. The band decays fast: at 150 bps the holders' side is
-    ///      a third of the fee, at 200 bps a half.
-    function test_E09_atTheMinimumFeeTheHoldersAndCreatorGetNothing() public {
-        console2.log("E-09   feeBps | platformShareBps | holders+creator get");
-        uint16[5] memory fees = [uint16(100), 110, 150, 200, 300];
+    /// @notice REGRESSION GUARD. The fee rate that paid the creator and the holders literally
+    ///         nothing is now refused at configuration time.
+    ///
+    /// @dev THE BUG. `platformShareBps = PLATFORM_VOLUME_BPS * BPS / feeBps` (`FeeHook.sol`). The
+    ///      floor check was `feeBps < PLATFORM_VOLUME_BPS`, so the minimum legal `feeBps = 100`
+    ///      made that expression exactly `BPS`: `_routeFee` sent 100% to the platform and `rest`
+    ///      was ZERO, no matter what `creatorBps` said.
+    ///
+    ///      MEASURED BEFORE, on a 100-pair buy with the creator advertising `creatorBps = 8000`:
+    ///
+    ///        feeBps | platform | creator | holders
+    ///           100 |   0.9950 |  0.0000 |  0.0000   <- nothing, silently, forever
+    ///           110 |   0.9949 |  0.0796 |  0.0199
+    ///           150 |   0.9949 |  0.3980 |  0.0995
+    ///           300 |   0.9949 |  1.5920 |  0.3980
+    ///
+    ///      MEASURED AFTER: `feeBps = 100` reverts `FeeBelowPlatformFloor(100)` out of
+    ///      `configurePoolFull`, so the launch never happens. Every rate that IS legal pays the
+    ///      creator and the holders something, asserted below at every point on the band.
+    ///
+    ///      The steep band above the floor is correct arithmetic and is left alone;
+    ///      `FeeHook.effectiveSplitBps` is what lets a UI show the real number before signing.
+    function test_E09_fixed_theMinimumFeeIsRejectedInsteadOfPayingHoldersNothing() public {
+        // The configuration that used to pay two of the three recipients zero no longer launches.
+        Launcher.LaunchParams memory refused = _baseParams();
+        refused.feeBps = 100;
+        refused.creatorBps = 8000;
+        vm.prank(creator);
+        vm.expectRevert(
+            abi.encodeWithSelector(FeeHook.FeeBelowPlatformFloor.selector, uint16(100))
+        );
+        launcher.launch(refused);
+
+        console2.log("E-09   feeBps | platform | creator | holders");
+        uint16[4] memory fees = [uint16(101), 110, 200, 300];
         for (uint256 i = 0; i < fees.length; ++i) {
             uint256 snap = vm.snapshotState();
 
             Launcher.LaunchParams memory p = _baseParams();
             p.feeBps = fees[i];
             p.creatorBps = 8000; // the creator ADVERTISES 80% to themselves
-            (address t, PoolKey memory k,) = _launch(p);
+            (address t, PoolKey memory k, PoolId id) = _launch(p);
             Distributor dist = LaunchToken(t).distributor();
             _approveTrader(t, bob);
 
@@ -1377,11 +1486,17 @@ abstract contract EconAuditCases is EconWorld {
                 )
             );
 
-            if (fees[i] == 100) {
-                assertEq(toCreator, 0, "at 100 bps the creator is paid nothing");
-                assertEq(toHolders, 0, "and so are the holders");
-                assertGt(toPlatform, 0, "the platform takes the entire fee");
-            }
+            // EVERY legal rate pays all three. That is the property the floor now guarantees.
+            assertGt(toPlatform, 0, "the platform was paid nothing");
+            assertGt(toCreator, 0, "the creator was paid nothing at a LEGAL fee rate");
+            assertGt(toHolders, 0, "the holders were paid nothing at a LEGAL fee rate");
+
+            // And the split is readable up front, so the steep band cannot surprise anybody.
+            (uint16 pBps, uint16 cBps, uint16 hBps) = hook.effectiveSplitBps(id);
+            assertEq(uint256(pBps) + cBps + hBps, 10_000, "the advertised split is not exhaustive");
+            assertGt(cBps, 0, "effectiveSplitBps claims the creator gets nothing");
+            assertGt(hBps, 0, "effectiveSplitBps claims holders get nothing");
+
             vm.revertToState(snap);
         }
     }

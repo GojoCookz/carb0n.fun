@@ -248,6 +248,9 @@ contract FeeHook is HookBase {
     error GraduationNotConfigured();
     error ThresholdRequired();
     error SupplyRequired();
+    /// @notice The buy was cut short by its own price limit, so the fee would have been charged on
+    ///         input the pool never spent. See `_assertExactInputBuyFilled`.
+    error PriceLimitedBuyWouldOvercharge(uint256 requested, uint256 consumed, uint256 fee);
 
     constructor(IPoolManager _poolManager, address _launcher, address _platformRecipient)
         HookBase(_poolManager)
@@ -336,9 +339,20 @@ contract FeeHook is HookBase {
         if (uint256(s.creatorBps) + s.burnBps > BPS) revert CreatorShareTooHigh(s.creatorBps);
         if (s.distributor == address(0) || s.creator == address(0)) revert ZeroAddress();
 
-        // A buy rate below the platform's own cut cannot pay it. Rejected rather than clamped: a
-        // launch that silently charges more than the creator chose is worse than one that reverts.
-        if (s.feeBps < PLATFORM_VOLUME_BPS) revert FeeBelowPlatformFloor(s.feeBps);
+        // A buy rate at or below the platform's own cut cannot pay anybody else. Rejected rather
+        // than clamped: a launch that silently charges more than the creator chose is worse than
+        // one that reverts.
+        //
+        // **The boundary is `<=`, not `<`, and that one character is a real finding.** At exactly
+        // `feeBps == PLATFORM_VOLUME_BPS` the derived `platformShareBps` below evaluates to
+        // exactly `BPS`, so `_routeFee` sends 100% of every fee to the platform and `rest` is
+        // zero. A creator picking "1% fee, 80% to holders" was configuring a launch that pays
+        // holders and creator **literally nothing**, permanently, with no revert, no clamp and no
+        // warning anywhere. Silent trimming is banned in this codebase; silently zeroing two of
+        // the three recipients is worse than trimming. `effectiveSplitBps` exists so a UI can
+        // show the real numbers on the steep part of the curve, where the arithmetic is correct
+        // but surprising.
+        if (s.feeBps <= PLATFORM_VOLUME_BPS) revert FeeBelowPlatformFloor(s.feeBps);
 
         PoolId id = key.toId();
         if (poolConfig[id].configured) revert AlreadyConfigured();
@@ -496,6 +510,33 @@ contract FeeHook is HookBase {
         return graduation[id].graduated;
     }
 
+    /// @notice What a pool's fee ACTUALLY splits into, in basis points OF THE FEE.
+    ///
+    /// @dev Exists because `creatorBps` alone is misleading and the misreading is worst exactly
+    ///      where a creator is most likely to be economising. The platform's cut is a flat share
+    ///      of VOLUME, so its share of the FEE is `PLATFORM_VOLUME_BPS / feeBps` - which is half
+    ///      the fee at 2%, a tenth at 10%, and **all of it** at 1%. A creator reading
+    ///      "creatorBps = 8000" on a 1.1% launch is looking at 80% of 9.1%.
+    ///
+    ///      Reads only stored configuration, so a front end can render the true number before the
+    ///      launch is signed rather than after the first sweep.
+    /// @return platformBps the platform's share of every fee this pool charges
+    /// @return creatorBps  the creator's share of every fee this pool charges
+    /// @return holderBps   what is left for holders
+    function effectiveSplitBps(PoolId id)
+        external
+        view
+        returns (uint16 platformBps, uint16 creatorBps, uint16 holderBps)
+    {
+        PoolConfig memory cfg = poolConfig[id];
+        if (!cfg.configured) revert NotConfigured();
+
+        platformBps = cfg.platformShareBps;
+        uint256 rest = BPS - platformBps;
+        creatorBps = uint16((rest * cfg.creatorBps) / BPS);
+        holderBps = uint16(rest - creatorBps);
+    }
+
     /// @dev Market cap = totalSupply x price, with price read off `sqrtPriceX96`.
     ///
     ///      `sqrtPriceX96 = sqrt(amount1 / amount0) * 2^96`, so the price of ONE launch token in
@@ -551,11 +592,15 @@ contract FeeHook is HookBase {
     ///      the core curve swaps: `amountToSwap += hookDeltaSpecified`, so `-1000` becomes `-970`
     ///      for a 3% fee. The trader still pays 1000; 30 never reaches the pool.
     ///
-    ///      TRADEOFF, deliberate and documented: this charges the amount the trader REQUESTED, not
-    ///      the amount the pool ultimately consumed. If a `sqrtPriceLimitX96` stops the swap early,
-    ///      the unspent input is refunded to the trader but the fee on it is not. Moving the charge
-    ///      to `afterSwap` would fix that and reintroduce the zero-fee hole this exists to close;
-    ///      the partial-fill case is rare and the overcharge is bounded by `feeBps`.
+    ///      This charges the amount the trader REQUESTED, not the amount the pool ultimately
+    ///      consumed, and it has to: on an exact-input buy the pair currency is the SPECIFIED side
+    ///      and `beforeSwap` is the only place a hook can touch it. Moving the charge to
+    ///      `afterSwap` would reintroduce the zero-fee hole this exists to close.
+    ///
+    ///      A buy cut short by its own `sqrtPriceLimitX96` would therefore pay the fee on input it
+    ///      never spent - measured at a **9,087 bps effective rate** against an advertised 300, and
+    ///      forceable by a sandwicher. `_assertExactInputBuyFilled` refuses that trade in
+    ///      `_afterSwap` rather than letting it settle at a rate nobody agreed to.
     ///      **Both directions are charged here on an exact-input swap**, because for exact input
     ///      the specified currency IS the input currency whichever way the trade runs:
     ///
@@ -632,7 +677,10 @@ contract FeeHook is HookBase {
         // swap is exact-input and `_beforeSwap` already charged it - this guard is what stops the
         // two legs double-charging the same trade.
         bool exactInput = params.amountSpecified < 0;
-        if (exactInput) return (IHooks.afterSwap.selector, 0);
+        if (exactInput) {
+            _assertExactInputBuyFilled(key, params, delta, cfg, pairIsCurrency0);
+            return (IHooks.afterSwap.selector, 0);
+        }
 
         // A buy pays the pair currency in.
         bool isBuy = params.zeroForOne == pairIsCurrency0;
@@ -654,6 +702,58 @@ contract FeeHook is HookBase {
         _tryAutoSweep(id, key, cfg);
 
         return (IHooks.afterSwap.selector, int128(uint128(fee)));
+    }
+
+    /// @dev **A price-limited exact-input BUY is refused instead of overcharged.**
+    ///
+    ///      `_beforeSwap` charges `feeBps` of the amount the trader REQUESTED, computed before the
+    ///      curve runs, because on an exact-input buy the pair currency is the SPECIFIED side and
+    ///      `beforeSwap` is the only place a hook can touch it. If `sqrtPriceLimitX96` then stops
+    ///      the swap early, the unspent input is refunded by the manager and the fee on it is not.
+    ///      The old docstring called that overcharge "bounded by `feeBps`" - true of the notional
+    ///      and false of the RATE, which is what a trader experiences. Measured on a live
+    ///      launcher-seeded pool at the configured 3%: 100 pair requested, 3.30 pair actually
+    ///      debited, 3.00 pair of fee - an effective **9,087 bps**. And it is forceable: a
+    ///      sandwicher pushes the price to one tick short of the victim's own limit and the
+    ///      victim fills for almost nothing while paying the full notional's fee.
+    ///
+    ///      **There is no refund available, and that is structural, not an oversight.** A hook's
+    ///      `afterSwap` return can only move the UNSPECIFIED currency, which on an exact-input buy
+    ///      is the launch token. Handing back launch tokens is not a refund of a pair-currency
+    ///      fee. So the only honest options are "overcharge silently" or "refuse", and this
+    ///      codebase already settled that question elsewhere: a named revert beats a silent
+    ///      half-fill.
+    ///
+    ///      Scoped to BUYS on purpose. A sell is charged in the launch token and a sell hitting
+    ///      the opening-tick floor and partially filling is a normal, documented consequence of
+    ///      single-sided seeding - `sweep`'s conversion leg depends on that partial fill being
+    ///      allowed. On a launcher-seeded pool the position runs to `maxUsableTick`, so the only
+    ///      thing that can cut a BUY short is a limit the trader set themselves.
+    function _assertExactInputBuyFilled(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta delta,
+        PoolConfig memory cfg,
+        bool pairIsCurrency0
+    ) internal pure {
+        // Only the leg that was charged in the pair currency.
+        if (params.zeroForOne != pairIsCurrency0) return;
+        if (cfg.feeBps == 0) return;
+
+        uint256 requested = uint256(-params.amountSpecified);
+        uint256 fee = (requested * cfg.feeBps) / BPS;
+        if (fee == 0) return;
+
+        // What the curve was actually handed, after `_beforeSwap` took the fee out of the input.
+        int128 inDelta = params.zeroForOne ? delta.amount0() : delta.amount1();
+        uint256 consumed = inDelta < 0 ? uint256(uint128(-inDelta)) : 0;
+
+        // A full fill consumes exactly `requested - fee`. Anything less means the trader would be
+        // charged `feeBps` of input the pool never took.
+        if (consumed + fee < requested) {
+            revert PriceLimitedBuyWouldOvercharge(requested, consumed, fee);
+        }
+        key;
     }
 
     /// @dev Opportunistic payout, attempted once the pair-currency backlog is worth the gas.

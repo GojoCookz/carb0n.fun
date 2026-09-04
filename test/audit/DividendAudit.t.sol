@@ -133,6 +133,14 @@ contract ReentrantConverter is IRewardConverter {
 /// @notice A contract that can hold the launch token and has no way to call `withdraw()`.
 contract DumbHolder {}
 
+/// @dev A contract holder that CAN make an external call - a vault, a splitter, a treasury, a
+///      staking pool. The population `Distributor.renounceAccrual` exists for.
+contract RenouncingHolder {
+    function renounce(Distributor d) external {
+        d.renounceAccrual();
+    }
+}
+
 contract DividendAuditTest is Test, LaunchTokenDeployer {
     MockERC20 internal pair;
     MockERC20 internal reward;
@@ -619,43 +627,113 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
     }
 
     // ===========================================================================================
-    // D-02  Exclusion cannot be changed after construction, so a claim held by a contract that
-    //       cannot call `withdraw()` is destroyed rather than redistributed.
+    // D-02  Exclusion USED TO be unchangeable after construction, so a claim held by a contract
+    //       that cannot call `withdraw()` was destroyed rather than redistributed.
     // ===========================================================================================
 
-    /// @dev `setExcluded` is `onlyController`, the controller is `FeeHook`, and `FeeHook` contains
-    ///      no call to it (`grep -rn setExcluded src/` finds only the definition). So the excluded
-    ///      set is frozen at construction: pool, launcher, distributor, 0x0, 0xdEaD.
-    function test_D02_aContractHolderThatCannotPullLocksItsDividendsForever() public {
+    /// @notice REGRESSION GUARD. There is now a reachable path out of the accrual set.
+    ///
+    /// @dev THE BUG. `setExcluded` is `onlyController`, the controller is `FeeHook`, and `FeeHook`
+    ///      contains no call to it (`grep -rn setExcluded src/` found only the definition). The
+    ///      excluded set was therefore frozen at construction - pool, launcher, distributor, 0x0,
+    ///      0xdEaD - and a contract holder with no way to spend the payout currency accrued
+    ///      dividends nobody could ever use. MEASURED: a `DumbHolder` accrued
+    ///      ~100e18 of a 200e18 distribution, `processBatch` delivered it, and it sat there.
+    ///
+    ///      THE FIX is `Distributor.renounceAccrual()`: permissionless, keyed on `msg.sender`, one
+    ///      way. **Not** a hook-gated third-party path, because there is no address in this system
+    ///      that can be trusted to delete somebody else's entitlement - not the creator, who
+    ///      competes with holders for the same fee, and not an admin, which this codebase
+    ///      deliberately does not have. Keyed on the caller, the authority is exactly the person
+    ///      whose money it is.
+    ///
+    ///      MEASURED AFTER, below: a holder that renounces leaves `totalShares` outright, and the
+    ///      remaining holder's rate genuinely doubles on the next distribution - the value is
+    ///      REDISTRIBUTED rather than delivered somewhere it cannot be spent.
+    ///
+    ///      **The honest residue, asserted rather than glossed:** a contract that cannot make an
+    ///      external call at all is still beyond help. Nothing on chain can distinguish it from a
+    ///      cold wallet, and no ledger can fix a holder that cannot act.
+    function test_D02_fixed_aContractHolderCanRenounceSoItsShareIsRedistributed() public {
         Distributor d = _mkDefault();
-        DumbHolder dumb = new DumbHolder();
+        RenouncingHolder holder = new RenouncingHolder();
 
-        d.setBalance(address(dumb), 1_000e18);
+        d.setBalance(address(holder), 1_000e18);
         d.setBalance(alice, 1_000e18);
         _fundAndVest(d, 200e18);
 
-        uint256 stranded = d.withdrawableOf(address(dumb));
+        uint256 aliceFirst = d.withdrawableOf(alice);
+        assertApproxEqAbs(aliceFirst, 100e18, _dust(d), "precondition: a 50/50 register");
         assertApproxEqAbs(
-            stranded, 100e18, _dust(d), "the dumb holder accrued half of the distribution"
+            d.withdrawableOf(address(holder)), 100e18, _dust(d), "precondition: the contract accrued"
         );
+        assertEq(d.totalShares(), 2_000e18, "precondition: both are in the denominator");
 
-        // Push cannot rescue it either: the transfer succeeds and the pair currency lands on a
-        // contract with no function that can ever move it again.
-        d.processBatch(10);
-        assertEq(pair.balanceOf(address(dumb)), stranded, "push did not deliver");
-        assertEq(d.withdrawableOf(address(dumb)), 0, "and the claim is settled, on paper");
-
-        // And there is no reachable way to have excluded it in the first place.
+        // The reachable exit. Nobody else can pull it for them...
         vm.prank(alice);
         vm.expectRevert(Distributor.OnlyController.selector);
-        d.setExcluded(address(dumb), true);
+        d.setExcluded(address(holder), true);
+
+        // ...but the holder itself can, and it is one way.
+        holder.renounce(d);
+        assertTrue(d.excluded(address(holder)), "the renunciation did not take");
+        assertEq(d.shareOf(address(holder)), 0, "renouncing removed no shares");
+        assertEq(d.totalShares(), 1_000e18, "renouncing did not change the denominator");
+
+        // The already-earned claim is untouched - renouncing gives away the FUTURE, not the past.
+        assertApproxEqAbs(
+            d.withdrawableOf(address(holder)),
+            100e18,
+            _dust(d),
+            "renouncing confiscated an already-earned claim"
+        );
+
+        // And the next distribution goes entirely to the remaining holder. THIS is the number the
+        // old behaviour could not produce: alice's slice doubles.
+        _fundAndVest(d, 200e18);
+        assertApproxEqAbs(
+            d.withdrawableOf(alice) - aliceFirst,
+            200e18,
+            _dust(d),
+            "the renounced share was not redistributed"
+        );
+        assertApproxEqAbs(
+            d.withdrawableOf(address(holder)),
+            100e18,
+            _dust(d),
+            "the renounced holder kept accruing"
+        );
+
+        // Renouncing twice is refused, so the toggle that would be a lever on the denominator does
+        // not exist.
+        vm.expectRevert(Distributor.AlreadyExcluded.selector);
+        holder.renounce(d);
+
+        // THE RESIDUE, stated on the record: a holder that cannot call anything is still stuck.
+        DumbHolder dumb = new DumbHolder();
+        d.setBalance(address(dumb), 1_000e18);
+        _fundAndVest(d, 200e18);
+        assertGt(d.withdrawableOf(address(dumb)), 0, "an inert contract still accrues");
     }
 
-    /// @dev The in-repo instance of the same gap. `VestingVault.renounceAccrual` is documented as
-    ///      "the locked supply's dividend claim belongs to the other holders, forever". It sets a
-    ///      flag on the vault and nothing else - the vault's shares stay in `totalShares`, so the
-    ///      other holders' per-share rate does not move by one wei. The stream is destroyed.
-    function test_D02b_vestingVaultRenounceDestroysTheStreamInsteadOfRedistributingIt() public {
+    /// @notice REGRESSION GUARD. `VestingVault.renounceAccrual` now does what it says.
+    ///
+    /// @dev THE BUG. It is documented as "the locked supply's dividend claim belongs to the other
+    ///      holders, forever". It set a flag on the vault and nothing else: the vault's shares
+    ///      stayed in `totalShares`, so the other holders' per-share rate did not move by one wei
+    ///      and the renounced stream was DESTROYED rather than redistributed. Worse, `processBatch`
+    ///      kept pushing real pair currency into a vault whose only exit now reverted
+    ///      `AlreadyRenounced`, so the money was stranded on top of being lost.
+    ///
+    ///      MEASURED BEFORE, on the scenario below - vault and alice each holding 1,000e18, two
+    ///      200e18 distributions: after renouncing, `shareOf(vault) == 1000e18`,
+    ///      `totalShares == 2000e18`, alice's second slice was **100e18** (unchanged), the vault
+    ///      accrued a second 100e18 it could never claim, and a `processBatch` pushed real pair
+    ///      currency into it.
+    ///
+    ///      MEASURED AFTER: `shareOf(vault) == 0`, `totalShares == 1000e18`, alice's second slice
+    ///      is **200e18**, and a push moves nothing into the vault because it is owed nothing.
+    function test_D02b_fixed_vestingVaultRenounceRedistributesTheStream() public {
         Distributor d = _mkDefault();
         address creator = address(0xC12EA702);
         VestingVault vault = new VestingVault(address(this), address(d), creator);
@@ -666,37 +744,53 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         _fundAndVest(d, 200e18);
         uint256 aliceBefore = d.withdrawableOf(alice);
         assertGt(aliceBefore, 0, "precondition: a real stream exists to be renounced out of");
+        assertEq(d.totalShares(), 2_000e18, "precondition: both are in the denominator");
+
+        uint256 vaultOwedAtRenounce = d.withdrawableOf(address(vault));
+        assertGt(vaultOwedAtRenounce, 0, "precondition: the vault has already earned something");
+        uint256 creatorPairBefore = pair.balanceOf(creator);
 
         vm.prank(creator);
         vault.renounceAccrual();
 
-        // Nothing moved on the ledger.
-        assertEq(d.shareOf(address(vault)), 1_000e18, "renouncing removed no shares");
-        assertEq(d.totalShares(), 2_000e18, "renouncing did not change the denominator");
+        // The ledger moved, which is the whole finding.
+        assertEq(d.shareOf(address(vault)), 0, "renouncing removed no shares");
+        assertEq(d.totalShares(), 1_000e18, "renouncing did not change the denominator");
+        assertTrue(d.excluded(address(vault)), "the vault still accrues");
 
-        // So the next distribution still cuts the vault in, and alice's rate is unchanged.
+        // And what was ALREADY earned before the signal was paid out on the way through, so the
+        // one-way exit leaves nothing stranded behind it.
+        assertEq(
+            pair.balanceOf(creator) - creatorPairBefore,
+            vaultOwedAtRenounce,
+            "the already-earned claim was stranded by renouncing"
+        );
+        assertEq(pair.balanceOf(address(vault)), 0, "payout currency left sitting in the vault");
+        assertEq(d.withdrawableOf(address(vault)), 0, "the vault is still owed something");
+
+        // The next distribution goes entirely to alice: 200e18, not 100e18.
         _fundAndVest(d, 200e18);
         assertApproxEqAbs(
             d.withdrawableOf(alice) - aliceBefore,
-            100e18,
+            200e18,
             _dust(d),
-            "alice received a renounced holder's share - she did not"
+            "alice did not receive the renounced holder's share"
         );
-        assertGt(d.withdrawableOf(address(vault)), 0, "the vault kept accruing after renouncing");
+        assertEq(d.withdrawableOf(address(vault)), 0, "the vault kept accruing after renouncing");
 
-        // And the vault's only exit is now closed.
+        // The vault's own exit is still closed by design - renunciation is one way, for everyone.
         vm.prank(creator);
         vm.expectRevert(VestingVault.AlreadyRenounced.selector);
         vault.claimDividends();
 
-        // Push still delivers real pair currency into the vault, where it is unrecoverable: the
-        // vault's ONLY payout-token transfer sits inside `claimDividends`, which now reverts.
+        // And a push no longer strands anything in it, because there is nothing left to push.
+        uint256 vaultPairBefore = pair.balanceOf(address(vault));
         d.processBatch(10);
-        assertGt(pair.balanceOf(address(vault)), 0, "pair currency was pushed into a sealed vault");
-
-        vm.prank(creator);
-        vm.expectRevert(VestingVault.AlreadyRenounced.selector);
-        vault.claimDividends();
+        assertEq(
+            pair.balanceOf(address(vault)),
+            vaultPairBefore,
+            "pair currency was pushed into a sealed vault"
+        );
     }
 
     // ===========================================================================================
@@ -760,32 +854,49 @@ contract DividendAuditTest is Test, LaunchTokenDeployer {
         assertGt(pair.balanceOf(alice) - aliceBefore, 0, "pull must always work");
     }
 
-    /// @dev `processBatch` is documented at Distributor.sol:15-16 as something "the hook calls
-    ///      opportunistically after a swap". Nothing in `src/` calls it - `FeeHook` only ever calls
-    ///      `distribute` (FeeHook.sol:909). The push path is entirely volunteer-funded.
-    function test_D03c_nothingInTheSystemEverCallsProcessBatch() public {
-        // Documented here rather than asserted: the claim is about the absence of a call site.
-        // `grep -rn "processBatch" src/` returns only Distributor.sol's own definition and
-        // docstring. This test pins the consequence: a queued holder owed money stays owed until
-        // somebody volunteers gas.
-        //
-        //      Streaming makes this WORSE, not better. `distribute` has exactly one call site in
-        //      `src/` - FeeHook.sol:909, inside the sweep - so if the hook ever did call
-        //      `processBatch` "opportunistically after a swap" it would call it in the same
-        //      transaction as the sweep, where `withdrawableOf` is zero for every holder by
-        //      construction. Any future wiring has to DELAY the push, not fold it into the trade.
+    /// @notice REGRESSION GUARD for the DOCUMENTATION, which was the defect.
+    ///
+    /// @dev THE BUG was a false statement, not false arithmetic. `Distributor`'s docblock claimed
+    ///      `processBatch` was something "the hook calls opportunistically after a swap". Nothing
+    ///      in `src/` has ever called it - `FeeHook` only ever calls `distribute`, inside the
+    ///      sweep - so an integrator reading the contract would have built on a push that does not
+    ///      exist, and a keeper operator would not have known the job was theirs.
+    ///
+    ///      **WIRING IT IN WOULD HAVE BEEN WORSE THAN THE DOCSTRING.** `distribute` has exactly
+    ///      one call site, inside `sweep`, and `distribute` arms a 24-hour linear vest. A push in
+    ///      that same transaction finds `withdrawableOf == 0` for every holder in the queue, walks
+    ///      the whole thing, pays nobody, and charges the swapper for it. That is asserted below,
+    ///      because it is the reason the fix is a corrected docstring and a `flush()`-style
+    ///      keeper model rather than a call site: any future wiring has to DELAY the push.
+    ///
+    ///      AFTER: the docblock says permissionless and keeper-driven, states why folding it into
+    ///      the trade is wrong, and this test pins both halves - the same-block push really is a
+    ///      no-op walk, and a keeper one window later really does pay.
+    function test_D03c_fixed_thePushPathIsKeeperDrivenAndAKeeperCanActuallyPay() public {
         Distributor d = _mkDefault();
         d.setBalance(alice, 1_000e18);
         _fund(d, 100e18);
 
-        // Nobody is owed anything in the block the fee lands - that is the streaming defence.
+        // Nobody is owed anything in the block the fee lands - that is the streaming defence, and
+        // it is exactly why the hook must NOT call this from inside the sweep.
         assertEq(d.withdrawableOf(alice), 0, "a same-block push would have nothing to pay");
-        (uint256 sentNow,) = d.processBatch(10);
+        (uint256 sentNow, uint256 movedNow) = d.processBatch(10);
         assertEq(sentNow, 0, "a same-block push is a guaranteed no-op walk");
+        assertEq(movedNow, 0, "and it moved money it should not have been able to move");
 
-        // A window later she is owed, and still nothing on chain will move it.
+        // A window later she is owed, and the documented keeper path really does deliver it.
         _vest(d);
-        assertGt(d.withdrawableOf(alice), 0, "owed, and nothing on-chain will push it");
+        uint256 owed = d.withdrawableOf(alice);
+        assertGt(owed, 0, "precondition: there is a real claim for the keeper to move");
+
+        uint256 aliceBefore = pair.balanceOf(alice);
+        vm.prank(bob); // any address at all: the push is permissionless
+        (uint256 sent, uint256 moved) = d.processBatch(10);
+
+        assertEq(sent, 1, "the keeper walked the queue and paid nobody");
+        assertEq(moved, owed, "the keeper moved something other than what was owed");
+        assertEq(pair.balanceOf(alice) - aliceBefore, owed, "the money never reached the holder");
+        assertEq(d.withdrawableOf(alice), 0, "and the claim was not settled by paying it");
     }
 
     // ===========================================================================================

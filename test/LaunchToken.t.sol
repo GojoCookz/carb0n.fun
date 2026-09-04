@@ -123,17 +123,39 @@ contract LaunchTokenTest is Test, LaunchTokenDeployer {
         assertEq(token.balanceOf(alice), 0, "sell must always be allowed");
     }
 
-    /// @dev Wallet-to-wallet is not a buy and must not be capped, even past the cap.
-    function test_walletToWalletIsNotCapped() public {
+    /// @notice REGRESSION GUARD for audit-05 E-06. Wallet-to-wallet IS capped now, because
+    ///         otherwise the cap bounded a purchase and not a holding.
+    ///
+    /// @dev BEFORE: `_update` checked the cap only when `from == poolManager`, so this test
+    ///      asserted `balanceOf(alice) == MAX_WALLET * 2`. On a live pool that meant buying across
+    ///      twelve wallets and consolidating gave one address **2,376 bps of supply against an
+    ///      advertised 200 bps cap** - 11.9x - for about $200 of gas.
+    ///
+    ///      AFTER: the consolidating transfer reverts `MaxWalletExceeded`. `test_sellIsNeverBlocked`
+    ///      immediately above is the property this must not cost, and it does not: a sell moves
+    ///      tokens INTO the PoolManager, which is exempt.
+    function test_walletToWalletIsCappedToo() public {
         vm.prank(poolManager);
         token.transfer(alice, MAX_WALLET);
         vm.prank(poolManager);
         token.transfer(bob, MAX_WALLET);
 
         vm.prank(bob);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LaunchToken.MaxWalletExceeded.selector, alice, MAX_WALLET * 2, MAX_WALLET
+            )
+        );
         token.transfer(alice, MAX_WALLET);
 
-        assertEq(token.balanceOf(alice), MAX_WALLET * 2, "p2p transfers are not buys");
+        assertEq(token.balanceOf(alice), MAX_WALLET, "the consolidation went through anyway");
+
+        // Under the cap it is still an ordinary free transfer - the cap bounds the holding, it
+        // does not make peer-to-peer movement special.
+        address dave = address(0xDA7E);
+        vm.prank(alice);
+        token.transfer(dave, MAX_WALLET / 2);
+        assertEq(token.balanceOf(dave), MAX_WALLET / 2, "a legal p2p transfer was blocked");
     }
 
     function test_exemptAddressesBypassCap() public view {

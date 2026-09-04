@@ -38,9 +38,11 @@ import {LaunchMetadata} from "./types/LaunchMetadata.sol";
 ///         the fee by avoiding this contract. This is the single most important structural choice
 ///         inherited from the BaseStonk design and it is why the token stays this simple.
 ///
-///      4. **Max wallet caps BUYS only.** The check fires only when tokens move OUT of the pool.
-///         Selling is never blocked, wallet-to-wallet is never blocked. A cap that can block a sell
-///         is a honeypot, and the difference is one condition.
+///      4. **Max wallet caps a HOLDING, and never a sell.** Every inbound transfer to a
+///         non-exempt address is checked, so the cap bounds what an address can end up owning
+///         rather than only what it can buy in one go. A sell moves tokens into the PoolManager,
+///         which is exempt, so selling can never be blocked - that is the property that keeps a
+///         cap from being a honeypot, and it is preserved exactly.
 contract LaunchToken is ERC20 {
     /// @notice The dividend ledger for this token, deployed alongside it in `initialize`.
     Distributor public distributor;
@@ -58,6 +60,15 @@ contract LaunchToken is ERC20 {
 
     /// @notice Addresses the max-wallet cap does not apply to (pool, launcher, hook, treasury).
     mapping(address account => bool) public exemptFromMaxWallet;
+
+    /// @notice The launcher. Deliveries FROM it are the only uncapped inbound transfer.
+    ///
+    /// @dev The dev buy reaches the creator (or their vesting vault) as a wallet-to-wallet
+    ///      transfer out of the launcher inside the launch transaction. It is bounded by its own,
+    ///      stricter rules - `MAX_DEV_BUY_BPS` on the unvested path, a published schedule on the
+    ///      vested one - so applying the wallet cap to it as well would simply make a legal dev
+    ///      buy revert the launch. Read only when a cap is actually configured.
+    address public launchConduit;
 
     string private _tokenName;
     string private _tokenSymbol;
@@ -147,6 +158,10 @@ contract LaunchToken is ERC20 {
         exemptFromMaxWallet[p.controller] = true;
         exemptFromMaxWallet[address(this)] = true;
         exemptFromMaxWallet[address(distributor)] = true;
+        // The buyback sends bought-back supply here. Left capped, a launch with a burn wedge and
+        // a max wallet would brick its own `sweep` the moment cumulative burns crossed the cap.
+        exemptFromMaxWallet[address(0xdEaD)] = true;
+        launchConduit = p.recipient;
 
         _mint(p.recipient, p.supply);
     }
@@ -168,8 +183,19 @@ contract LaunchToken is ERC20 {
     ///      after `super._update` rather than before. Updating with stale balances silently
     ///      misallocates every dividend from that point forward.
     function _update(address from, address to, uint256 value) internal override {
-        // A buy is tokens leaving the pool. Mints (from == 0) are the initial supply, not buys.
-        if (maxWallet != 0 && from == poolManager && !exemptFromMaxWallet[to]) {
+        // **The cap bounds a HOLDING, not a purchase.** It used to fire only on `from ==
+        // poolManager`, which capped one buy and nothing else - so wallet-to-wallet moves were
+        // uncapped and the cap did not bound the final holding at all. Buy wide, then
+        // consolidate: 12 wallets reached **2,376 bps of supply against an advertised 200 bps
+        // cap**, 11.9x, for about $200 of gas at 20 gwei. As a claim about who owns the token
+        // that was theatre, and the token page presented it as a concentration guarantee.
+        //
+        // Capping every INBOUND transfer instead of only the pool's is what closes it, and it
+        // does NOT turn the cap into a honeypot - the property that matters is that a SELL can
+        // never be blocked, and a sell moves tokens INTO the PoolManager, which is exempt.
+        // Mints go to the launcher, also exempt. Deliveries out of the launcher (the dev buy,
+        // bounded by its own rules) are the one exception, see `launchConduit`.
+        if (maxWallet != 0 && !exemptFromMaxWallet[to] && from != launchConduit) {
             uint256 resulting = balanceOf(to) + value;
             if (resulting > maxWallet) revert MaxWalletExceeded(to, resulting, maxWallet);
         }

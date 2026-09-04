@@ -585,16 +585,36 @@ abstract contract HookAuditCases is HookAuditWorld {
     // V-03  A price-limited exact-input buy pays the full fee on input it never spent.
     // -------------------------------------------------------------------------------------------
 
-    /// @dev `_beforeSwap` charges `feeBps` of `-params.amountSpecified` (FeeHook.sol:591-592) - the
-    ///      amount REQUESTED, before the curve has run. The docstring at FeeHook.sol:550-554 calls
-    ///      the resulting overcharge "bounded by `feeBps`", which is true of the notional and false
-    ///      of the rate: the trader is charged `feeBps` of the whole request while the pool executes
-    ///      an arbitrarily small part of it, so the fee on EXECUTED volume is unbounded.
+    /// @notice REGRESSION GUARD. The trade that used to settle at a 9,087 bps effective fee is
+    ///         now refused by name.
     ///
-    ///      It is not only self-inflicted. A sandwicher who pushes the price to a victim's
-    ///      `sqrtPriceLimitX96` makes the victim's swap fill for almost nothing and still pay
-    ///      `feeBps` of the full notional.
-    function test_V03_priceLimitedBuyPaysTheFullFeeOnUnspentInput() public {
+    /// @dev THE BUG. `_beforeSwap` charges `feeBps` of `-params.amountSpecified` - the amount
+    ///      REQUESTED, before the curve has run, because on an exact-input buy the pair currency
+    ///      is the SPECIFIED side and `beforeSwap` is the only place a hook can touch it. If
+    ///      `sqrtPriceLimitX96` stopped the swap early, the unspent input came back and the fee on
+    ///      it did not. The docstring called that "bounded by `feeBps`" - true of the notional,
+    ///      false of the RATE, and the rate is what a trader experiences. And it was forceable:
+    ///      a sandwicher pushes the price to one tick short of the victim's own limit and the
+    ///      victim fills for almost nothing while paying the full notional's fee.
+    ///
+    ///      MEASURED BEFORE, on this exact scenario, both currency orderings:
+    ///
+    ///        requested input   : 100.000000000000000000 pair
+    ///        actually debited  :   3.301308354505875602 pair
+    ///        fee charged       :   3.000000000000000000 pair
+    ///        effective rate    : 9,087 bps   (30x the advertised 300)
+    ///
+    ///      MEASURED AFTER: the same call reverts `PriceLimitedBuyWouldOvercharge(100e18,
+    ///      consumed, 3e18)` and nothing settles. `spent == 0`, `pendingFees` does not move.
+    ///
+    ///      THE FIX, and why it is a refusal rather than a refund. A hook's `afterSwap` return can
+    ///      only move the UNSPECIFIED currency, which on an exact-input buy is the launch token.
+    ///      Handing back launch tokens is not a refund of a pair-currency fee, so there is no
+    ///      refund available at all - the choice is "overcharge silently" or "refuse", and this
+    ///      codebase has already settled that question (`ZapRouter.IntermediateLegDidNotNet`).
+    ///      A trader who wanted a partial fill asks for a smaller amount; a trader who set the
+    ///      limit as slippage protection gets exactly what slippage protection means.
+    function test_V03_fixed_aPriceLimitedBuyIsRefusedRatherThanOvercharged() public {
         (, PoolKey memory k, PoolId id) = _defaultLaunch();
 
         // Leave the swap exactly one tick-spacing of room before its own limit binds.
@@ -604,8 +624,10 @@ abstract contract HookAuditCases is HookAuditWorld {
 
         uint256 requested = 100e18;
         uint256 before = pair.balanceOf(alice);
+        uint256 feesBefore = hook.pendingFees(id);
 
         vm.prank(alice);
+        vm.expectRevert();
         swapRouter.swap(
             k,
             SwapParams({
@@ -617,19 +639,72 @@ abstract contract HookAuditCases is HookAuditWorld {
             ""
         );
 
+        assertEq(pair.balanceOf(alice), before, "the trader was debited by a refused trade");
+        assertEq(hook.pendingFees(id), feesBefore, "a refused trade still accrued a fee");
+
+        // POSITIVE CONTROL, and it is what stops this being a test that would pass on a hook that
+        // rejected every buy: the SAME size with the same limit, once the pool has room for it,
+        // fills completely and is charged exactly the advertised 300 bps of what was requested.
+        uint160 wideLimit =
+            _buyIsZeroForOne() ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        vm.prank(alice);
+        swapRouter.swap(
+            k,
+            SwapParams({
+                zeroForOne: _buyIsZeroForOne(),
+                amountSpecified: -int256(requested),
+                sqrtPriceLimitX96: wideLimit
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
         uint256 spent = before - pair.balanceOf(alice);
-        uint256 fee = hook.pendingFees(id);
+        uint256 fee = hook.pendingFees(id) - feesBefore;
+        emit log_named_uint("control: debited  ", spent);
+        emit log_named_uint("control: fee      ", fee);
+        assertEq(spent, requested, "an unconstrained buy spends the whole request");
+        assertEq(fee, (requested * 300) / 10_000, "and pays exactly the advertised rate");
+        assertEq((fee * 10_000) / spent, 300, "effective rate == advertised rate");
+    }
 
-        emit log_named_uint("requested input   ", requested);
-        emit log_named_uint("actually debited  ", spent);
-        emit log_named_uint("fee charged       ", fee);
+    /// @dev The other half of the property: a SELL cut short by the opening-tick floor must still
+    ///      partially fill. The refusal above is scoped to the leg charged in the pair currency,
+    ///      because `sweep`'s sell-fee conversion and the F-05 self-healing deferral both depend on
+    ///      a sell being allowed to fill only as far as the pool's pair side reaches.
+    function test_V03b_sound_aPriceLimitedSellStillPartiallyFills() public {
+        Launcher.LaunchParams memory p = _baseParams();
+        p.sellFeeBps = 1000;
+        (address t, PoolKey memory k, PoolId id) = _launch(p);
 
-        assertEq(fee, (requested * 300) / 10_000, "fee is feeBps of the REQUESTED amount");
-        assertLt(spent, requested, "but most of the request was never spent");
-        // Effective rate on what the trader actually parted with, versus the advertised 3%.
-        uint256 effectiveBps = (fee * 10_000) / spent;
-        emit log_named_uint("effective fee bps ", effectiveBps);
-        assertGt(effectiveBps, 300 * 3, "the trader paid over 3x the advertised rate");
+        // Build a position and put real pair currency in the pool for it to sell into.
+        _buyExactIn(k, alice, 50e18);
+        _buyExactIn(k, bob, 50e18);
+        uint256 held = IERC20(t).balanceOf(alice);
+        assertGt(held, 0, "precondition: alice holds something to sell");
+
+        // The mirror of the buy above: one tick-spacing of room before the sell's own limit binds.
+        int24 t0 = _tick(id);
+        int24 limitTick = _buyIsZeroForOne() ? t0 + TICK_SPACING : t0 - TICK_SPACING;
+
+        uint256 pairBefore = pair.balanceOf(alice);
+        uint256 tokenBefore = IERC20(t).balanceOf(alice);
+
+        vm.prank(alice);
+        swapRouter.swap(
+            k,
+            SwapParams({
+                zeroForOne: !_buyIsZeroForOne(),
+                amountSpecified: -int256(held),
+                sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(limitTick)
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        uint256 sold = tokenBefore - IERC20(t).balanceOf(alice);
+        assertGt(pair.balanceOf(alice) - pairBefore, 0, "the sell did not fill at all");
+        assertLt(sold, held, "the sell was NOT cut short, so this proves nothing");
     }
 
     // -------------------------------------------------------------------------------------------
@@ -826,7 +901,10 @@ abstract contract HookAuditCases is HookAuditWorld {
     function test_sound_aFailedAutoSweepNeverBreaksTheTrade() public {
         Launcher.LaunchParams memory p = _baseParams();
         // A very low bar, so the auto path is attempted on the first trade the pool ever sees.
-        p.graduationThreshold = OPENING_MCAP + 1;
+        // `OPENING_MCAP + 1` no longer launches: the opening tick is SNAPPED, so the pool really
+        // opens at 100.290561036899339019 and a bar below that is now refused `BornGraduated`.
+        // One percent up is still ~0.1 pair of `autoSweepThreshold`, i.e. the same test.
+        p.graduationThreshold = OPENING_MCAP + OPENING_MCAP / 100;
         (, PoolKey memory k, PoolId id) = _launch(p);
 
         assertEq(pair.balanceOf(address(manager)), 0, "the pool opens holding zero pair currency");

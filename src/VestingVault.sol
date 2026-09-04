@@ -58,6 +58,13 @@ contract VestingVault {
     address public immutable token;
     /// @notice The launch's dividend ledger, so the vault can claim what its locked supply earns.
     address public immutable distributor;
+    /// @notice Whoever deployed this vault - the `Launcher`, in every real launch.
+    ///
+    /// @dev Captured from `msg.sender` in the constructor rather than passed in, because the
+    ///      launcher creates the vault mid-`launch` and there is no other candidate. It exists
+    ///      solely so `addSchedule` can accept the launch's own opening lock without also
+    ///      accepting a stranger's.
+    address public immutable launcher;
 
     /// @notice Who receives the tokens as they vest. Transferable - a project outliving the
     ///         wallet that founded it is a normal thing to want.
@@ -82,6 +89,9 @@ contract VestingVault {
     error TooManySchedules();
     error NothingToRelease();
     error AlreadyRenounced();
+    error OnlyLauncherOrBeneficiary();
+    error StartInTheFuture(uint64 given, uint64 now_);
+    error AmountExceedsUnscheduled(uint256 given, uint256 available);
 
     modifier onlyBeneficiary() {
         if (msg.sender != beneficiary) revert OnlyBeneficiary();
@@ -93,6 +103,7 @@ contract VestingVault {
         token = _token;
         distributor = _distributor;
         beneficiary = _beneficiary;
+        launcher = msg.sender;
     }
 
     // -------------------------------------------------------------------------------------------
@@ -100,10 +111,35 @@ contract VestingVault {
     // -------------------------------------------------------------------------------------------
 
     /// @notice Record a schedule over tokens this vault already holds.
-    /// @dev Permissionless on purpose. The launcher calls it during the launch transaction, before
-    ///      a beneficiary could possibly front-run anything, and adding a schedule only ever
-    ///      restricts tokens that are already here. Nothing can be scheduled that was not sent.
+    ///
+    /// @dev **The launcher or the beneficiary, and `start` may not be in the future.** This used
+    ///      to be fully permissionless with an unbounded caller-chosen `start`, justified by "the
+    ///      launcher calls it during the launch transaction, before a beneficiary could possibly
+    ///      front-run anything". That is true of the launch and of nothing else: the contract also
+    ///      advertises top-ups, and every top-up after the launch is transfer-then-schedule with
+    ///      an open window in between. Two abuses lived in that window, both measured:
+    ///
+    ///        - **Permanent lock.** A stranger front-ran a 1,000-token top-up with
+    ///          `start = now + 100 years`. Fifty years later it had not begun to vest, and
+    ///          nothing could undo it - `extend` takes only `cliff` and `duration` and refuses to
+    ///          shorten either, so `start` is unreachable once written.
+    ///        - **Slot exhaustion.** 31 schedules over 1 wei each filled `MAX_SCHEDULES`, and the
+    ///          beneficiary could never lock anything again. Cost: 31 wei plus gas.
+    ///
+    ///      `start <= block.timestamp` is what closes the first one for good. A lock that should
+    ///      begin later is expressed as a CLIFF, which `extend` can lengthen and which is visible
+    ///      in `scheduleAt`, rather than as a start date nothing can ever move.
+    ///
+    ///      **Over-large amounts revert rather than trim.** Silent trimming is banned across this
+    ///      codebase (`Launcher` reverts `DevBuyTooLarge` rather than clamping a dev buy) and this
+    ///      was the one place it was not applied: asking to lock more than is present produced a
+    ///      schedule for a different number, with no revert and only a well-formed event to notice
+    ///      it by.
     function addSchedule(uint128 amount, uint64 start, uint64 cliff, uint64 duration) external {
+        if (msg.sender != launcher && msg.sender != beneficiary) {
+            revert OnlyLauncherOrBeneficiary();
+        }
+        if (start > block.timestamp) revert StartInTheFuture(start, uint64(block.timestamp));
         if (duration < MIN_DURATION) revert DurationTooShort();
         if (cliff > duration) revert CliffExceedsDuration();
         if (_schedules.length >= MAX_SCHEDULES) revert TooManySchedules();
@@ -111,7 +147,7 @@ contract VestingVault {
         // Never schedule more than is actually here, or `release` would promise tokens the vault
         // cannot pay and the last beneficiary out would eat the shortfall.
         uint256 unscheduled = IERC20(token).balanceOf(address(this)) - _totalUnreleased();
-        if (amount > unscheduled) amount = uint128(unscheduled);
+        if (amount > unscheduled) revert AmountExceedsUnscheduled(amount, unscheduled);
         if (amount == 0) revert NothingToRelease();
 
         _schedules.push(
@@ -229,9 +265,37 @@ contract VestingVault {
     /// @dev There is no un-renounce, not for the beneficiary and not for the platform. A founder
     ///      who wants to signal that their locked bag will not keep earning has to be able to make
     ///      that irreversible, or it is not a signal.
+    ///
+    /// @dev **It now does what it says.** The previous version set this flag and nothing else: the
+    ///      vault's shares stayed in `totalShares`, so the other holders' per-share rate did not
+    ///      move by one wei and the renounced stream was DESTROYED rather than redistributed -
+    ///      the exact opposite of the sentence above it. Worse, `processBatch` kept pushing real
+    ///      pair currency into a vault whose only exit (`claimDividends`) now reverted
+    ///      `AlreadyRenounced`, so the money was stranded on top of being lost.
+    ///
+    ///      `Distributor.renounceAccrual` is the reachable, self-only, one-way exclusion that
+    ///      makes the promise true: the vault's shares leave the denominator, everybody else's
+    ///      rate genuinely rises, and nothing is ever pushed here again.
+    ///      **What has ALREADY been earned is paid out first, and that is not generosity - it is
+    ///      the only way to leave no residue.** Renouncing removes the vault's shares but not its
+    ///      outstanding claim, and after renouncing `claimDividends` reverts `AlreadyRenounced`
+    ///      forever, so anything still owed at that instant would be stranded on the distributor
+    ///      with no path out. The signal is about the FUTURE; the past is settled on the way
+    ///      through.
     function renounceAccrual() external onlyBeneficiary {
         if (accrualRenounced) revert AlreadyRenounced();
         accrualRenounced = true;
+
+        if (distributor != address(0)) {
+            Distributor d = Distributor(distributor);
+            address payout = d.payoutToken();
+            if (d.withdrawableOf(address(this)) != 0) d.withdraw();
+            _forward(payout);
+            address reward = d.rewardToken();
+            if (reward != payout) _forward(reward);
+            d.renounceAccrual();
+        }
+
         emit AccrualRenounced();
     }
 

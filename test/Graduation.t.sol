@@ -394,16 +394,44 @@ abstract contract GraduationHarness is Test {
         launcher.launch(p);
     }
 
-    /// @dev One wei above the opening is legal. How far above the bar sits is the creator's call.
-    function test_aThresholdOneWeiAboveTheOpeningIsAccepted() public {
+    /// @notice REGRESSION GUARD for audit-05 E-07. The bar is now measured against the price the
+    ///         pool ACTUALLY opens at, not against the number the creator typed.
+    ///
+    /// @dev BEFORE: `_validate` compared `graduationThreshold` to `openingMarketCap` and nothing
+    ///      else, so `OPENING_MCAP + 1` was accepted - even though `_openingTick` SNAPS the
+    ///      opening price up to a usable tick and the pool therefore really opens at
+    ///      **100.290561036899339019 pair** against a 100.000000000000000001 bar. The launch was
+    ///      born graduated: `checkGraduation` succeeded in the launch block and
+    ///      `graduationProgressBps` returned a full 10,000 before the first buyer existed.
+    ///
+    ///      AFTER: `Launcher._assertNotBornGraduated` reads `marketCapOf` once the pool is open
+    ///      and seeded and reverts `BornGraduated(threshold, marketCapAtLaunch)`. It uses the same
+    ///      function the latch itself uses, so there is no second model to keep in sync.
+    ///
+    ///      **How far above the open the bar sits is still entirely the creator's call** - the
+    ///      companion assertion below launches one percent up and it is accepted.
+    function test_aThresholdBelowTheRealOpeningPriceIsRefused() public {
         Launcher.LaunchParams memory p = _params();
         p.graduationThreshold = OPENING_MCAP + 1;
+
+        vm.prank(creator);
+        vm.expectPartialRevert(Launcher.BornGraduated.selector);
+        launcher.launch(p);
+    }
+
+    /// The other half: a bar above the price the pool really opens at is accepted, and the launch
+    /// is genuinely NOT graduated in its own block.
+    function test_aThresholdJustAboveTheRealOpeningPriceIsAccepted() public {
+        Launcher.LaunchParams memory p = _params();
+        p.graduationThreshold = OPENING_MCAP + OPENING_MCAP / 100;
 
         vm.prank(creator);
         (, PoolId id) = launcher.launch(p);
 
         (uint256 threshold,,,,,) = hook.graduation(id);
-        assertEq(threshold, OPENING_MCAP + 1);
+        assertEq(threshold, OPENING_MCAP + OPENING_MCAP / 100);
+        assertLt(hook.marketCapOf(id), threshold, "the pool opened below its own bar");
+        assertFalse(hook.checkGraduation(id), "and it is not graduated in the launch block");
     }
 
     // ===========================================================================================

@@ -264,6 +264,8 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     error DevBuyTooLarge(uint256 given, uint256 cap);
     error MaxWalletTooSmall(uint16 given);
     error GraduationThresholdTooLow(uint256 given, uint256 openingMarketCap);
+    /// @notice The pool opened at or above its own graduation bar. See `_assertNotBornGraduated`.
+    error BornGraduated(uint256 threshold, uint256 marketCapAtLaunch);
     error VestRequiresDevBuy();
     error VestTooShort(uint64 given);
     error VestCliffExceedsDuration();
@@ -392,10 +394,13 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
             )
         );
 
-        // 6. Nothing may be left here. Asserted on chain, not just in a test - if a rounding change
+        // 7. Nothing may be left here. Asserted on chain, not just in a test - if a rounding change
         //    or a hostile pair currency ever strands value on this contract there is no sweep
         //    function to recover it, so the launch must fail loudly instead.
         _assertHoldsNothing(token, p.pair);
+
+        // 8. And the launch must not already be over. See `_assertNotBornGraduated`.
+        _assertNotBornGraduated(poolId, p.graduationThreshold);
 
         launches.push(
             LaunchRecord({
@@ -435,6 +440,18 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     ///      is 17 fields and `launch` already holds the key, the token, the ordering flag and the
     ///      dev buy; inlining these two calls pushes it past what even via-ir can allocate.
     function _configureHook(PoolKey memory key, LaunchParams memory p, address token) internal {
+        // Zero means "pay me where I stand". Anything else is a deliberate choice of a team
+        // wallet, splitter or multisig, and it is fixed from this transaction on.
+        //
+        // **Hoisted into a local because the referral has to be recorded under the SAME key the
+        // hook will look it up by.** It used to be recorded under `msg.sender` and looked up under
+        // `cfg.creator`, so any creator who routed fees to a multisig - which these params
+        // explicitly invite them to do - silently zeroed out whoever referred them:
+        // `referrerOf[multisig]` was empty, the tier walk terminated immediately, and 100% of the
+        // platform cut went to the treasury. No revert, no event, no view showed the mismatch;
+        // the referrer's only symptom was a number that never grew.
+        address feeRecipient = p.feeRecipient == address(0) ? msg.sender : p.feeRecipient;
+
         feeHook.configurePoolFull(
             key,
             FeeHook.FeeSetup({
@@ -443,9 +460,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
                 feeBps: p.feeBps,
                 sellFeeBps: p.sellFeeBps,
                 burnBps: p.burnBps,
-                // Zero means "pay me where I stand". Anything else is a deliberate choice of a
-                // team wallet, splitter or multisig, and it is fixed from this transaction on.
-                creator: p.feeRecipient == address(0) ? msg.sender : p.feeRecipient,
+                creator: feeRecipient,
                 creatorBps: p.creatorBps,
                 rewardCurrency: Currency.wrap(address(0))
             })
@@ -459,7 +474,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         // self-referral must never cost somebody their launch - the token is the product and a
         // marketing attribution is not worth failing it over.
         if (referralVault != address(0) && p.referrer != address(0)) {
-            try IReferralVault(referralVault).setReferrer(msg.sender, p.referrer) {} catch {}
+            try IReferralVault(referralVault).setReferrer(feeRecipient, p.referrer) {} catch {}
         }
     }
 
@@ -693,6 +708,29 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         // It is burned to the standard dead address, which the Distributor already excludes.
         uint256 leftoverToken = IERC20(d.token).balanceOf(address(this));
         if (leftoverToken != 0) IERC20(d.token).safeTransfer(address(0xdEaD), leftoverToken);
+    }
+
+    /// @dev **The graduation bar is checked against the price the pool ACTUALLY opened at, not
+    ///      against the number the creator typed.**
+    ///
+    ///      `_validate` compares `graduationThreshold` to `openingMarketCap`, and that is the
+    ///      wrong quantity in two independent ways. The opening price is SNAPPED to a usable tick,
+    ///      so the pool can open above the requested cap; and the dev buy is the first swap in
+    ///      this same transaction, so it moves the price before anybody else can trade. On a
+    ///      single-sided seed the spot cap after a dev buy of `D` pair is `(M + D)^2 / M`, which
+    ///      for a large vested dev buy is multiples of `M`. Measured: a 78%-supply launch with a
+    ///      "5x to graduate" bar opened at **4.2x its own threshold**, `checkGraduation` succeeded
+    ///      in the launch block, and `graduationProgressBps` returned a full 10,000 before the
+    ///      first buyer existed.
+    ///
+    ///      That is precisely the outcome `GraduationThresholdTooLow` exists to prevent, measured
+    ///      against the wrong number. Reading `marketCapOf` after the unlock cycle measures it
+    ///      with the same function the latch itself uses, so there is no second model to keep in
+    ///      sync and no closed form to get wrong. Reverting - rather than adjusting the threshold
+    ///      - is the house rule: silent trimming is banned.
+    function _assertNotBornGraduated(PoolId poolId, uint256 threshold) internal view {
+        uint256 mcap = feeHook.marketCapOf(poolId);
+        if (mcap >= threshold) revert BornGraduated(threshold, mcap);
     }
 
     function _assertHoldsNothing(address token, address pair) internal view {

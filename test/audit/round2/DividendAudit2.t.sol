@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {Distributor, IRewardConverter} from "../../../src/Distributor.sol";
 import {MockERC20} from "../../mocks/MockERC20.sol";
 
@@ -116,6 +117,20 @@ contract DividendAudit2Test is Test {
 
     function _pair(Distributor d) internal view returns (MockERC20) {
         return MockERC20(d.payoutToken());
+    }
+
+    /// @dev Did the last recorded trace contain this event signature?
+    ///
+    ///      Needed because a converter's own counter is USELESS as evidence once the converter's
+    ///      call reverts: `hits++` is rolled back with everything else in that frame. An emitted
+    ///      log from the CALLER's frame survives, and is the only durable proof the conversion was
+    ///      actually attempted rather than skipped.
+    function _sawLog(bytes32 sig) internal returns (bool) {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics.length != 0 && logs[i].topics[0] == sig) return true;
+        }
+        return false;
     }
 
     function _give(Distributor d, uint256 amount) internal {
@@ -562,20 +577,33 @@ contract DividendAudit2Test is Test {
     //        holder's whole claim while paying them nothing.
     // ===========================================================================================
 
-    /// @dev `Distributor.sol:529` measures `taken = heldBefore - balanceOf(this)` across the
-    ///      `convert` call and treats any non-zero delta as proof the converter spent the
-    ///      allowance (`taken != 0` -> `return true`, line 530-536). The delta is a property of
-    ///      the CONTRACT'S BALANCE, not of the allowance, and `processBatch` is permissionless and
-    ///      re-entrant-reachable from inside `convert`. A converter that pulls nothing but pays
-    ///      somebody else out of the same balance therefore reads as a success.
+    /// @notice REGRESSION GUARD. A re-entrant converter can no longer settle a claim it never paid.
     ///
-    ///      `withdraw()` has already incremented `_withdrawn[alice]` (line 450) before calling
-    ///      `_trySend`, so a `true` return finalises the claim. Alice is debited in full and
-    ///      receives zero, in either currency.
+    /// @dev THE BUG, and note that the round-2 ALLOWANCE fix alone did not close it. Round 1
+    ///      measured `taken = heldBefore - balanceOf(this)`, a property of the contract's balance,
+    ///      which a re-entrant converter could move without taking anything. Round 2 replaced that
+    ///      with `taken = amount - allowance(this, converter)` - the right quantity, but stored in
+    ///      a SINGLE SHARED SLOT keyed on `(distributor, converter)`. `convert` re-enters
+    ///      `processBatch`; the nested `_trySend` approves ITS amount, measures its own honest
+    ///      zero, and calls `_clearAllowance()`; the outer frame returns to an allowance of zero
+    ///      and computes `taken == amount`. Same outcome by a different route.
     ///
-    ///      Round 1's `test_sound_aReentrantConverterCannotDoublePay` only asserts nobody is paid
-    ///      MORE than they are owed. It cannot see this, because this is an under-payment.
-    function test_R2_07_aReentrantConverterSettlesAClaimWithoutPayingIt() public {
+    ///      `withdraw()` increments `_withdrawn[msg.sender]` before calling `_trySend`, so a
+    ///      `true` return finalises the claim.
+    ///
+    ///      MEASURED BEFORE: alice debited **99999999999999999999** wei, received **0** in the
+    ///      pair currency and **0** in the reward currency, `withdrawableOf(alice) == 0`
+    ///      afterwards, `PayoutSent(alice, amount)` emitted.
+    ///
+    ///      MEASURED AFTER: `ReentrancyGuardTransient` on `withdraw`/`processBatch` makes the
+    ///      nested `processBatch` revert inside `convert`, so `convert` reverts, the `catch` runs
+    ///      `_clearAllowance()`, and the fallback pays alice **99999999999999999999** wei of the
+    ///      pair currency - the documented "could not route" degradation. `conv.hits()` is still
+    ///      non-zero, so the converter really was called and the guard is doing the work.
+    ///
+    ///      Round 1's `test_sound_aReentrantConverterCannotDoublePay` cannot see any of this: it
+    ///      only asserts nobody is paid MORE than they are owed, and this was an under-payment.
+    function test_R2_07_fixed_aReentrantConverterCannotSettleAClaimWithoutPayingIt() public {
         ReentrantDrainConverter conv = new ReentrantDrainConverter();
         Distributor d = _mk(18, 1, 1, 1, address(reward), address(conv));
         conv.arm(d);
@@ -586,19 +614,37 @@ contract DividendAudit2Test is Test {
         _tick(2 * uint256(d.STREAM_WINDOW()));
 
         uint256 owedAlice = d.withdrawableOf(alice);
+        uint256 owedBob = d.withdrawableOf(bob);
         assertGt(owedAlice, 0, "precondition: alice must actually be owed something");
 
+        vm.recordLogs();
         vm.prank(alice);
         uint256 claimed = d.withdraw();
 
-        assertGt(conv.hits(), 1, "the re-entrancy never fired, so this proves nothing");
+        // NON-VACUITY. `conv.hits()` is useless here and that is itself the evidence: the nested
+        // `processBatch` reverts, so `convert` reverts, so the converter's own `hits++` is rolled
+        // back with it. What survives is the event the `catch` path emits, which can only be
+        // reached by approving the converter and attempting the conversion.
+        assertTrue(
+            _sawLog(keccak256("RewardConversionFailed(address,uint256,address)")),
+            "the converter was never attempted, so this proves nothing"
+        );
         assertEq(claimed, owedAlice, "withdraw reported a partial claim");
 
-        // The damage.
-        assertEq(_pair(d).balanceOf(alice), 0, "alice was paid the pair currency after all");
-        assertEq(reward.balanceOf(alice), 0, "alice was paid the reward currency after all");
+        // THE FIX: the claim was consumed AND the money arrived.
+        assertEq(
+            _pair(d).balanceOf(alice) + reward.balanceOf(alice),
+            owedAlice,
+            "alice was debited and paid nothing"
+        );
         assertEq(d.withdrawnOf(alice), owedAlice, "alice's claim was not consumed");
-        assertEq(d.withdrawableOf(alice), 0, "alice can still re-claim, so nothing was lost");
+        assertEq(d.withdrawableOf(alice), 0, "alice can still re-claim");
+
+        // And nobody else's claim was touched by the attempt.
+        assertEq(d.withdrawableOf(bob), owedBob, "bob's claim moved during alice's withdrawal");
+        assertGe(
+            _pair(d).balanceOf(address(d)), owedBob, "the contract cannot cover the other holder"
+        );
 
         console2.log("alice was debited      ", owedAlice);
         console2.log("alice actually received", _pair(d).balanceOf(alice) + reward.balanceOf(alice));
@@ -623,10 +669,17 @@ contract DividendAudit2Test is Test {
         assertEq(_pair(d).balanceOf(alice), owedAlice, "control failed: the holder was not paid");
     }
 
-    /// The push path has the same hole. `processBatch` emits `PayoutSent(alice, amount)`, counts
-    /// her in `sentCount`/`sentTotal`, and consumes her claim - while every wei that moved went to
-    /// somebody else.
-    function test_R2_07c_thePushPathAlsoSettlesAClaimItNeverPaid() public {
+    /// @notice REGRESSION GUARD, the push half. `processBatch` used to emit `PayoutSent(alice,
+    ///         amount)`, count her in `sentCount`/`sentTotal` and consume her claim, while every
+    ///         wei that moved went to somebody else.
+    ///
+    /// @dev MEASURED BEFORE: `sentTotal == 99999999999999999999` while `199999999999999999998`
+    ///      actually left the contract, and none of it went to the account it was credited
+    ///      against.
+    ///
+    ///      MEASURED AFTER: the batch's own report reconciles with what left the contract, to the
+    ///      wei, and every holder it reports paying holds exactly what it reports.
+    function test_R2_07c_fixed_thePushPathReportMatchesWhatActuallyLeft() public {
         ReentrantDrainConverter conv = new ReentrantDrainConverter();
         Distributor d = _mk(18, 1, 1, 1, address(reward), address(conv));
         conv.arm(d);
@@ -641,19 +694,31 @@ contract DividendAudit2Test is Test {
         assertGt(owedAlice, 0, "precondition: alice must be owed something");
 
         uint256 heldBefore = _pair(d).balanceOf(address(d));
+        vm.recordLogs();
         (uint256 sentCount, uint256 sentTotal) = d.processBatch(3);
         uint256 reallyMoved = heldBefore - _pair(d).balanceOf(address(d));
 
-        assertGt(conv.hits(), 1, "the re-entrancy never fired");
-        assertGt(sentCount, 0, "the batch reported paying nobody");
+        // NON-VACUITY, same reasoning as `test_R2_07_fixed`: `hits++` is rolled back with the
+        // reverting `convert`, so the fallback event is the only durable proof the converter path
+        // was taken at all.
+        assertTrue(
+            _sawLog(keccak256("RewardConversionFailed(address,uint256,address)")),
+            "the converter was never attempted, so this proves nothing"
+        );
+        assertEq(sentCount, 3, "the batch did not pay every queued holder");
 
-        // Alice's claim is gone and alice holds nothing, in either currency.
+        // The report reconciles with reality.
+        assertEq(sentTotal, reallyMoved, "the batch reported moving a different amount than it did");
+
+        // And alice, specifically, holds what she was credited with.
         assertEq(d.withdrawnOf(alice), owedAlice, "alice's claim was not consumed");
         assertEq(d.withdrawableOf(alice), 0, "alice can still re-claim");
-        assertEq(_pair(d).balanceOf(alice) + reward.balanceOf(alice), 0, "alice was paid after all");
+        assertEq(
+            _pair(d).balanceOf(alice) + reward.balanceOf(alice),
+            owedAlice,
+            "alice's claim was settled without paying her"
+        );
 
-        // ...and the batch's own report does not match what left the contract.
-        assertTrue(sentTotal != reallyMoved, "sentTotal happened to match, weaken the claim");
         console2.log("reported sent", sentTotal);
         console2.log("really moved ", reallyMoved);
         console2.log("alice held   ", _pair(d).balanceOf(alice) + reward.balanceOf(alice));

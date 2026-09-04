@@ -90,6 +90,8 @@ contract PairRegistry is Ownable2Step {
     error InvalidPrice(address pair, int256 answer);
     /// @notice The pair is approved for launches but has no USD oracle, so it has no USD price.
     error PairNotPriceable(address pair);
+    /// @notice This registry has no unowned state. See `renounceOwnership`.
+    error OwnershipCannotBeRenounced();
 
     constructor(address initialOwner) Ownable(initialOwner) {}
 
@@ -158,6 +160,25 @@ contract PairRegistry is Ownable2Step {
             _listed[pair] = true;
             _pairList.push(pair);
         }
+    }
+
+    /// @notice Disabled. Ownership here can be TRANSFERRED but never destroyed.
+    ///
+    /// @dev `Ownable2Step` guards `transferOwnership` with a handshake and leaves
+    ///      `renounceOwnership` exactly as `Ownable` defines it - one call, no confirmation,
+    ///      `_transferOwnership(address(0))`. That is the wrong default for this contract
+    ///      specifically, because this registry is the only gate on which currencies may be
+    ///      launched or paid against. Renouncing freezes the allowlist forever: no pair can be
+    ///      added, and - the half that actually matters - **no pair can ever be REVOKED**, so a
+    ///      pair currency that later pauses, blacklists or gets exploited stays launchable for the
+    ///      life of the deployment.
+    ///
+    ///      A one-way, unconfirmed, irreversible call that costs the system its only safety valve
+    ///      does not belong on the ABI. An operator who genuinely wants to walk away transfers to
+    ///      a burn-controlled multisig, which is the same outcome with a second step in front of
+    ///      it.
+    function renounceOwnership() public pure override {
+        revert OwnershipCannotBeRenounced();
     }
 
     function setSequencerFeed(address feed, uint32 gracePeriod) external onlyOwner {

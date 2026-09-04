@@ -430,8 +430,11 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
     /// @dev Immutability is the anti-rug property: a fee split that can change after people buy is
     ///      a rug with extra steps.
     function test_configurePool_revertsOnReconfigure() public {
+        // `FEE_BPS`, not the bare 100 this used to pass: 100 is now rejected outright by the
+        // platform floor (`feeBps <= PLATFORM_VOLUME_BPS`), which would have made this test pass
+        // for the wrong reason - the reconfigure guard would never have been reached.
         vm.expectRevert(FeeHook.AlreadyConfigured.selector);
-        hook.configurePool(key, address(dist), Currency.wrap(address(pair)), 100, creator, 0);
+        hook.configurePool(key, address(dist), Currency.wrap(address(pair)), FEE_BPS, creator, 0);
     }
 
     function test_configurePool_revertsAboveFeeCap() public {

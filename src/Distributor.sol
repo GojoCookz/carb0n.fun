@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 
 /// @title Distributor
 /// @notice Pays holders of one launch in that launch's PAIR currency - USDG, WETH, NVDA, whatever
@@ -11,10 +12,20 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///      every distribution, with no iteration in the hot path. Payout is then offered two ways:
 ///
 ///        - PUSH  `processBatch(n)`  - a gas-bounded cursor that walks at most `n` holders per
-///                                     call and wraps around. Anyone may call it; the hook calls
-///                                     it opportunistically after a swap. There is NO unbounded
-///                                     loop over holders anywhere in this contract, because that
-///                                     is a self-DoS the moment the holder set grows.
+///                                     call and wraps around. **Permissionless and entirely
+///                                     keeper-driven: nothing in `src/` calls it, deliberately.**
+///                                     An earlier version of this docstring claimed "the hook
+///                                     calls it opportunistically after a swap", which was never
+///                                     true and must never become true - the hook's only reason
+///                                     to touch this contract is `distribute`, inside a sweep,
+///                                     and a distribution vests over `STREAM_WINDOW`. A push in
+///                                     that same transaction would find `withdrawableOf == 0`
+///                                     for every holder in the queue and walk the whole thing
+///                                     paying nobody, at the swapper's expense. Any future
+///                                     wiring has to DELAY the push, not fold it into the trade.
+///                                     There is NO unbounded loop over holders anywhere in this
+///                                     contract, because that is a self-DoS the moment the
+///                                     holder set grows.
 ///        - PULL  `withdraw()`       - always available, so a holder is never dependent on anyone
 ///                                     else paying gas.
 ///
@@ -40,7 +51,26 @@ interface IRewardConverter {
         returns (uint256 amountOut);
 }
 
-contract Distributor {
+/// @dev **`ReentrancyGuardTransient` on the two payout entry points, and it is load-bearing.**
+///      `_trySend` measures how much of ITS OWN allowance the converter consumed, which is the
+///      only quantity describing that one transfer - but the allowance lives in a single slot on
+///      the payout token, keyed by `(distributor, converter)`, and it is SHARED by every
+///      concurrent `_trySend`. A converter that re-enters `processBatch` from inside `convert`
+///      makes a second `_trySend` run to completion in the middle of the first: that nested frame
+///      approves its own amount, measures its own zero, and then calls `_clearAllowance()`. The
+///      outer frame comes back to an allowance of zero, computes `taken == amount`, and settles
+///      the holder's whole claim having paid them nothing.
+///
+///      Measured: alice debited 99999999999999999999 wei, received 0 in both currencies, with
+///      `PayoutSent(alice, amount)` emitted. Round 1's re-entrancy test cannot see it because it
+///      only asserts nobody is paid MORE.
+///
+///      Nothing about the allowance MEASUREMENT is wrong - the round-2 fix is correct and stays.
+///      What was missing is that the measurement is only meaningful if nothing else touches the
+///      slot in between, and the guard is what makes that true. `flush`, `setBalance` and
+///      `setExcluded` are deliberately NOT guarded: none of them touches an allowance, and
+///      `setBalance` is on the token's hot path where a nested call is normal.
+contract Distributor is ReentrancyGuardTransient {
     uint256 internal constant MAGNITUDE = 2 ** 128;
 
     /// @notice The launch token whose holders are paid.
@@ -152,6 +182,7 @@ contract Distributor {
     error OnlyController();
     error NothingToWithdraw();
     error ZeroAddress();
+    error AlreadyExcluded();
 
     address public immutable controller;
 
@@ -400,6 +431,41 @@ contract Distributor {
         emit ExcludedSet(account, isExcluded);
     }
 
+    /// @notice Give up your own future dividends. **One way, and only ever for yourself.**
+    ///
+    /// @dev **This is the reachable half of exclusion, and without it there was none.**
+    ///      `setExcluded` is `onlyController`, the controller is the fee hook, and the hook has
+    ///      never contained a call to it - so the excluded set was frozen at construction for the
+    ///      life of every launch. `VestingVault.renounceAccrual` advertised exactly this
+    ///      behaviour ("the locked supply's dividend claim belongs to the other holders, forever")
+    ///      and delivered the opposite: it set a flag on the vault, left the vault's shares in
+    ///      `totalShares`, and so destroyed the stream instead of redistributing it.
+    ///
+    ///      **Why self-service rather than a hook-gated third-party path.** Excluding an account
+    ///      deletes its future entitlement and hands it to everybody else. There is no address in
+    ///      this system that can be trusted with that over somebody else's balance - not the
+    ///      creator, who competes with holders for the same fee, and not a platform admin, which
+    ///      this codebase deliberately does not have. Keyed on `msg.sender` the authority is
+    ///      exactly the person whose money it is.
+    ///
+    ///      **Why one way.** A reversible toggle is a lever on the denominator: exclude before a
+    ///      checkpoint, re-enter after. Round 2 proved re-entry grants no backlog
+    ///      (`test_R2_04c`), so a toggle is only ever self-harming today - but the guarantee costs
+    ///      one comparison and it means the property does not have to be re-proved every time the
+    ///      accrual maths changes. It also matches `VestingVault`'s promise: a signal that can be
+    ///      taken back is not a signal.
+    ///
+    ///      A contract that cannot make an external call at all is still beyond help; nothing on
+    ///      chain can distinguish it from a cold wallet. That is a property of the holder, not of
+    ///      this ledger.
+    function renounceAccrual() external {
+        _checkpoint();
+        if (excluded[msg.sender]) revert AlreadyExcluded();
+        excluded[msg.sender] = true;
+        if (shareOf[msg.sender] != 0) _setShares(msg.sender, 0);
+        emit ExcludedSet(msg.sender, true);
+    }
+
     function _setShares(address account, uint256 newShares) internal {
         uint256 old = shareOf[account];
         if (newShares == old) return;
@@ -457,7 +523,7 @@ contract Distributor {
     // -------------------------------------------------------------------------------------------
 
     /// @notice Pull. Always available, never gated on anyone else paying gas.
-    function withdraw() external returns (uint256) {
+    function withdraw() external nonReentrant returns (uint256) {
         // Vest first, so a holder is paid everything owed up to this second rather than up to
         // whenever somebody else last transacted.
         _checkpoint();
@@ -479,7 +545,11 @@ contract Distributor {
     /// @dev Permissionless and idempotent. A failing recipient is skipped and the cursor moves on.
     /// @return sentCount how many accounts were actually paid
     /// @return sentTotal total payout tokens moved
-    function processBatch(uint256 maxAccounts) public returns (uint256 sentCount, uint256 sentTotal) {
+    function processBatch(uint256 maxAccounts)
+        public
+        nonReentrant
+        returns (uint256 sentCount, uint256 sentTotal)
+    {
         _checkpoint();
         uint256 len = _queue.length;
         if (len == 0 || maxAccounts == 0) return (0, 0);
