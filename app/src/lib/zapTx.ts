@@ -51,7 +51,7 @@ export const ZAP_ROUTER_ABI = [
     type: 'function',
     stateMutability: 'payable',
     inputs: [
-      { ...POOL_KEY_TUPLE, name: 'ethKey' },
+      { ...POOL_KEY_TUPLE, name: 'ethKeys', type: 'tuple[]' },
       { ...POOL_KEY_TUPLE, name: 'tokenKey' },
       { name: 'minAmountOut', type: 'uint256' },
       { name: 'recipient', type: 'address' },
@@ -64,7 +64,7 @@ export const ZAP_ROUTER_ABI = [
     type: 'function',
     stateMutability: 'nonpayable',
     inputs: [
-      { ...POOL_KEY_TUPLE, name: 'ethKey' },
+      { ...POOL_KEY_TUPLE, name: 'ethKeys', type: 'tuple[]' },
       { ...POOL_KEY_TUPLE, name: 'tokenKey' },
       { name: 'amountIn', type: 'uint256' },
       { name: 'minAmountOut', type: 'uint256' },
@@ -78,7 +78,7 @@ export const ZAP_ROUTER_ABI = [
     type: 'function',
     stateMutability: 'nonpayable',
     inputs: [
-      { ...POOL_KEY_TUPLE, name: 'ethKey' },
+      { ...POOL_KEY_TUPLE, name: 'ethKeys', type: 'tuple[]' },
       { ...POOL_KEY_TUPLE, name: 'tokenKey' },
       { name: 'amountIn', type: 'uint256' },
     ],
@@ -89,7 +89,7 @@ export const ZAP_ROUTER_ABI = [
     type: 'function',
     stateMutability: 'nonpayable',
     inputs: [
-      { ...POOL_KEY_TUPLE, name: 'ethKey' },
+      { ...POOL_KEY_TUPLE, name: 'ethKeys', type: 'tuple[]' },
       { ...POOL_KEY_TUPLE, name: 'tokenKey' },
       { name: 'amountIn', type: 'uint256' },
     ],
@@ -144,13 +144,55 @@ export const ZAP_ROUTER_ABI = [
 export function ethPoolKeyFor(pair: Address) {
   const fee = ethPoolFeeFor(pair)
   if (fee === null) return null
+  return ethKeyAt(pair, fee, TICK_SPACING)
+}
+
+function ethKeyAt(pair: Address, fee: number, tickSpacing: number) {
   return {
     currency0: zeroAddress as Address,
     currency1: pair.toLowerCase() as Address,
     fee,
-    tickSpacing: TICK_SPACING,
+    tickSpacing,
     hooks: zeroAddress as Address,
   }
+}
+
+/**
+ * The canonical Uniswap fee tiers and their tick spacings.
+ *
+ * Offering all of them is the point: `ZapRouter` takes the first that is not pinned, so a pair with
+ * pools at several tiers is one an attacker has to exhaust several times per block instead of once.
+ */
+const TIERS: ReadonlyArray<readonly [number, number]> = [
+  [100, 1],
+  [500, 10],
+  [3000, 60],
+  [10000, 200],
+]
+
+/**
+ * EVERY hop-1 candidate for this pair, best-known first.
+ *
+ * **This is the Z-14 fix on the client side, and passing one key would make the contract fix
+ * inert.** A stranger can exhaust a single ETH pool and park it on its price limit; with only that
+ * pool offered, every zap sell reverts for every holder until somebody trades it back off. Cost to
+ * the attacker was measured at 0.69% of what they pushed through, and it re-arms every block.
+ *
+ * The verified tier from `ethRoute.ts` goes first because it is the one actually measured for
+ * depth. The other canonical tiers follow as fallbacks — an uninitialised pool is not pinned, it is
+ * absent, and the router treats those differently, so listing a tier that does not exist is
+ * harmless rather than a silent misroute.
+ */
+export function ethPoolKeysFor(pair: Address) {
+  const best = ethPoolFeeFor(pair)
+  if (best === null) return []
+
+  const bestSpacing = TIERS.find(([f]) => f === best)?.[1] ?? TICK_SPACING
+  const keys = [ethKeyAt(pair, best, bestSpacing)]
+  for (const [fee, spacing] of TIERS) {
+    if (fee !== best) keys.push(ethKeyAt(pair, fee, spacing))
+  }
+  return keys
 }
 
 /** True when this launch can be traded in ETH at all. */
@@ -204,8 +246,8 @@ export type ZapArgs = {
 
 /** What the two hops would return right now. Null when the route cannot be quoted at all. */
 export async function quoteZap(opts: ZapArgs): Promise<bigint | null> {
-  const ethKey = ethPoolKeyFor(opts.pair)
-  if (!ethKey || !ZAP_ROUTER) return null
+  const ethKeys = ethPoolKeysFor(opts.pair)
+  if (ethKeys.length === 0 || !ZAP_ROUTER) return null
 
   const { key: tokenKey } = poolKeyFor(opts.token, opts.pair)
   const inDecimals = opts.isBuy ? 18 : opts.tokenDecimals
@@ -217,7 +259,7 @@ export async function quoteZap(opts: ZapArgs): Promise<bigint | null> {
       address: ZAP_ROUTER,
       abi: ZAP_ROUTER_ABI,
       functionName: opts.isBuy ? 'quoteZapBuy' : 'quoteZapSell',
-      args: [ethKey, tokenKey, amountIn],
+      args: [ethKeys, tokenKey, amountIn],
       account: opts.account,
     })
     // The quote functions always revert. Reaching here means the deployed bytecode is not the
@@ -244,8 +286,8 @@ export async function submitZap(
   opts: ZapArgs & { slippageBps: number },
   onPhase: (p: TradePhase) => void,
 ): Promise<void> {
-  const ethKey = ethPoolKeyFor(opts.pair)
-  if (!ethKey || !ZAP_ROUTER) throw new Error('There is no ETH pool for this pair yet.')
+  const ethKeys = ethPoolKeysFor(opts.pair)
+  if (ethKeys.length === 0 || !ZAP_ROUTER) throw new Error('There is no ETH pool for this pair yet.')
 
   const { key: tokenKey } = poolKeyFor(opts.token, opts.pair)
   const inDecimals = opts.isBuy ? 18 : opts.tokenDecimals
@@ -311,12 +353,12 @@ export async function submitZap(
     ...(opts.isBuy
       ? {
           functionName: 'zapBuy' as const,
-          args: [ethKey, tokenKey, minOut, opts.account, deadline] as const,
+          args: [ethKeys, tokenKey, minOut, opts.account, deadline] as const,
           value: amountIn,
         }
       : {
           functionName: 'zapSell' as const,
-          args: [ethKey, tokenKey, amountIn, minOut, opts.account, deadline] as const,
+          args: [ethKeys, tokenKey, amountIn, minOut, opts.account, deadline] as const,
         }),
     account: opts.account,
   })

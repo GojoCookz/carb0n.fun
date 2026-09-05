@@ -17,7 +17,7 @@ import { readFileSync } from 'node:fs'
 import { LAUNCHER_ABI } from './src/lib/abi'
 import { DEPLOYMENTS } from './src/lib/chain'
 import { poolKeyFor, TRADE_ROUTER, TRADE_ROUTER_ABI } from './src/lib/tradeTx'
-import { ethPoolKeyFor, ZAP_ROUTER, ZAP_ROUTER_ABI } from './src/lib/zapTx'
+import { ethPoolKeysFor, ZAP_ROUTER, ZAP_ROUTER_ABI } from './src/lib/zapTx'
 import { poolIdOf } from './src/lib/useTokenDetail'
 
 const env = Object.fromEntries(
@@ -134,10 +134,10 @@ const gotAfter = (await bal(tokenAddr, account.address)) - tokBefore2
 ok('E-01: sniping got materially less than waiting', gotAfter > gotInWindow * 3n, `${formatUnits(gotInWindow, 18)} in-window vs ${formatUnits(gotAfter, 18)} after (understated: the first buy moved the price)`)
 
 console.log('\n=== 4. BUY WITH ETH (zap) ===')
-const ethKey = ethPoolKeyFor(PAXG)!
+const ethKeys = ethPoolKeysFor(PAXG)
 const paxgBefore = await bal(PAXG, account.address)
 const tokBefore3 = await bal(tokenAddr, account.address)
-const zapSim = await pub.simulateContract({ address: ZAP_ROUTER, abi: ZAP_ROUTER_ABI, functionName: 'zapBuy', args: [ethKey, tokenKey, 1n, account.address, BigInt(Math.floor(Date.now() / 1000) + 1200)], value: parseEther('0.002'), account })
+const zapSim = await pub.simulateContract({ address: ZAP_ROUTER, abi: ZAP_ROUTER_ABI, functionName: 'zapBuy', args: [ethKeys, tokenKey, 1n, account.address, BigInt(Math.floor(Date.now() / 1000) + 1200)], value: parseEther('0.002'), account })
 const zh = await wallet.writeContract(zapSim.request)
 await pub.waitForTransactionReceipt({ hash: zh })
 const zapGot = (await bal(tokenAddr, account.address)) - tokBefore3
@@ -149,7 +149,7 @@ console.log('\n=== 5. SELL back to ETH ===')
 const held = await bal(tokenAddr, account.address)
 await approve(tokenAddr, ZAP_ROUTER, held / 4n)
 const ethBefore = await pub.getBalance({ address: account.address })
-const sellSim = await pub.simulateContract({ address: ZAP_ROUTER, abi: ZAP_ROUTER_ABI, functionName: 'zapSell', args: [ethKey, tokenKey, held / 4n, 1n, account.address, BigInt(Math.floor(Date.now() / 1000) + 1200)], account })
+const sellSim = await pub.simulateContract({ address: ZAP_ROUTER, abi: ZAP_ROUTER_ABI, functionName: 'zapSell', args: [ethKeys, tokenKey, held / 4n, 1n, account.address, BigInt(Math.floor(Date.now() / 1000) + 1200)], account })
 const sh = await wallet.writeContract(sellSim.request)
 const sr = await pub.waitForTransactionReceipt({ hash: sh })
 const ethBack = (await pub.getBalance({ address: account.address })) - ethBefore + sr.gasUsed * sr.effectiveGasPrice

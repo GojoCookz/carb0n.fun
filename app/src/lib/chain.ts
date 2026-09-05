@@ -93,7 +93,7 @@ export const DEPLOYMENTS: { sepolia: Deployment; mainnet: Deployment } = {
     // Redeployed when `ZapRouter` gained a `deadline` argument and a WETH wrap path — the
     // constructor and both entry-point selectors changed, so the previous address could not have
     // accepted a call from this build.
-    zapRouter: '0xe4683175B4Bd69C62F073b0F9fAC5f29b181AB52',
+    zapRouter: '0x71cC4afbF4cB6c6878A2405063F8810EE3B2dDBB',
     // Confirmed `isApproved() == true` for both, and `isApproved()` false for mainnet WETH,
     // which is the control that proves the call is reading what it claims to read.
     pairs: [

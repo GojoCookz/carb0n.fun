@@ -26,7 +26,7 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { sepolia } from 'viem/chains'
 import { readFileSync } from 'node:fs'
 import { poolKeyFor, TRADE_ROUTER, TRADE_ROUTER_ABI } from './src/lib/tradeTx'
-import { ethPoolKeyFor, zapAvailable, ZAP_ROUTER, ZAP_ROUTER_ABI } from './src/lib/zapTx'
+import { ethPoolKeysFor, zapAvailable, ZAP_ROUTER, ZAP_ROUTER_ABI } from './src/lib/zapTx'
 import { DEPLOYMENTS } from './src/lib/chain'
 import { LAUNCHER_ABI } from './src/lib/abi'
 
@@ -248,8 +248,8 @@ for (let i = 0n; i < count; i++) {
   ])
   console.log(`── ${tSym} / ${pSym}`)
 
-  const ethKey = ethPoolKeyFor(pair)
-  if (!zapAvailable(pair) || !ethKey) {
+  const ethKeys = ethPoolKeysFor(pair)
+  if (!zapAvailable(pair) || ethKeys.length === 0) {
     // Not a failure. There is genuinely no ETH/<pair> pool for these, and the panel says so
     // rather than offering a button that reverts.
     console.log(`   SKIP - no ETH/${pSym} pool on this network\n`)
@@ -266,7 +266,7 @@ for (let i = 0n; i < count; i++) {
   try {
     // ---- BUY: pay ether, receive the launch token -----------------------------------------
     const spend = parseEther('0.002')
-    const quoted = await quote('quoteZapBuy', [ethKey, tokenKey, spend])
+    const quoted = await quote('quoteZapBuy', [ethKeys, tokenKey, spend])
     const minOut = (quoted * 9900n) / 10_000n // 1%, the panel's default
 
     const tokenBefore = await bal(token, account.address)
@@ -278,7 +278,7 @@ for (let i = 0n; i < count; i++) {
 
     const { request: buyReq } = await pub.simulateContract({
       address: ZAP_ROUTER, abi: ZAP_ROUTER_ABI, functionName: 'zapBuy',
-      args: [ethKey, tokenKey, minOut, account.address, DEADLINE], value: spend, account,
+      args: [ethKeys, tokenKey, minOut, account.address, DEADLINE], value: spend, account,
     })
     const buyHash = await wallet.writeContract(buyReq)
     const buyReceipt = await pub.waitForTransactionReceipt({ hash: buyHash })
@@ -340,13 +340,13 @@ for (let i = 0n; i < count; i++) {
       await pub.waitForTransactionReceipt({ hash: h })
     }
 
-    const sellQuote = await quote('quoteZapSell', [ethKey, tokenKey, sellAmt])
+    const sellQuote = await quote('quoteZapSell', [ethKeys, tokenKey, sellAmt])
     const pairBeforeSell = await bal(pair, account.address)
     const ethBeforeSell = await pub.getBalance({ address: account.address })
 
     const { request: sellReq } = await pub.simulateContract({
       address: ZAP_ROUTER, abi: ZAP_ROUTER_ABI, functionName: 'zapSell',
-      args: [ethKey, tokenKey, sellAmt, (sellQuote * 9900n) / 10_000n, account.address, DEADLINE], account,
+      args: [ethKeys, tokenKey, sellAmt, (sellQuote * 9900n) / 10_000n, account.address, DEADLINE], account,
     })
     const sellHash = await wallet.writeContract(sellReq)
     const sellReceipt = await pub.waitForTransactionReceipt({ hash: sellHash })

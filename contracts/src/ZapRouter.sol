@@ -94,6 +94,14 @@ contract ZapRouter is IUnlockCallback {
     error TooLittleReceived(uint256 got, uint256 minOut);
     /// @notice The first key must be an ETH pool: `currency0` has to be native ether.
     error EthLegIsNotNative();
+    /// @notice No hop-1 candidate was supplied at all.
+    error NoEthPoolGiven();
+    /// @notice Candidate ETH pools must all trade the same pair currency, or falling back to the
+    ///         next one would silently route through a different asset.
+    error EthPoolsDisagreeOnThePair();
+    /// @notice Every candidate hop-1 pool is sitting on its price limit. Supply another fee tier,
+    ///         or wait — a pinned pool clears as soon as anybody trades it back off the limit.
+    error AllEthPoolsPinned(uint256 tried, bool zeroForOne);
     /// @notice The second key must contain the pair currency the first key trades against.
     error PairIsNotInTheLaunchPool();
     /// @notice Spot already sits on the price limit for this direction, so `Pool.swap` would
@@ -168,8 +176,11 @@ contract ZapRouter is IUnlockCallback {
     ///      guard.** A transaction can sit unmined for hours and then land into a market that has
     ///      moved far enough that the floor derived from a stale quote is no longer protective.
     ///      Every production router takes one; omitting it was an oversight in the first version.
+    /// @param ethKeys EVERY hop-1 pool you know of for this pair. The router takes the first that
+    ///        is not pinned — see `_pickEthKey` and finding Z-14. One entry is legal and is exactly
+    ///        the old behaviour.
     function zapBuy(
-        PoolKey calldata ethKey,
+        PoolKey[] calldata ethKeys,
         PoolKey calldata tokenKey,
         uint256 minAmountOut,
         address recipient,
@@ -177,6 +188,9 @@ contract ZapRouter is IUnlockCallback {
     ) external payable before(deadline) returns (uint256 amountOut) {
         if (msg.value == 0) revert ZeroAmount();
         if (minAmountOut == 0) revert NoSlippageFloor();
+
+        // Buying spends ether, and ether is currency0, so hop 1 is zeroForOne.
+        PoolKey calldata ethKey = _pickEthKey(ethKeys, true);
 
         // **Baselines taken BEFORE anything moves.** Everything refunded below is measured against
         // these, so this call can only ever hand back what it itself brought. Value that was
@@ -213,8 +227,11 @@ contract ZapRouter is IUnlockCallback {
     /// @notice Spend the launch token, receive ETH.
     /// @param minAmountOut Floor in wei. Must not be zero.
     /// @param deadline Unix seconds after which this must not execute.
+    /// @param ethKeys EVERY hop-1 pool you know of for this pair. **This is the Z-14 fix**: a
+    ///        stranger can exhaust one ETH pool and park it on its limit, which took every zap sell
+    ///        offline when the router depended on a single pool.
     function zapSell(
-        PoolKey calldata ethKey,
+        PoolKey[] calldata ethKeys,
         PoolKey calldata tokenKey,
         uint256 amountIn,
         uint256 minAmountOut,
@@ -223,6 +240,9 @@ contract ZapRouter is IUnlockCallback {
     ) external before(deadline) returns (uint256 amountOut) {
         if (amountIn == 0) revert ZeroAmount();
         if (minAmountOut == 0) revert NoSlippageFloor();
+
+        // Selling receives ether out of hop 1, which pushes its price up: oneForZero.
+        PoolKey calldata ethKey = _pickEthKey(ethKeys, false);
 
         address to = recipient == address(0) ? msg.sender : recipient;
         amountOut = _run(ethKey, tokenKey, false, false, amountIn, to);
@@ -243,15 +263,15 @@ contract ZapRouter is IUnlockCallback {
     /// @dev Needs no ETH and no approval: the revert happens after both swaps and before any
     ///      settlement, so the manager's accounting is discarded along with everything else. This
     ///      is how a frontend derives a slippage floor without ever sending a floorless swap.
-    function quoteZapBuy(PoolKey calldata ethKey, PoolKey calldata tokenKey, uint256 amountIn) external {
+    function quoteZapBuy(PoolKey[] calldata ethKeys, PoolKey calldata tokenKey, uint256 amountIn) external {
         if (amountIn == 0) revert ZeroAmount();
-        _run(ethKey, tokenKey, true, true, amountIn, msg.sender);
+        _run(_pickEthKey(ethKeys, true), tokenKey, true, true, amountIn, msg.sender);
     }
 
     /// @notice Simulation only. **Always reverts** with `ZapQuote(amountOut)`.
-    function quoteZapSell(PoolKey calldata ethKey, PoolKey calldata tokenKey, uint256 amountIn) external {
+    function quoteZapSell(PoolKey[] calldata ethKeys, PoolKey calldata tokenKey, uint256 amountIn) external {
         if (amountIn == 0) revert ZeroAmount();
-        _run(ethKey, tokenKey, false, true, amountIn, msg.sender);
+        _run(_pickEthKey(ethKeys, false), tokenKey, false, true, amountIn, msg.sender);
     }
 
     // ===============================================================================================
@@ -431,13 +451,64 @@ contract ZapRouter is IUnlockCallback {
     ///      never been bought from sits at its opening tick with nothing below it, so EVERY sell is
     ///      refused until a buy lifts it off. Name it.
     function _requireNotPinned(PoolKey memory key, bool zeroForOne) internal view {
+        if (_isPinned(key, zeroForOne)) revert PoolIsPinnedAtItsPriceLimit(zeroForOne);
+    }
+
+    /// @dev True when spot already sits on the limit for this direction, so `Pool.swap` would
+    ///      refuse before doing any work. An uninitialised pool is NOT pinned — it is absent, and
+    ///      the manager's own error says so better than this could.
+    function _isPinned(PoolKey memory key, bool zeroForOne) internal view returns (bool) {
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
-        if (sqrtPriceX96 == 0) return; // uninitialised: let the manager give its own error
-        if (zeroForOne) {
-            if (sqrtPriceX96 <= TickMath.MIN_SQRT_PRICE + 1) revert PoolIsPinnedAtItsPriceLimit(true);
-        } else {
-            if (sqrtPriceX96 >= TickMath.MAX_SQRT_PRICE - 1) revert PoolIsPinnedAtItsPriceLimit(false);
+        if (sqrtPriceX96 == 0) return false;
+        return zeroForOne
+            ? sqrtPriceX96 <= TickMath.MIN_SQRT_PRICE + 1
+            : sqrtPriceX96 >= TickMath.MAX_SQRT_PRICE - 1;
+    }
+
+    /// @notice Pick the first ETH pool that can actually take this trade.
+    ///
+    /// @dev **This is the Z-14 fix, and the shape of it matters.** Hop 1 is an ordinary two-sided
+    ///      pool that nobody in this system owns. Exhausting its ether side does not stop the price
+    ///      at the top of the band: with no liquidity above, `Pool.swap` walks the rest of the way
+    ///      to the limit for free and parks there. A single-pool router then refuses EVERY zap sell
+    ///      through it, for every holder, while buys keep working — measured at 0.4220 pair against
+    ///      the 61.0892 the attacker pushed through, 0.69%, re-armable every block.
+    ///
+    ///      Naming the error better does not help, because the outage is physical: that pool has no
+    ///      ether left to give. The answer is not to depend on one pool. A caller passes every ETH
+    ///      pool they know of for this pair — the fee tiers are 100/500/3000/10000 and a live pair
+    ///      usually has several — and the router takes the first that is not pinned. Griefing then
+    ///      costs the attacker one exhaustion per pool per block instead of one, against a victim
+    ///      who simply routes around it.
+    ///
+    ///      Every candidate must trade the same pair currency, or "fall back to the next one" would
+    ///      silently mean "route through a different asset".
+    function _pickEthKey(PoolKey[] calldata candidates, bool zeroForOne)
+        internal
+        view
+        returns (PoolKey calldata chosen)
+    {
+        if (candidates.length == 0) revert NoEthPoolGiven();
+
+        // **Shape is validated for EVERY candidate before any is chosen, and that ordering is
+        // deliberate.** Validating lazily inside the picking loop means a malformed entry hiding
+        // behind a healthy first one is never examined — it only becomes reachable later, when the
+        // pool in front of it happens to be pinned. That is a latent failure that shows up on the
+        // worst day rather than immediately, so the whole list is checked up front. It costs only
+        // calldata comparisons; no storage is read here.
+        Currency pair = candidates[0].currency1;
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            if (!candidates[i].currency0.isAddressZero()) revert EthLegIsNotNative();
+            if (!(candidates[i].currency1 == pair)) revert EthPoolsDisagreeOnThePair();
         }
+
+        // Only now read state, and only until one answers.
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            if (!_isPinned(candidates[i], zeroForOne)) return candidates[i];
+        }
+        // Every one of them is sitting on its limit. That is a real, physical outage rather than a
+        // policy refusal, and the caller is told which direction so they can see it clear.
+        revert AllEthPoolsPinned(candidates.length, zeroForOne);
     }
 
     /// @dev A hop cut short by its price limit leaves ether unspent, and it goes back in the same

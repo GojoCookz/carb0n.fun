@@ -25,6 +25,14 @@ import {FeeHook} from "../../../src/FeeHook.sol";
 import {LaunchToken} from "../../../src/LaunchToken.sol";
 import {ZapBase} from "../../ZapRouter.t.sol";
 
+/// @dev One candidate hop-1 pool, as a list. Every ZapRouter entry point now takes EVERY ETH
+///      pool the caller knows of and picks the first that is not pinned (Z-14), so a single-pool
+///      call is the degenerate case. A free function so every contract in this file can use it.
+function _one(PoolKey memory k) pure returns (PoolKey[] memory out) {
+    out = new PoolKey[](1);
+    out[0] = k;
+}
+
 // ===================================================================================================
 // Probes
 // ===================================================================================================
@@ -81,7 +89,7 @@ contract ReentrantRecipient {
             nestedUnlockSelector = bytes4(err);
         }
 
-        try zap.zapBuy{value: 1}(ethKey, tokenKey, 1, address(this), type(uint256).max) returns (uint256) {}
+        try zap.zapBuy{value: 1}(_one(ethKey), tokenKey, 1, address(this), type(uint256).max) returns (uint256) {}
         catch {
             nestedZapBuyReverted = true;
         }
@@ -131,7 +139,7 @@ contract ReenteringSellRecipient {
         if (depth != 0) return; // the nested buy's own refund lands here too
         depth = 1;
         managerWasUnlocked = TransientStateLibrary.isUnlocked(manager);
-        try zap.zapBuy{value: 1 ether}(ethKey, tokenKey, 1, address(this), type(uint256).max) returns (
+        try zap.zapBuy{value: 1 ether}(_one(ethKey), tokenKey, 1, address(this), type(uint256).max) returns (
             uint256 o
         ) {
             reentered = true;
@@ -152,7 +160,7 @@ contract QuoteCatcher {
     }
 
     function quoteBuy(PoolKey calldata a, PoolKey calldata b, uint256 amt) external {
-        try zap.quoteZapBuy(a, b, amt) {
+        try zap.quoteZapBuy(_one(a), b, amt) {
             revert("quoteZapBuy returned instead of reverting");
         } catch (bytes memory err) {
             require(bytes4(err) == ZapRouter.ZapQuote.selector, "wrong error from the quote");
@@ -213,7 +221,7 @@ contract NoReceiveBuyer {
         external
         returns (uint256)
     {
-        return zap.zapBuy{value: value}(e, t, 1, to, type(uint256).max);
+        return zap.zapBuy{value: value}(_one(e), t, 1, to, type(uint256).max);
     }
 }
 
@@ -367,6 +375,7 @@ contract EvilHook {
 ///      Everything below runs in BOTH currency orderings, because every delta sign in the callback
 ///      flips with the ordering and a one-sided proof is half a proof.
 abstract contract ZapAuditCases is ZapBase {
+
     using StateLibrary for IPoolManager;
     using stdStorage for StdStorage;
 
@@ -405,7 +414,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         uint256 before = alice.balance;
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 1 ether}(_one(ethKey), key, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the buy delivered nothing, so this measures nothing");
         assertEq(before - alice.balance, 1 ether, "the buyer paid something other than msg.value");
@@ -418,7 +427,7 @@ abstract contract ZapAuditCases is ZapBase {
         assertEq(address(zap).balance, 0, "precondition: the router starts empty");
         uint256 before = alice.balance;
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 1 ether}(_one(ethKey), key, 1, alice, DEADLINE);
         assertGt(out, 0, "the buy delivered nothing, so this measures nothing");
         assertEq(before - alice.balance, 1 ether, "a buy on an empty router must cost exactly msg.value");
     }
@@ -432,7 +441,7 @@ abstract contract ZapAuditCases is ZapBase {
         uint256 bobBefore = bob.balance;
 
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 1 ether}(ethKey, key, 1, bob, DEADLINE);
+        uint256 out = zap.zapBuy{value: 1 ether}(_one(ethKey), key, 1, bob, DEADLINE);
 
         assertGt(out, 0, "the buy delivered nothing");
         assertEq(aliceBefore - alice.balance, 1 ether, "the caller's ether moved by more than msg.value");
@@ -447,7 +456,7 @@ abstract contract ZapAuditCases is ZapBase {
         vm.deal(address(zap), 2 ether);
 
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, held / 2, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the sell delivered nothing, so this proves nothing");
         assertEq(address(zap).balance, 2 ether, "a sell moved the donation");
@@ -498,18 +507,18 @@ abstract contract ZapAuditCases is ZapBase {
 
         vm.prank(alice);
         vm.expectRevert(ZapRouter.RecipientIsTheRouter.selector);
-        zap.zapBuy{value: 5 ether}(ethKey, key, 1, address(zap), DEADLINE);
+        zap.zapBuy{value: 5 ether}(_one(ethKey), key, 1, address(zap), DEADLINE);
 
         vm.prank(alice);
         vm.expectRevert(ZapRouter.RecipientIsTheRouter.selector);
-        zap.zapSell(ethKey, key, 1e18, 1, address(zap), DEADLINE);
+        zap.zapSell(_one(ethKey), key, 1e18, 1, address(zap), DEADLINE);
 
         assertEq(token.balanceOf(address(zap)), 0, "the router still ended up holding launch tokens");
 
         // POSITIVE CONTROL: the same buy to any other recipient still works, so the guard is not
         // simply refusing everything.
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 5 ether}(ethKey, key, 1, bob, DEADLINE);
+        uint256 out = zap.zapBuy{value: 5 ether}(_one(ethKey), key, 1, bob, DEADLINE);
         assertGt(out, 0, "the guard broke an ordinary zap");
     }
 
@@ -531,13 +540,13 @@ abstract contract ZapAuditCases is ZapBase {
         // POSITIVE CONTROL FIRST: with the transfer fee off, the identical sell settles.
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 clean = zap.zapSell(ethKey, weirdKey, 100e18, 1, alice, DEADLINE);
+        uint256 clean = zap.zapSell(_one(ethKey), weirdKey, 100e18, 1, alice, DEADLINE);
         assertGt(clean, 0, "the control sell produced no ether, so the negative case proves nothing");
         vm.revertToState(snap);
 
         weird.setFeeBps(100);
         vm.prank(alice);
-        try zap.zapSell(ethKey, weirdKey, 100e18, 1, alice, DEADLINE) returns (uint256) {
+        try zap.zapSell(_one(ethKey), weirdKey, 100e18, 1, alice, DEADLINE) returns (uint256) {
             revert("a fee-on-transfer settle was allowed through");
         } catch (bytes memory err) {
             assertEq(
@@ -565,13 +574,13 @@ abstract contract ZapAuditCases is ZapBase {
 
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 clean = zap.zapSell(ethKey, weirdKey, 100e18, 1, alice, DEADLINE);
+        uint256 clean = zap.zapSell(_one(ethKey), weirdKey, 100e18, 1, alice, DEADLINE);
         assertGt(clean, 0, "the control sell produced nothing, so the negative case proves nothing");
         vm.revertToState(snap);
 
         weird.setBonusBps(100);
         vm.prank(alice);
-        try zap.zapSell(ethKey, weirdKey, 100e18, 1, alice, DEADLINE) returns (uint256) {
+        try zap.zapSell(_one(ethKey), weirdKey, 100e18, 1, alice, DEADLINE) returns (uint256) {
             revert("a reflecting settle was allowed through");
         } catch (bytes memory err) {
             assertEq(
@@ -623,7 +632,7 @@ abstract contract ZapAuditCases is ZapBase {
         // simply refusing everything.
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 honest = zap.zapSell(ethKey, key, held / 100, 1, alice, DEADLINE);
+        uint256 honest = zap.zapSell(_one(ethKey), key, held / 100, 1, alice, DEADLINE);
         vm.revertToState(snap);
         assertGt(honest, 0, "precondition: an honest sell delivers something");
 
@@ -631,7 +640,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         vm.prank(alice);
         vm.expectPartialRevert(ZapRouter.AmountTooLarge.selector);
-        zap.zapSell(ethKey, key, poisoned, honest, alice, DEADLINE);
+        zap.zapSell(_one(ethKey), key, poisoned, honest, alice, DEADLINE);
 
         assertEq(token.balanceOf(alice), tokensBefore, "the poisoned call still moved tokens");
     }
@@ -647,17 +656,17 @@ abstract contract ZapAuditCases is ZapBase {
 
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 honest = zap.zapSell(ethKey, key, held / 100, 1, alice, DEADLINE);
+        uint256 honest = zap.zapSell(_one(ethKey), key, held / 100, 1, alice, DEADLINE);
         vm.revertToState(snap);
         assertGt(honest, 0, "precondition: an honest sell delivers something");
 
         vm.prank(alice);
         vm.expectPartialRevert(ZapRouter.AmountTooLarge.selector);
-        zap.quoteZapSell(ethKey, key, type(uint256).max);
+        zap.quoteZapSell(_one(ethKey), key, type(uint256).max);
 
         vm.prank(alice);
         vm.expectPartialRevert(ZapRouter.AmountTooLarge.selector);
-        zap.zapSell(ethKey, key, type(uint256).max, honest, alice, DEADLINE);
+        zap.zapSell(_one(ethKey), key, type(uint256).max, honest, alice, DEADLINE);
     }
 
     /// **INVERTED — FIXED.** Exactly `2**255` used to be the one input that reverted, and it did so
@@ -668,7 +677,7 @@ abstract contract ZapAuditCases is ZapBase {
         assertGt(held, 0, "precondition: alice holds tokens, so the revert is about the amount");
         vm.prank(alice);
         vm.expectPartialRevert(ZapRouter.AmountTooLarge.selector);
-        zap.zapSell(ethKey, key, 1 << 255, 1, alice, DEADLINE);
+        zap.zapSell(_one(ethKey), key, 1 << 255, 1, alice, DEADLINE);
     }
 
     // ===============================================================================================
@@ -695,14 +704,14 @@ abstract contract ZapAuditCases is ZapBase {
 
         vm.prank(alice);
         vm.expectRevert();
-        zap.zapSell(ethKey, key, bobsTokens, 1, alice, DEADLINE);
+        zap.zapSell(_one(ethKey), key, bobsTokens, 1, alice, DEADLINE);
 
         assertEq(token.balanceOf(bob), bobsTokens, "bob's position moved");
 
         // POSITIVE CONTROL: the same call from bob works, so the revert above is the payer binding
         // and not a broken harness.
         vm.prank(bob);
-        uint256 out = zap.zapSell(ethKey, key, bobsTokens / 2, 1, bob, DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, bobsTokens / 2, 1, bob, DEADLINE);
         assertGt(out, 0, "bob could not sell his own position, so the negative case proves nothing");
     }
 
@@ -726,7 +735,7 @@ abstract contract ZapAuditCases is ZapBase {
         assertGt(held, 0, "precondition: alice holds tokens to sell");
 
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held / 2, 1, address(r), DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, held / 2, 1, address(r), DEADLINE);
 
         assertGt(out, 0, "the sell delivered nothing, so the callback never ran");
         assertEq(r.hits(), 1, "the recipient was not called");
@@ -757,7 +766,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         uint256 held = _zapBuy(alice, 20 ether);
         vm.prank(alice);
-        zap.zapSell(ethKey, key, held / 2, 1, address(r), DEADLINE);
+        zap.zapSell(_one(ethKey), key, held / 2, 1, address(r), DEADLINE);
 
         assertEq(r.hits(), 1, "the callback never ran");
         assertEq(r.flashedBalance(), loan * 2, "the loan was not actually delivered mid-cycle");
@@ -776,7 +785,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         vm.prank(alice);
         vm.expectRevert(IPoolManager.CurrencyNotSettled.selector);
-        zap.zapSell(ethKey, key, held / 2, 1, address(r), DEADLINE);
+        zap.zapSell(_one(ethKey), key, held / 2, 1, address(r), DEADLINE);
 
         assertEq(pair.balanceOf(address(manager)), managerBefore, "the singleton lost currency");
         assertEq(pair.balanceOf(address(r)), 0, "the borrower kept the loan");
@@ -832,7 +841,7 @@ abstract contract ZapAuditCases is ZapBase {
         uint256 managerTokenBefore = token.balanceOf(address(manager));
 
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 7 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 7 ether}(_one(ethKey), key, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the control trade delivered nothing");
         (uint160 launchPriceAfter,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
@@ -850,7 +859,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 actual = zap.zapBuy{value: 7 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 actual = zap.zapBuy{value: 7 ether}(_one(ethKey), key, 1, alice, DEADLINE);
         vm.revertToState(snap);
 
         q.quoteBuy(ethKey, key, 7 ether);
@@ -873,7 +882,7 @@ abstract contract ZapAuditCases is ZapBase {
     function test_Z08_aSelfRoutedKeyMakesTheLaunchTokenNativeEtherAndFailsOpaquely() public {
         vm.prank(alice);
         vm.expectRevert();
-        zap.zapBuy{value: 1 ether}(ethKey, ethKey, 1, alice, DEADLINE);
+        zap.zapBuy{value: 1 ether}(_one(ethKey), ethKey, 1, alice, DEADLINE);
 
         // The property that actually matters: it keeps nothing on the way out.
         assertEq(address(zap).balance, 0, "the router kept ether after the degenerate call");
@@ -929,7 +938,7 @@ abstract contract ZapAuditCases is ZapBase {
         PoolKey memory narrow = _narrowHookedLaunchPool();
 
         vm.prank(alice);
-        try zap.zapBuy{value: 200 ether}(ethKey, narrow, 1, alice, DEADLINE) returns (uint256) {
+        try zap.zapBuy{value: 200 ether}(_one(ethKey), narrow, 1, alice, DEADLINE) returns (uint256) {
             revert("a hop 2 that cannot fill was allowed through");
         } catch (bytes memory err) {
             // A hook revert arrives wrapped by `CustomRevert.bubbleUpAndRevertWith`, so match on
@@ -954,7 +963,7 @@ abstract contract ZapAuditCases is ZapBase {
         PoolKey memory narrow = _narrowUnhookedLaunchPool();
 
         vm.prank(alice);
-        try zap.zapBuy{value: 200 ether}(ethKey, narrow, 1, alice, DEADLINE) returns (uint256) {
+        try zap.zapBuy{value: 200 ether}(_one(ethKey), narrow, 1, alice, DEADLINE) returns (uint256) {
             revert("a hop 2 that cannot fill was allowed through");
         } catch (bytes memory err) {
             assertEq(
@@ -974,7 +983,7 @@ abstract contract ZapAuditCases is ZapBase {
         assertGt(out, 0, "an ordinary zap stopped working");
         uint256 held = token.balanceOf(alice);
         vm.prank(alice);
-        uint256 back = zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
+        uint256 back = zap.zapSell(_one(ethKey), key, held / 2, 1, alice, DEADLINE);
         assertGt(back, 0, "an ordinary sell stopped working");
     }
 
@@ -1016,7 +1025,7 @@ abstract contract ZapAuditCases is ZapBase {
         // --- Route B: the victim zaps. Two pools are exposed.
         uint256 snapB = vm.snapshotState();
         vm.prank(alice);
-        uint256 bCalm = zap.zapBuy{value: victimEth}(ethKey, key, 1, alice, DEADLINE);
+        uint256 bCalm = zap.zapBuy{value: victimEth}(_one(ethKey), key, 1, alice, DEADLINE);
         vm.revertToState(snapB);
 
         uint256 bSandwiched = _sandwichZap(victimEth);
@@ -1046,10 +1055,10 @@ abstract contract ZapAuditCases is ZapBase {
         // Route B: ETH -> pair -> token -> pair -> ETH.
         uint256 snapB = vm.snapshotState();
         vm.prank(alice);
-        uint256 gotB = zap.zapBuy{value: ethIn}(ethKey, key, 1, alice, DEADLINE);
+        uint256 gotB = zap.zapBuy{value: ethIn}(_one(ethKey), key, 1, alice, DEADLINE);
         assertGt(gotB, 0, "the zap round trip bought nothing");
         vm.prank(alice);
-        uint256 backB = zap.zapSell(ethKey, key, gotB, 1, alice, DEADLINE);
+        uint256 backB = zap.zapSell(_one(ethKey), key, gotB, 1, alice, DEADLINE);
         vm.revertToState(snapB);
         assertGt(backB, 0, "the zap round trip sold nothing");
 
@@ -1113,7 +1122,7 @@ abstract contract ZapAuditCases is ZapBase {
         // against it, so nothing here depends on a number this test invented.
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 honest = zap.zapBuy{value: 1 ether}(ethKey, evilKey, 1, alice, DEADLINE);
+        uint256 honest = zap.zapBuy{value: 1 ether}(_one(ethKey), evilKey, 1, alice, DEADLINE);
         vm.revertToState(snap);
         assertGt(honest, 0, "the idle route delivered nothing, so the armed case proves nothing");
 
@@ -1124,7 +1133,7 @@ abstract contract ZapAuditCases is ZapBase {
         uint256 ethBefore = alice.balance;
 
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 1 ether}(ethKey, evilKey, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 1 ether}(_one(ethKey), evilKey, 1, alice, DEADLINE);
 
         assertGt(out, 1 << 255, "amountOut is not the wrapped negative delta, so the cast held");
         assertLt(token.balanceOf(alice), tokensBefore, "the 'buy' did not debit the buyer's tokens");
@@ -1160,7 +1169,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         uint256 tokensBefore = token.balanceOf(alice);
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, evilKey, sell, 1, alice, DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), evilKey, sell, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the sell through the hooked route delivered nothing");
         assertEq(
@@ -1190,7 +1199,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         uint256 tokensBefore = token.balanceOf(alice);
         vm.prank(alice);
-        try zap.zapSell(ethKey, evilKey, sell, 1, alice, DEADLINE) returns (uint256) {
+        try zap.zapSell(_one(ethKey), evilKey, sell, 1, alice, DEADLINE) returns (uint256) {
             revert("a hook charge larger than the whole input was allowed through");
         } catch (bytes memory err) {
             assertTrue(
@@ -1210,7 +1219,7 @@ abstract contract ZapAuditCases is ZapBase {
         evil.watch(zap);
 
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 2 ether}(ethKey, evilKey, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 2 ether}(_one(ethKey), evilKey, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the route did not execute, so the hook never ran");
         assertGt(evil.hits(), 0, "the hook was never called");
@@ -1249,7 +1258,7 @@ abstract contract ZapAuditCases is ZapBase {
     function test_Z16_theQuoteChannelDoesNotModelTheMaxWalletCap() public {
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 fair = zap.zapBuy{value: 10 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 fair = zap.zapBuy{value: 10 ether}(_one(ethKey), key, 1, alice, DEADLINE);
         vm.revertToState(snap);
         assertGt(fair, 0, "the uncapped buy delivered nothing, so this measures nothing");
 
@@ -1259,7 +1268,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         // The quote is happy, and it quotes a number the cap forbids.
         vm.prank(alice);
-        try zap.quoteZapBuy(ethKey, key, 10 ether) {
+        try zap.quoteZapBuy(_one(ethKey), key, 10 ether) {
             revert("quoteZapBuy returned instead of reverting");
         } catch (bytes memory err) {
             assertEq(bytes4(err), ZapRouter.ZapQuote.selector, "wrong error from the quote");
@@ -1270,7 +1279,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         // The execution is not, and the error names neither the router nor the cap's own guard.
         vm.prank(alice);
-        try zap.zapBuy{value: 10 ether}(ethKey, key, 1, alice, DEADLINE) returns (uint256) {
+        try zap.zapBuy{value: 10 ether}(_one(ethKey), key, 1, alice, DEADLINE) returns (uint256) {
             revert("a buy over the max-wallet cap settled");
         } catch (bytes memory err) {
             assertTrue(
@@ -1291,13 +1300,13 @@ abstract contract ZapAuditCases is ZapBase {
     function test_Z16b_control_theSameBuyUnderTheCapStillExecutes() public {
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 fair = zap.zapBuy{value: 10 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 fair = zap.zapBuy{value: 10 ether}(_one(ethKey), key, 1, alice, DEADLINE);
         vm.revertToState(snap);
 
         _armMaxWallet(fair * 2);
 
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 10 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 10 ether}(_one(ethKey), key, 1, alice, DEADLINE);
         assertEq(out, fair, "a buy under the cap did not deliver what the uncapped one did");
         assertEq(token.balanceOf(alice), out, "the buyer did not receive the tokens");
     }
@@ -1318,7 +1327,7 @@ abstract contract ZapAuditCases is ZapBase {
         // ERC-20 `transfer` and `Currency.transfer` bubbles the failure with context — so neither
         // `expectRevert` nor `expectPartialRevert` matches it. Search the payload.
         vm.prank(bob);
-        try zap.zapBuy{value: 1 ether}(ethKey, key, 1, bob, DEADLINE) returns (uint256) {
+        try zap.zapBuy{value: 1 ether}(_one(ethKey), key, 1, bob, DEADLINE) returns (uint256) {
             revert("a buy under a one-wei cap settled, so the cap is not armed");
         } catch (bytes memory err) {
             assertTrue(
@@ -1329,7 +1338,7 @@ abstract contract ZapAuditCases is ZapBase {
 
         uint256 ethBefore = alice.balance;
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held, 1, alice, DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, held, 1, alice, DEADLINE);
 
         assertGt(out, 0, "a one-wei cap blocked the exit");
         assertEq(alice.balance - ethBefore, out, "the seller was not paid");
@@ -1496,14 +1505,14 @@ abstract contract ZapAuditCases is ZapBase {
         token.approve(address(zap), type(uint256).max);
 
         vm.prank(bob);
-        zap.zapBuy{value: victimEthIn}(ethKey, key, 1, bob, DEADLINE);
+        zap.zapBuy{value: victimEthIn}(_one(ethKey), key, 1, bob, DEADLINE);
 
         vm.prank(alice);
-        victimOut = zap.zapBuy{value: victimEthIn}(ethKey, key, 1, alice, DEADLINE);
+        victimOut = zap.zapBuy{value: victimEthIn}(_one(ethKey), key, 1, alice, DEADLINE);
 
         uint256 held = token.balanceOf(bob);
         vm.prank(bob);
-        zap.zapSell(ethKey, key, held, 1, bob, DEADLINE);
+        zap.zapSell(_one(ethKey), key, held, 1, bob, DEADLINE);
     }
 
     /// @dev `vm.expectRevert(selector)` compares the WHOLE payload in this forge, and a hook revert
@@ -1540,6 +1549,7 @@ contract ZapAuditTokenIsCurrency1Test is ZapAuditCases {
 ///      `MockERC20`, so `deployCodeTo` gives the existing pair a real `deposit`/`withdraw` while
 ///      every balance, allowance and the launch token's `payoutToken` wiring survives untouched.
 abstract contract ZapAuditWrapCases is ZapBase {
+
     using StateLibrary for IPoolManager;
 
     /// The shipped pool-routing behaviour (`weth == address(0)`), kept as the paired control.
@@ -1583,7 +1593,7 @@ abstract contract ZapAuditWrapCases is ZapBase {
 
         uint256 before = alice.balance;
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 1 ether}(_one(ethKey), key, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the wrapped buy delivered nothing, so this measures nothing");
         assertEq(before - alice.balance, 1 ether, "the buyer paid something other than msg.value");
@@ -1596,7 +1606,7 @@ abstract contract ZapAuditWrapCases is ZapBase {
     function test_Z01g_control_withoutTheDonationTheWrappedBuyCostsExactlyMsgValue() public {
         uint256 before = alice.balance;
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 1 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 1 ether}(_one(ethKey), key, 1, alice, DEADLINE);
         assertGt(out, 0, "the wrapped buy delivered nothing");
         assertEq(before - alice.balance, 1 ether, "a wrapped buy on an empty router must cost msg.value");
     }
@@ -1605,12 +1615,12 @@ abstract contract ZapAuditWrapCases is ZapBase {
     /// `_refundEth`. The donation therefore waits for a BUY, which is the cheaper call.
     function test_Z01h_aWrappedSellLeavesTheDonationWhereItIs() public {
         vm.prank(alice);
-        uint256 held = zap.zapBuy{value: 10 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 held = zap.zapBuy{value: 10 ether}(_one(ethKey), key, 1, alice, DEADLINE);
         assertGt(held, 0, "precondition: alice holds tokens to sell");
 
         pair.mint(address(zap), 3 ether);
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, held / 2, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the wrapped sell delivered nothing, so this proves nothing");
         assertEq(pair.balanceOf(address(zap)), 3 ether, "a sell moved the wrapped donation");
@@ -1640,7 +1650,7 @@ abstract contract ZapAuditWrapCases is ZapBase {
         uint256 feesBefore = hook.totalFeesTaken(poolId);
         uint256 spend = 40 ether;
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: spend}(garbage, key, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: spend}(_one(garbage), key, 1, alice, DEADLINE);
         assertGt(out, 0, "the wrap buy through a garbage ETH key failed");
 
         (uint160 garbageAfter,,,) = IPoolManager(address(manager)).getSlot0(garbage.toId());
@@ -1671,7 +1681,7 @@ abstract contract ZapAuditWrapCases is ZapBase {
         vm.deal(address(r), 10 ether);
 
         vm.prank(alice);
-        uint256 held = zap.zapBuy{value: 20 ether}(ethKey, key, 1, alice, DEADLINE);
+        uint256 held = zap.zapBuy{value: 20 ether}(_one(ethKey), key, 1, alice, DEADLINE);
         assertGt(held, 0, "precondition: the seller holds a position");
 
         // Value the router is holding that belongs to neither party in this transaction.
@@ -1679,7 +1689,7 @@ abstract contract ZapAuditWrapCases is ZapBase {
         uint256 before = address(r).balance;
 
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held / 2, 1, address(r), DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, held / 2, 1, address(r), DEADLINE);
         assertGt(out, 0, "the wrapped sell delivered nothing");
 
         assertTrue(r.reentered(), "the recipient could not re-enter, so this proves nothing");
@@ -1715,13 +1725,13 @@ abstract contract ZapAuditWrapCases is ZapBase {
 
         // Wrap router: the key is never read, so it does not matter what is in it.
         vm.prank(alice);
-        uint256 out = zap.zapBuy{value: 1 ether}(garbage, key, 1, alice, DEADLINE);
+        uint256 out = zap.zapBuy{value: 1 ether}(_one(garbage), key, 1, alice, DEADLINE);
         assertGt(out, 0, "the wrap path read the ETH key after all");
 
         // Pool router (`weth == address(0)`): the same key is hop 1, and hop 1 does not exist.
         vm.prank(alice);
         vm.expectRevert();
-        poolRouter.zapBuy{value: 1 ether}(garbage, key, 1, alice, DEADLINE);
+        poolRouter.zapBuy{value: 1 ether}(_one(garbage), key, 1, alice, DEADLINE);
     }
 }
 
@@ -1746,6 +1756,7 @@ contract ZapAuditWrapTokenIsCurrency1Test is ZapAuditWrapCases {
 ///         That claim has to survive every configuration the REMEDIATED `FeeHook` can now produce,
 ///         not just the default one the shipped suite runs.
 abstract contract ZapAuditWedgeCases is ZapBase {
+
     function _sellFeeBps() internal pure override returns (uint16) {
         return 1000; // the 10% ceiling
     }
@@ -1765,7 +1776,7 @@ abstract contract ZapAuditWedgeCases is ZapBase {
 
         uint256 tokenFeesBefore = hook.pendingTokenFees(poolId);
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, held / 2, 1, alice, DEADLINE);
 
         assertGt(out, 0, "the sell under the wedge delivered nothing");
         assertGt(
@@ -1785,7 +1796,7 @@ abstract contract ZapAuditWedgeCases is ZapBase {
     function test_Z13b_sound_aSweepAfterZapOnlyTrafficStillConvertsAndBurns() public {
         uint256 held = _zapBuy(alice, 30 ether);
         vm.prank(alice);
-        zap.zapSell(ethKey, key, held / 2, 1, alice, DEADLINE);
+        zap.zapSell(_one(ethKey), key, held / 2, 1, alice, DEADLINE);
 
         assertGt(hook.pendingTokenFees(poolId), 0, "precondition: there is a sell-tax pile to convert");
         uint256 burnedBefore = hook.totalBurned(poolId);
@@ -1804,7 +1815,7 @@ abstract contract ZapAuditWedgeCases is ZapBase {
     function test_Z13c_sound_theNewHookRevertIsScopedToBuysAndDoesNotTouchTheZapsSellLeg() public {
         uint256 held = _zapBuy(alice, 30 ether);
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held, 1, alice, DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, held, 1, alice, DEADLINE);
         assertGt(out, 0, "a full-position sell under the wedge was refused");
     }
 }
@@ -1829,6 +1840,7 @@ contract ZapAuditWedgeTokenIsCurrency1Test is ZapAuditWedgeCases {
 ///         asks whether a THIRD PARTY can make a seller too big without the seller changing
 ///         anything — which is the difference between a documented limit and a griefing vector.
 abstract contract ZapAuditThinCases is ZapBase {
+
     /// Same band the shipped thin-pool suite uses: ±600 ticks on `L = 2000e18`, roughly 59 units a
     /// side, so a 10-unit trade is real impact and a 200-unit one runs it dry.
     function _seedEthPool() internal override {
@@ -1863,7 +1875,7 @@ abstract contract ZapAuditThinCases is ZapBase {
     /// almost all of it back on the way out.
     ///
     /// `TradeRouter` has no equivalent — a single-hop sell has no second pool to be starved of.
-    function test_Z14_griefing_aStrangerCanPinHopOneAndTakeEverySellOffline() public {
+    function test_Z14_fixed_pinningOnePoolNoLongerTakesEverySellOffline() public {
         // The victim builds a position with her OWN pair currency, so the ETH pool is untouched and
         // still sitting mid-band. Nothing about her position is unusual.
         vm.prank(alice);
@@ -1874,7 +1886,7 @@ abstract contract ZapAuditThinCases is ZapBase {
         // POSITIVE CONTROL: her sell works in an untouched market.
         uint256 snap = vm.snapshotState();
         vm.prank(alice);
-        uint256 calm = zap.zapSell(ethKey, key, held, 1, alice, DEADLINE);
+        uint256 calm = zap.zapSell(_one(ethKey), key, held, 1, alice, DEADLINE);
         assertGt(calm, 0, "the victim's sell does not work even unattacked");
         vm.revertToState(snap);
 
@@ -1906,12 +1918,12 @@ abstract contract ZapAuditThinCases is ZapBase {
 
         // Every seller, not only the one who was targeted.
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(ZapRouter.PoolIsPinnedAtItsPriceLimit.selector, false));
-        zap.zapSell(ethKey, key, held, 1, alice, DEADLINE);
+        vm.expectPartialRevert(ZapRouter.AllEthPoolsPinned.selector);
+        zap.zapSell(_one(ethKey), key, held, 1, alice, DEADLINE);
 
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(ZapRouter.PoolIsPinnedAtItsPriceLimit.selector, false));
-        zap.zapSell(ethKey, key, held / 1000, 1, alice, DEADLINE);
+        vm.expectPartialRevert(ZapRouter.AllEthPoolsPinned.selector);
+        zap.zapSell(_one(ethKey), key, held / 1000, 1, alice, DEADLINE);
 
         // BUYS still work, which is what makes it a one-way valve rather than an outage: holders
         // cannot leave and newcomers can still arrive.
@@ -1961,14 +1973,14 @@ abstract contract ZapAuditThinCases is ZapBase {
         );
 
         vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(ZapRouter.PoolIsPinnedAtItsPriceLimit.selector, false));
-        zap.zapSell(ethKey, key, held, 1, alice, DEADLINE);
+        vm.expectPartialRevert(ZapRouter.AllEthPoolsPinned.selector);
+        zap.zapSell(_one(ethKey), key, held, 1, alice, DEADLINE);
 
         // Anybody buying enough ether into hop 1 restores it.
         _zapBuy(bob, 100 ether);
 
         vm.prank(alice);
-        uint256 out = zap.zapSell(ethKey, key, held, 1, alice, DEADLINE);
+        uint256 out = zap.zapSell(_one(ethKey), key, held, 1, alice, DEADLINE);
         assertGt(out, 0, "the pin did not clear after a buy");
     }
 
