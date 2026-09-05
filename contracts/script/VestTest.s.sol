@@ -63,7 +63,7 @@ contract VestTest is Script {
                 rewardCurrency: address(0),
                 feeRecipient: address(0),
                 referrer: address(0),
-                metadata: LaunchMetadata({imageCid: keccak256("vest"), bannerCid: 0, infoCid: 0})
+                openingWindow: 0, openingFeeBps: 0, metadata: LaunchMetadata({imageCid: keccak256("vest"), bannerCid: 0, infoCid: 0})
             })
         );
 

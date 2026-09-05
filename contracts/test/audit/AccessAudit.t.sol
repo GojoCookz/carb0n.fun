@@ -132,7 +132,7 @@ abstract contract AccessAuditHarness is Test {
             rewardCurrency: address(0),
             feeRecipient: address(0),
             referrer: address(0),
-            metadata: LaunchMetadata({imageCid: keccak256("image"), bannerCid: 0, infoCid: 0})
+            openingWindow: 0, openingFeeBps: 0, metadata: LaunchMetadata({imageCid: keccak256("image"), bannerCid: 0, infoCid: 0})
         });
     }
 
@@ -209,8 +209,10 @@ abstract contract AccessAuditHarness is Test {
 // Every external/public function in src/, asked two questions: who may call it, and what happens
 // if the wrong person does. Guards already proven elsewhere are NOT re-tested here:
 //
-//   - `FeeHook.unlockCallback` / `autoRedeem` / `configurePool*` / `configureGraduation`
+//   - `FeeHook.unlockCallback` / `configurePool*` / `configureGraduation`
 //     -> `test/HookAttack.t.sol`
+//     (`autoRedeem` was on this list until the automatic-sweep path was deleted. It no longer
+//      exists, so neither does the external surface its guard protected.)
 //   - `Distributor.distribute` / `setBalance` / `setExcluded`   -> `test/Adversarial.t.sol`
 //   - `PairRegistry` onlyOwner guards                            -> `test/PairRegistry.t.sol`
 //   - `VestingVault.extend` / `renounceAccrual` onlyBeneficiary  -> `test/Vesting.t.sol`

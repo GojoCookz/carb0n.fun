@@ -95,6 +95,15 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         return 0;
     }
 
+    /// @notice No opening-fee decay by default, which is what every launch did before it existed.
+    function _openingWindow() internal pure virtual returns (uint32) {
+        return 0;
+    }
+
+    function _openingFeeBps() internal pure virtual returns (uint16) {
+        return 0;
+    }
+
     /// @dev Buying the launch token means paying the PAIR currency and receiving the token.
     ///      `zeroForOne` therefore depends entirely on which side the token sorted onto.
     function _buyIsZeroForOne() internal pure returns (bool) {
@@ -146,11 +155,12 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
                 creator: creator,
                 creatorBps: CREATOR_BPS,
                 rewardCurrency: Currency.wrap(address(0))
-            })
+            , openingWindow: _openingWindow(), openingFeeBps: _openingFeeBps()})
         );
-        // A real launch always registers graduation alongside the fee, and that is where the
-        // auto-sweep threshold is armed. Configuring only the fee here left this harness in a
-        // state `Launcher` can never produce, which is how the auto path went untested.
+        // A real launch always registers graduation alongside the fee, so the harness does too -
+        // configuring only the fee leaves this in a state `Launcher` can never produce.
+        // (This call used to arm a second thing, an automatic-sweep backlog threshold. That
+        // mechanism has been deleted; graduation is now the only thing configured here.)
         hook.configureGraduation(key, 1_000_000e18, SUPPLY);
 
         manager.initialize(key, TickMath.getSqrtPriceAtTick(0));
@@ -282,18 +292,29 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         );
     }
 
-    /// @dev The automatic path. Once the backlog clears the threshold a trade pays holders on its
-    ///      way through, with nobody having to call anything.
-    function test_autoSweepFiresOnceTheBacklogIsWorthIt() public {
-        assertGt(hook.autoSweepThreshold(poolId), 0, "auto sweep must be armed at launch");
-
-        // Manual first buy, so the backlog exists without the harness sweeping it away.
+    /// @notice REPLACES `test_autoSweepFiresOnceTheBacklogIsWorthIt`, which tested a DELETED
+    ///         feature and could not be inverted in place because the thing it drove no longer
+    ///         exists.
+    ///
+    /// @dev The old test asserted that an exact-output buy pays holders on its way through, with
+    ///      nobody calling anything. That was true only of the exact-output shape (audit 04 V-01:
+    ///      the automatic path was unreachable from every exact-input swap, i.e. from all real
+    ///      router traffic), and the mechanism that made it true moved real ERC-20 out of the
+    ///      singleton mid-swap and overcharged any sync-first payer 8.5x (V-02). Both are now
+    ///      closed by deletion.
+    ///
+    ///      What replaces it is the guarantee that bought the deletion, asserted on the shape that
+    ///      used to be the exception: **no swap of any shape pays a holder.** Payment happens on
+    ///      `sweep` and nowhere else.
+    function test_noSwapShapePaysHoldersWithoutASweep() public {
+        // A big exact-input buy to build a backlog, sent raw so the harness's `_swap` helper does
+        // not sweep it away.
         vm.prank(alice);
         swapRouter.swap(
             key,
             SwapParams({
                 zeroForOne: _buyIsZeroForOne(),
-                amountSpecified: -int256(hook.autoSweepThreshold(poolId) * 500),
+                amountSpecified: -int256(uint256(500e18)),
                 sqrtPriceLimitX96: _buyIsZeroForOne()
                     ? TickMath.MIN_SQRT_PRICE + 1
                     : TickMath.MAX_SQRT_PRICE - 1
@@ -302,16 +323,41 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
             ""
         );
 
-        // An exact-OUTPUT buy runs the afterSwap leg, which is where the auto path is attempted.
-        uint256 ledgerBefore = pair.balanceOf(address(dist));
-        _giveTokens(bob, 1_000_000e18);
-        _buyExactOut(alice, 100_000e18);
+        uint256 backlog = hook.pendingFees(poolId);
+        assertGt(backlog, 0, "precondition: a real, large backlog exists to be paid out");
 
-        assertGt(
+        // Bob becomes a holder, so there is somebody for a payout to actually reach.
+        _giveTokens(bob, 1_000_000e18);
+        uint256 ledgerBefore = pair.balanceOf(address(dist));
+
+        // The exact-OUTPUT buy: the ONLY shape that ever reached the automatic path. Sent RAW,
+        // because this harness's `_buyExactOut` sweeps on the way out and would answer the
+        // question this test is asking.
+        vm.prank(alice);
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: _buyIsZeroForOne(),
+                amountSpecified: int256(uint256(100_000e18)),
+                sqrtPriceLimitX96: _buyIsZeroForOne()
+                    ? TickMath.MIN_SQRT_PRICE + 1
+                    : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        assertEq(
             pair.balanceOf(address(dist)),
             ledgerBefore,
-            "holders were not paid without anyone calling sweep"
+            "no swap shape may move money to holders any more"
         );
+        assertGt(hook.pendingFees(poolId), backlog, "the trade still accrued its fee as a claim");
+
+        // And the manual path still works, which is what stops this being a test of a dead pool.
+        hook.sweep(key);
+        assertGt(pair.balanceOf(address(dist)), ledgerBefore, "sweep is what pays holders");
+        assertEq(hook.pendingFees(poolId), 0, "and it clears the whole backlog");
     }
 
     /// @dev The behaviour change made explicit: a trade charges the fee immediately, but the value
@@ -664,10 +710,8 @@ abstract contract FeeHookHarness is Test, LaunchTokenDeployer {
         assertGt(total, 0, "fee must have been taken at all");
         assertGt(creatorGot, 0, "creator was paid nothing");
 
-        // Assert the SPLIT, not a reconstructed absolute. Three things now come off a fee before
-        // it is divided - the burn wedge, the sweep bounty, and a burn share reserved by an
-        // automatic sweep for a later manual one - and which of them applied depends on how many
-        // trades took the auto path versus the manual path. Reconstructing that arithmetic in a
+        // Assert the SPLIT, not a reconstructed absolute. Two things come off a fee before it is
+        // divided - the burn wedge and the sweep bounty - and reconstructing that arithmetic in a
         // test just re-implements the contract and asserts it against itself.
         //
         // What must hold on every path is the RATIO: of everything that reaches the two of them,

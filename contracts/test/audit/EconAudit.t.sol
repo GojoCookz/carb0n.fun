@@ -185,7 +185,7 @@ abstract contract EconWorld is Test {
             rewardCurrency: address(0),
             feeRecipient: address(0),
             referrer: address(0),
-            metadata: LaunchMetadata({
+            openingWindow: 0, openingFeeBps: 0, metadata: LaunchMetadata({
                 imageCid: keccak256("image"),
                 bannerCid: keccak256("banner"),
                 infoCid: keccak256("info")

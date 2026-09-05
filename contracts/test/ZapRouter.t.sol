@@ -169,7 +169,7 @@ abstract contract ZapBase is FeeHookHarness {
                 creator: creator,
                 creatorBps: CREATOR_BPS,
                 rewardCurrency: Currency.wrap(address(0))
-            })
+            , openingWindow: 0, openingFeeBps: 0})
         );
         // Opened hard against the limit in the direction a SELL would push it, which is the state a
         // freshly launched single-sided pool is in before anybody has bought from it.

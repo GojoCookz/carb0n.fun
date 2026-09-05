@@ -124,8 +124,9 @@ abstract contract FeeAuditWorld is Test, LaunchTokenDeployer {
     }
 
     /// @dev Configure, initialise and seed a brand new pool with an arbitrary fee shape.
-    ///      `graduationThreshold == 0` means graduation (and therefore auto-sweep) stays UNARMED,
-    ///      which keeps a test's sweep path deterministic.
+    ///      `graduationThreshold == 0` means graduation stays UNCONFIGURED. (It also used to leave
+    ///      the automatic-sweep bar unarmed, which was the original reason for the zero; that
+    ///      mechanism has been deleted and sweeping is unconditionally manual now.)
     function _newPool(
         int24 tickSpacing,
         uint16 feeBps,
@@ -157,7 +158,7 @@ abstract contract FeeAuditWorld is Test, LaunchTokenDeployer {
                 creator: creator,
                 creatorBps: creatorBps,
                 rewardCurrency: Currency.wrap(address(0))
-            })
+            , openingWindow: 0, openingFeeBps: 0})
         );
         if (graduationThreshold != 0) hook.configureGraduation(k, graduationThreshold, SUPPLY);
 
@@ -208,7 +209,7 @@ abstract contract FeeAuditWorld is Test, LaunchTokenDeployer {
                 creator: creator,
                 creatorBps: 2000,
                 rewardCurrency: Currency.wrap(address(0))
-            })
+            , openingWindow: 0, openingFeeBps: 0})
         );
 
         manager.initialize(k, TickMath.getSqrtPriceAtTick(0));
@@ -305,26 +306,17 @@ abstract contract FeeAuditFindings is FeeAuditWorld {
         assertEq(pair.balanceOf(bob), bobBefore, "the sweep caller got no bounty either");
     }
 
-    /// @dev The same configuration also makes the automatic path a permanent, unconditional no-op
-    ///      that still costs every exact-output trader the gas of reaching it: `autoRedeem`
-    ///      reserves 100% for a burn, computes `payout == 0`, and returns having changed nothing.
-    function test_F01b_burnBps10000_makesAutoRedeemAPermanentNoOp() public {
-        PoolKey memory k = _newPool(60, 1000, 0, 10_000, 0, 1_000_000e18);
-        PoolId id = k.toId();
-
-        // Push the backlog well past the auto-sweep threshold.
-        _buyExactIn(k, alice, 500_000e18);
-        assertGt(hook.pendingFees(id), hook.autoSweepThreshold(id), "backlog is over the bar");
-
-        uint256 pendingBefore = hook.pendingFees(id);
-        uint256 distBefore = pair.balanceOf(address(dist));
-
-        // An exact-OUTPUT buy is the shape that reaches `_tryAutoSweep`.
-        _buyExactOut(k, bob, 1_000e18);
-
-        assertGt(hook.pendingFees(id), pendingBefore, "the trade still accrued");
-        assertEq(pair.balanceOf(address(dist)), distBefore, "auto sweep paid holders nothing");
-    }
+    /// DELETED: `test_F01b_burnBps10000_makesAutoRedeemAPermanentNoOp`.
+    ///
+    /// It asserted that at `burnBps == 10000` the AUTOMATIC path was a permanent no-op that still
+    /// charged every exact-output trader the gas of reaching it - `autoRedeem` reserved 100% for a
+    /// burn, computed `payout == 0` and returned. The automatic path has been deleted, so this is
+    /// a test of a removed feature.
+    ///
+    /// **F-01 itself is untouched and still open**: `burnBps = 10000` remains legal, and
+    /// `test_F01_burnBps10000_paysPlatformAndHoldersNothing` above still demonstrates the
+    /// whole finding on the manual `sweep` path, which is now the only path there is. Nothing was
+    /// weakened - if anything the finding is now simpler, because there is only one route to it.
 
     // -------------------------------------------------------------------------------------------
     // F-02  `platformShareBps` is derived from the BUY rate but applied to SELL fees too.
@@ -349,11 +341,11 @@ abstract contract FeeAuditFindings is FeeAuditWorld {
     ///
     ///      `PlatformFee.t.sol` asserts `assertLe(volumeBpsEarned, PLATFORM_VOLUME_BPS,
     ///      "platform was overpaid")`. It passes only because that fuzz hardcodes `sellFeeBps: 0`.
-    function test_F02_sellFeesArePaidToThePlatformAtTheBuyRateShare() public {
+    function test_F02_fixed_sellFeesArePaidToThePlatformAtTheSellRateShare() public {
         PoolKey memory k = _newPool(60, /*buy*/ 101, /*sell*/ 1000, 0, /*creatorBps*/ 5000, 0);
         PoolId id = k.toId();
 
-        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(id);
+        (,,,,,,,, uint16 platformShareBps,,,,,) = hook.poolConfig(id);
         assertEq(platformShareBps, 9_900, "one bp above the floor the platform takes 99% of the fee");
 
         // Give alice a position to sell, without routing through the pool.
@@ -382,30 +374,33 @@ abstract contract FeeAuditFindings is FeeAuditWorld {
 
         emit log_named_uint("platform bps of sell volume", platformBpsOfVolume);
 
-        assertGt(
+        // **INVERTED - F-02 IS FIXED.** Before: 1,052 bps of sell volume to the platform on this
+        // exact configuration, an order of magnitude over the documented flat 1%, with the creator
+        // and holders splitting a rounding error. After: 52 bps, comfortably under the cap, because
+        // the platform's share of a SELL fee is now derived from `sellFeeBps` and not from the buy
+        // rate. It lands under rather than exactly at 1% because the burn wedge and the sweep
+        // bounty are taken off the pot before the split.
+        assertLe(
             platformBpsOfVolume,
             hook.PLATFORM_VOLUME_BPS(),
             "PLATFORM OVERPAID: took more than 1% of sell volume"
         );
-        // ~10% of volume, i.e. an order of magnitude over the documented flat rate.
-        assertGt(platformBpsOfVolume, 500, "platform took over 5% of sell volume");
 
-        // The creator and the holders split the 1% of the fee the platform did not take, so their
-        // combined share of a 10% sell tax is a rounding error against the platform's.
-        assertLt(
+        // The creator and the holders now get the bulk of a 10% sell tax, which is the whole point.
+        assertGt(
             (pair.balanceOf(creator) - creatorBefore) + (pair.balanceOf(address(dist)) - distBefore),
-            platformGot / 50,
-            "creator and holders got a meaningful share of the sell tax"
+            platformGot,
+            "creator and holders should out-earn the platform on a 10% sell tax"
         );
     }
 
     /// @dev The mirror image: a high buy rate with a low sell rate UNDERPAYS the platform on sell
     ///      volume by the same ratio. 10% buy / 1% sell => the platform earns 0.1% of sell volume.
-    function test_F02b_theInverseConfigurationUnderpaysThePlatformOnSells() public {
-        PoolKey memory k = _newPool(60, /*buy*/ 1000, /*sell*/ 100, 0, /*creatorBps*/ 0, 0);
+    function test_F02b_fixed_theInverseConfigurationNoLongerUnderpaysThePlatform() public {
+        PoolKey memory k = _newPool(60, /*buy*/ 1000, /*sell*/ 101, 0, /*creatorBps*/ 0, 0);
         PoolId id = k.toId();
 
-        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(id);
+        (,,,,,,,, uint16 platformShareBps,,,,,) = hook.poolConfig(id);
         assertEq(platformShareBps, 1000, "a 10% fee gives the platform a tenth of it");
 
         token.transfer(alice, 1_000_000e18);
@@ -509,39 +504,51 @@ abstract contract FeeAuditFindings is FeeAuditWorld {
     }
 
     // -------------------------------------------------------------------------------------------
-    // F-04  An auto-sweep's "reserved for burn" is itself burn-fractioned by the next sweep.
+    // F-04  CLOSED BY DELETION. The finding was that an auto-sweep's "reserved for burn" got
+    //       burn-fractioned a second time by the next manual sweep, so a busy pool burned
+    //       `burnBps^2` of its fee instead of `burnBps`. There is no auto-sweep and no reserve.
     // -------------------------------------------------------------------------------------------
 
-    /// @dev `autoRedeem` parks `amount * burnBps / BPS` back into `pendingFees` so a later manual
-    ///      sweep can spend it on the buyback the auto path cannot run (FeeHook.sol:686-692). But
-    ///      `unlockCallback` does not know that balance is already earmarked: it applies
-    ///      `burnBps` to it AGAIN (FeeHook.sol:818), so only `burnBps^2` of the original fee is
-    ///      ever burned and the other `burnBps * (1 - burnBps)` is quietly re-routed to the
-    ///      platform, creator and holders.
+    /// @notice INVERTED from `test_F04_autoSweepReserveIsBurnFractionedTwice`.
     ///
-    ///      Nothing is stolen and nothing is lost. What is false is the documented behaviour: a
-    ///      pool busy enough to auto-sweep burns a small fraction of the wedge its creator chose.
-    function test_F04_autoSweepReserveIsBurnFractionedTwice() public {
+    /// @dev THE BUG. `autoRedeem` parked `amount * burnBps / BPS` back into `pendingFees` so a
+    ///      later manual sweep could spend it on the buyback the auto path could not run. But
+    ///      `unlockCallback` had no way to know that balance was already earmarked, so it applied
+    ///      `burnBps` to it AGAIN - only `burnBps^2` of the original fee was ever burned and the
+    ///      other `burnBps * (1 - burnBps)` was quietly re-routed to the platform, creator and
+    ///      holders. Nothing stolen, nothing lost; the documented behaviour was simply false.
+    ///
+    ///      MEASURED BEFORE, `burnBps = 2000`: the auto path parked a reserve, burned nothing
+    ///      itself, and the following manual sweep spent only `reserved * 2000 / 10000` of it on
+    ///      the buyback - one fifth of what the creator configured.
+    ///
+    ///      THE FIX IS THE DELETION. `autoRedeem` is gone, so nothing ever parks a pre-earmarked
+    ///      balance into `pendingFees`, so no balance is ever burn-fractioned twice. **The whole
+    ///      finding is a consequence of the auto path existing** - which is why it is inverted
+    ///      here rather than left open with the rest of the F-series.
+    ///
+    ///      MEASURED AFTER: with the SAME configuration and the SAME trade sequence, exactly
+    ///      `burnBps` of the swept fee is spent on the buyback, once.
+    function test_F04_fixed_theBurnWedgeIsAppliedExactlyOnce() public {
         uint16 burnBps = 2000;
         PoolKey memory k = _newPool(60, 1000, 0, burnBps, 0, 1_000_000e18);
         PoolId id = k.toId();
 
-        // Build a backlog over the auto-sweep bar without triggering it (exact-input never does).
+        // The same sequence the finding used: a big exact-input buy, then the exact-output buy
+        // that used to trigger the auto path and park a reserve.
         _buyExactIn(k, alice, 500_000e18);
         uint256 backlog = hook.pendingFees(id);
-        assertGt(backlog, hook.autoSweepThreshold(id), "over the auto-sweep bar");
+        assertGt(backlog, 0, "precondition: a real backlog exists");
 
-        // An exact-output buy runs `_afterSwap` and therefore `_tryAutoSweep`.
-        uint256 burnedBeforeAuto = hook.totalBurned(id);
+        uint256 burnedBefore = hook.totalBurned(id);
         _buyExactOut(k, bob, 1_000e18);
 
-        assertEq(hook.totalBurned(id), burnedBeforeAuto, "the auto path cannot burn, by design");
+        assertEq(hook.totalBurned(id), burnedBefore, "no swap shape burns anything mid-trade");
 
-        // Everything still pending is, by the contract's own comment, "reserved for burn".
-        uint256 reserved = hook.pendingFees(id);
-        assertGt(reserved, 0, "a burn reserve was parked");
+        // Nothing here is "reserved" any more - it is simply the unswept fee, all of it.
+        uint256 pending = hook.pendingFees(id);
+        assertGt(pending, backlog, "the second trade accrued too, so the pot grew");
 
-        // Now sweep manually. The whole reserve should be spent on the buyback.
         vm.recordLogs();
         hook.sweep(k);
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -554,17 +561,17 @@ abstract contract FeeAuditFindings is FeeAuditWorld {
             }
         }
 
-        emit log_named_uint("reserved for burn by the auto sweep", reserved);
-        emit log_named_uint("pair actually spent on the buyback ", pairSpentOnBurn);
+        emit log_named_uint("pot swept                          ", pending);
+        emit log_named_uint("pair spent on the buyback          ", pairSpentOnBurn);
+        emit log_named_uint("as bps of the pot                  ", (pairSpentOnBurn * 10_000) / pending);
 
-        // The documented intent is `pairSpentOnBurn == reserved`.
-        assertLt(pairSpentOnBurn, reserved, "the reserve was NOT spent on the burn");
-        // What actually happens is burnBps of the reserve, i.e. burnBps^2 of the original fee.
+        assertGt(pairSpentOnBurn, 0, "non-vacuity: the buyback really ran");
+        // THE INVERSION. This used to be `burnBps` OF `burnBps`; it is now `burnBps`, once.
         assertApproxEqAbs(
             pairSpentOnBurn,
-            (reserved * burnBps) / 10_000,
+            (pending * burnBps) / 10_000,
             2,
-            "only burnBps of the reserve is burned, not the reserve"
+            "exactly the configured burn wedge is spent, applied once and only once"
         );
     }
 

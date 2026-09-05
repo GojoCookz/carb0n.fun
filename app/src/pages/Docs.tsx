@@ -139,8 +139,8 @@ const SHORT: [string, string][] = [
     'Only if the creator set a sell rate — it defaults to zero and is capped at 10%, the same ceiling as buys. Sells are charged in the launch token rather than the pair currency, because a seller pays the token in and has no pair currency to take. Those tokens are swapped for the pair currency on a sweep and then paid out like any other fee.',
   ],
   [
-    'Why do sell fees arrive late?',
-    'Because converting them needs a swap, and the automatic path runs inside another swap — re-entering a pool mid-update. Sell fees and the buyback both wait for a sweep, which anyone can call for a 0.5% bounty. Buy fees are unaffected and pay out automatically.',
+    'Why do fees arrive late?',
+    'Nothing pays holders during a trade. Fees accrue inside the swap as claims and become real money only when somebody calls sweep(), which anyone may do for a 0.5% bounty. An earlier build tried to pay out automatically from inside the swap; it was deleted, because it never fired on ordinary trades and making it fire would have let the hook move tokens mid-swap and silently overcharge any router that pays before it swaps. Sell fees wait a further step because converting them into the pair currency needs a swap of its own. On a quiet pool this can be a while.',
   ],
   [
     'Why does my explorer say 0% fee?',

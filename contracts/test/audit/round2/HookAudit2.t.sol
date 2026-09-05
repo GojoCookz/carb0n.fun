@@ -533,7 +533,7 @@ abstract contract HookAudit2Launcher is HookAuditWorld {
     ///      (`pendingFees`, `pendingTokenFees`, the claim ledger) is complete regardless.
     function test_R2H_03_theHookNeverAssumesInstantHolderCredit() public {
         (address token, PoolKey memory k, PoolId id) = _taxedLaunch(1000, 0, 0);
-        (address distAddr,,,,,,,,,) = hook.poolConfig(id);
+        (address distAddr,,,,,,,,,,,,,) = hook.poolConfig(id);
         Distributor dist = Distributor(distAddr);
 
         uint256 bag = _acquire(k, token, alice, 50e18);
@@ -593,8 +593,10 @@ abstract contract HookAudit2Deferral is FeeAuditWorld {
     // Helpers
     // ------------------------------------------------------------------------------------------
 
-    /// @dev `FeeAuditWorld._newSingleSidedPool` hardcodes `burnBps: 0` and never arms graduation,
-    ///      so the buyback leg and the auto-sweep never run beside a deferral. This one can.
+    /// @dev `FeeAuditWorld._newSingleSidedPool` hardcodes `burnBps: 0`, so the buyback leg never
+    ///      runs beside a deferral. This one can. (It also arms graduation, which used to arm the
+    ///      automatic sweep as a side effect; that mechanism has been deleted and graduation now
+    ///      arms nothing but graduation.)
     function _ssPool(uint16 feeBps, uint16 sellFeeBps, uint16 burnBps, uint256 gradThreshold)
         internal
         returns (PoolKey memory k)
@@ -635,7 +637,7 @@ abstract contract HookAudit2Deferral is FeeAuditWorld {
                 creator: creator,
                 creatorBps: 2000,
                 rewardCurrency: Currency.wrap(address(0))
-            })
+            , openingWindow: 0, openingFeeBps: 0})
         );
         if (gradThreshold != 0) hook.configureGraduation(k, gradThreshold, SUPPLY);
 
@@ -860,9 +862,9 @@ abstract contract HookAudit2Deferral is FeeAuditWorld {
     // ------------------------------------------------------------------------------------------
 
     /// @dev The existing regression (`FeeAudit.t.sol:test_F05_...`) proves this on a pool with no
-    ///      burn wedge and no graduation armed. This runs the same proof with `burnBps = 2000` and
-    ///      the auto-sweep armed, so the conversion leg, the buyback leg, the bounty and the
-    ///      three-way split all execute in the same `unlockCallback` as the carry.
+    ///      burn wedge. This runs the same proof with `burnBps = 2000`, so the conversion leg, the
+    ///      buyback leg, the bounty and the three-way split all execute in the same
+    ///      `unlockCallback` as the carry.
     function test_R2H_13_aCarriedPileConvertsInFullOnceBuyingRebuildsThePairSide() public {
         PoolKey memory k = _ssPool(300, 1000, 2000, 1_000_000e18);
         PoolId id = k.toId();
@@ -1264,7 +1266,7 @@ abstract contract HookAudit2Deferral is FeeAuditWorld {
                 creator: creator,
                 creatorBps: 2000,
                 rewardCurrency: Currency.wrap(address(0))
-            })
+            , openingWindow: 0, openingFeeBps: 0})
         );
         manager.initialize(b, TickMath.getSqrtPriceAtTick(0));
         (int24 lo, int24 hi) = _tokenIsCurrency0()

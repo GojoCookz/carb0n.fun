@@ -169,15 +169,17 @@ export function TokenPage() {
               </p>
             )}
             <p>
-              Payouts are pushed to you automatically when they clear the dust floor, and you can
-              always pull them yourself — a holder is never dependent on someone else paying gas.
+              <span className="text-bone-200">You claim your dividends yourself.</span> There is a
+              push path in the contract, but nothing calls it on a schedule, so treat it as
+              something that may happen rather than something that will. Pulling always works and
+              never depends on anyone else paying gas.
             </p>
             <p>
               Balances under{' '}
               <span className="tnum font-mono text-bone-200">
                 {fmtSupply(distributionFloorTokens(draft))}
               </span>{' '}
-              tokens are not queued for automatic pushes. They can still be claimed manually.
+              tokens are not added to the payout queue. They can still be claimed directly.
             </p>
           </div>
         </Card>

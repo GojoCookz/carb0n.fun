@@ -16,6 +16,10 @@ import type { Pair } from './pairs'
 export const BPS = 10_000
 /** FeeHook.MAX_FEE_BPS — 10% is the most any launch may charge. */
 export const MAX_FEE_BPS = 1000
+/** FeeHook.MAX_OPENING_WINDOW - longest an anti-snipe decay may run, in seconds. */
+export const MAX_OPENING_WINDOW = 300
+/** FeeHook.MAX_OPENING_FEE_BPS - highest rate a market may open at. */
+export const MAX_OPENING_FEE_BPS = 9_900
 /** Launcher.MAX_DEV_BUY_BPS — the creator's opening buy, as a share of the pair seed. */
 export const MAX_DEV_BUY_BPS = 1000
 /** Launcher.MIN_MAX_WALLET_BPS — below this a cap stops being anti-whale and blocks transfers. */
@@ -49,6 +53,8 @@ export const SIMPLE_PRESET = {
   devBuyPairAmount: 0,
   vestDuration: 0,
   vestCliff: 0,
+  openingWindow: 0,
+  openingFeeBps: 0,
 } as const
 
 export type LaunchDraft = {
@@ -81,6 +87,23 @@ export type LaunchDraft = {
   vestDuration: number
   /** Seconds before anything unlocks. Must not exceed the duration. */
   vestCliff: number
+  /**
+   * Seconds of decaying opening fee. **Zero disables it.**
+   *
+   * The E-01 mitigation. A pool seeded single-sided opens against a hard floor, which hands the
+   * first transaction in the launch block a risk-free option on the whole supply - measured at
+   * -3.00 pair downside against +157.21 upside, with organic buyers losing 154.82 of 200. A window
+   * charges a premium for exercising that option early, decaying to nothing by the time it closes.
+   */
+  openingWindow: number
+  /**
+   * The buy rate at the opening instant, decaying linearly to `feeBps`.
+   *
+   * Must exceed `feeBps` whenever a window is set. Everything above `feeBps` goes to the PLATFORM,
+   * never the creator - otherwise a creator could snipe their own launch and collect the penalty
+   * they triggered.
+   */
+  openingFeeBps: number
   /** IPFS CID. Required — `Launcher._validate` reverts `ImageRequired` without it. */
   imageCid: string
   /** IPFS CID for a 1500x500 banner. Optional; a launch with none renders a fallback. */
@@ -356,6 +379,37 @@ export function validate(d: LaunchDraft, pair: Pair | undefined): Issue[] {
       field: 'vestCliff',
       message: 'The cliff cannot be longer than the lock itself.',
       revert: 'VestCliffExceedsDuration',
+    })
+  }
+
+  // Opening-fee window. Mirrors `FeeHook.configurePoolFull` rule for rule; the contract validates
+  // rather than clamps, so the form does too.
+  if (d.openingWindow > MAX_OPENING_WINDOW) {
+    out.push({
+      field: 'openingWindow',
+      message: `The anti-snipe window cannot exceed ${MAX_OPENING_WINDOW} seconds.`,
+      revert: 'OpeningWindowTooLong',
+    })
+  }
+  if (d.openingWindow > 0 && d.openingFeeBps <= d.feeBps) {
+    out.push({
+      field: 'openingFeeBps',
+      message: 'The opening rate has to be higher than your normal buy fee, or it does nothing.',
+      revert: 'OpeningFeeBelowNormalRate',
+    })
+  }
+  if (d.openingWindow > 0 && d.openingFeeBps > MAX_OPENING_FEE_BPS) {
+    out.push({
+      field: 'openingFeeBps',
+      message: `The opening rate cannot exceed ${MAX_OPENING_FEE_BPS / 100}%.`,
+      revert: 'FeeTooHigh',
+    })
+  }
+  if (d.openingWindow === 0 && d.openingFeeBps !== 0) {
+    out.push({
+      field: 'openingWindow',
+      message: 'An opening rate with no window does nothing. Set a window or clear the rate.',
+      revert: 'OpeningWindowTooLong',
     })
   }
   if (d.creatorBps > BPS) {

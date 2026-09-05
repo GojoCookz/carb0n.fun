@@ -15,14 +15,22 @@ import { parseAbi } from 'viem'
 import { useLaunches } from '../lib/useLaunches'
 import { useTokenDetail } from '../lib/useTokenDetail'
 import { useWallet } from '../lib/useWallet'
-import { sepoliaClient } from '../lib/chain'
+import { poolKeyFor } from '../lib/tradeTx'
+import { sepoliaClient, DEPLOYMENTS } from '../lib/chain'
 import { walletClient, walletErrorMessage, isUserRejection } from '../lib/wallet'
 import { TradePanel } from '../components/TradePanel'
 import { LaunchCard } from '../components/LaunchCard'
 import { DividendPanel } from '../components/DividendPanel'
 import { TokenFacts } from '../components/TokenFacts'
+import { SweepPanel } from '../components/SweepPanel'
 
 const WITHDRAW_ABI = parseAbi(['function withdraw()'])
+// Named components: viem takes an object for a named tuple and an array for an unnamed one, so an
+// unnamed signature turns `poolKeyFor`'s object into `Address "undefined" is invalid` at encode
+// time rather than anything that names the cause.
+const SWEEP_ABI = parseAbi([
+  'function sweep((address currency0,address currency1,uint24 fee,int24 tickSpacing,address hooks) key)',
+])
 
 export function Token() {
   const { address } = useParams<{ address: string }>()
@@ -31,6 +39,8 @@ export function Token() {
   const [claiming, setClaiming] = useState(false)
   const [claimError, setClaimError] = useState<string | null>(null)
   const [claimNonce, setClaimNonce] = useState(0)
+  const [sweeping, setSweeping] = useState(false)
+  const [sweepError, setSweepError] = useState<string | null>(null)
 
   const listing =
     state.kind === 'ok'
@@ -88,6 +98,38 @@ export function Token() {
       if (!isUserRejection(e)) setClaimError(walletErrorMessage(e))
     } finally {
       setClaiming(false)
+    }
+  }
+
+  /**
+   * `sweep()` is permissionless and pays its caller a 0.5% bounty. It is also the ONLY thing that
+   * turns accrued claims into money — the automatic path was deleted because it never fired on
+   * ordinary trades and making it fire would have broken settlement for third-party routers.
+   */
+  async function sweep() {
+    if (!account || !listing?.chainPair || !listing.address) return
+    const feeHook = DEPLOYMENTS.sepolia.feeHook
+    if (!feeHook) return
+    setSweepError(null)
+    setSweeping(true)
+    try {
+      const { key } = poolKeyFor(listing.address, listing.chainPair)
+      const wallet = walletClient(account)
+      const hash = await wallet.writeContract({
+        address: feeHook,
+        abi: SWEEP_ABI,
+        functionName: 'sweep',
+        args: [key],
+        chain: wallet.chain,
+        account,
+      })
+      const r = await sepoliaClient.waitForTransactionReceipt({ hash })
+      if (r.status !== 'success') throw new Error('The sweep reverted.')
+      setClaimNonce((n) => n + 1)
+    } catch (e) {
+      if (!isUserRejection(e)) setSweepError(walletErrorMessage(e))
+    } finally {
+      setSweeping(false)
     }
   }
 
@@ -152,6 +194,18 @@ export function Token() {
               {claimError && (
                 <p className="mt-2 text-[12px] leading-relaxed text-danger-400">{claimError}</p>
               )}
+              <div className="mt-5">
+                <SweepPanel
+                  fees={detail.fees}
+                  pairSymbol={listing.pair.symbol}
+                  pairDecimals={listing.pair.decimals}
+                  tokenSymbol={listing.symbol}
+                  account={account ?? null}
+                  onSweep={sweep}
+                  sweeping={sweeping}
+                  error={sweepError}
+                />
+              </div>
             </div>
           )}
         </div>

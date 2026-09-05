@@ -77,6 +77,8 @@ export function buildParams(d: LaunchDraft, pair: LaunchablePair) {
     rewardCurrency: addressOrZero(launchablePairFor(d.rewardSymbol)?.address ?? ''),
     feeRecipient: addressOrZero(d.feeRecipient),
     referrer: addressOrZero(d.referrer),
+    openingWindow: d.openingWindow,
+    openingFeeBps: d.openingFeeBps,
     metadata: {
       imageCid: image.digest,
       bannerCid: banner.digest,

@@ -1435,7 +1435,7 @@ abstract contract ZapAuditCases is ZapBase {
                 creator: creator,
                 creatorBps: CREATOR_BPS,
                 rewardCurrency: Currency.wrap(address(0))
-            })
+            , openingWindow: 0, openingFeeBps: 0})
         );
         manager.initialize(k, TickMath.getSqrtPriceAtTick(0));
         _seedNarrow(k);

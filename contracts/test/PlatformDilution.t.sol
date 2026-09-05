@@ -43,14 +43,14 @@ contract PlatformDilutionTest is FeeHookHarness {
                 creator: creator,
                 creatorBps: 5000,
                 rewardCurrency: Currency.wrap(address(0))
-            })
+            , openingWindow: 0, openingFeeBps: 0})
         );
     }
 
     /// With no burn, the platform's slice of the fee is worth exactly the flat rate.
     function test_withoutABurnThePlatformEarnsTheFullFlatRate() public {
         PoolKey memory k = _configureWithBurn(0);
-        (,, uint16 feeBps,,,,,, uint16 shareBps,) = hook.poolConfig(k.toId());
+        (,, uint16 feeBps,,,,,, uint16 shareBps,,,,,) = hook.poolConfig(k.toId());
 
         uint256 volumeBps = (uint256(feeBps) * shareBps) / hook.BPS();
         assertEq(volumeBps, hook.PLATFORM_VOLUME_BPS(), "default launch must pay the full 1%");
@@ -60,7 +60,7 @@ contract PlatformDilutionTest is FeeHookHarness {
     function test_aBurnDilutesThePlatformCutByTheBurnShare() public {
         uint16 burnBps = 1500; // 15%
         PoolKey memory k = _configureWithBurn(burnBps);
-        (,, uint16 feeBps,,,,,, uint16 shareBps,) = hook.poolConfig(k.toId());
+        (,, uint16 feeBps,,,,,, uint16 shareBps,,,,,) = hook.poolConfig(k.toId());
 
         // What `_routeFee` actually receives is the fee less the burn share.
         uint256 reaching = (uint256(feeBps) * (hook.BPS() - burnBps)) / hook.BPS();
@@ -78,7 +78,7 @@ contract PlatformDilutionTest is FeeHookHarness {
         burnBps = uint16(bound(burnBps, 0, 5000));
 
         PoolKey memory k = _configureWithBurn(burnBps);
-        (,, uint16 feeBps,,,,,, uint16 shareBps,) = hook.poolConfig(k.toId());
+        (,, uint16 feeBps,,,,,, uint16 shareBps,,,,,) = hook.poolConfig(k.toId());
 
         uint256 reaching = (uint256(feeBps) * (hook.BPS() - burnBps)) / hook.BPS();
         uint256 volumeBps = (reaching * shareBps) / hook.BPS();

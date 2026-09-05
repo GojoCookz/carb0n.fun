@@ -30,6 +30,9 @@ import {
   fmtBps,
   fmtSupply,
   issueFor,
+  MAX_OPENING_WINDOW,
+  MAX_OPENING_FEE_BPS,
+  type Issue,
   maxWalletTokens,
   openingMarketCap,
   openingPrice,
@@ -280,6 +283,7 @@ export function Launch() {
         ) : (
           <>
             <DividendOptIn draft={draft} set={set} pair={pair} />
+            <AntiSnipeOptIn draft={draft} set={set} issues={issues} />
             <FeeWalletOptIn draft={draft} set={set} issues={issues} />
 
         <Disclosure
@@ -856,6 +860,86 @@ function SimpleTerms({ split }: { split: ReturnType<typeof feeSplit> }) {
  * earn. Defaulting the picker to the pair currency is a convenience, not a constraint — every
  * allowlisted currency is selectable.
  */
+/**
+ * The anti-snipe window — the E-01 mitigation, and the one control on this form that protects
+ * somebody other than the creator.
+ *
+ * **The disclosure is not decoration.** Without a window the first transaction in the launch block
+ * holds a risk-free option on the entire supply, measured at -3.00 pair downside against +157.21
+ * upside with organic buyers losing 154.82 of 200. A creator who leaves this off is choosing that,
+ * and they should be choosing it knowingly rather than by not scrolling.
+ */
+function AntiSnipeOptIn({
+  draft,
+  set,
+  issues,
+}: {
+  draft: LaunchDraft
+  set: <K extends keyof LaunchDraft>(key: K, value: LaunchDraft[K]) => void
+  issues: Issue[]
+}) {
+  const on = draft.openingWindow > 0
+  const windowIssue = issueFor(issues, 'openingWindow')
+  const rateIssue = issueFor(issues, 'openingFeeBps')
+
+  return (
+    <OptIn
+      question="Protect the opening?"
+      hint="For a few seconds after launch the buy fee starts high and falls to your normal rate. It makes the first block expensive to snipe."
+      on={on}
+      // 20 seconds at 99% is what the measurement was taken against, and what the closest live
+      // comparable ships. The excess never reaches you, so there is nothing to tune for profit.
+      onChange={(v) => {
+        set('openingWindow', v ? 20 : 0)
+        set('openingFeeBps', v ? 9_900 : 0)
+      }}
+    >
+      <div className="space-y-3">
+        <BpsSlider
+          label="Opening buy fee"
+          hint={`falls to ${fmtBps(draft.feeBps)} by the end of the window`}
+          value={draft.openingFeeBps}
+          max={MAX_OPENING_FEE_BPS}
+          step={100}
+          onChange={(v) => set('openingFeeBps', v)}
+          error={rateIssue?.message}
+        />
+        <label className="block">
+          <span className="font-display text-[13px] font-semibold text-bone-200">
+            Window
+            <span className="ml-1.5 font-sans text-[11px] font-medium text-bone-500">
+              seconds, max {MAX_OPENING_WINDOW}
+            </span>
+          </span>
+          <input
+            type="range"
+            min={5}
+            max={MAX_OPENING_WINDOW}
+            step={5}
+            value={draft.openingWindow}
+            onChange={(e) => set('openingWindow', Number(e.target.value))}
+            className="mt-2 h-1.5 w-full cursor-pointer appearance-none rounded-full bg-ink-700 accent-bone-50"
+          />
+          <p className="tnum mt-1.5 font-mono text-[14px] font-bold text-bone-50">
+            {draft.openingWindow}s — {fmtBps(draft.openingFeeBps)} decaying to {fmtBps(draft.feeBps)}
+          </p>
+        </label>
+
+        {(windowIssue || rateIssue) && (
+          <p className="text-[12px] leading-relaxed text-danger-400">
+            {(windowIssue ?? rateIssue)!.message}
+          </p>
+        )}
+
+        <Source>
+          Everything above your normal rate goes to the platform, not to you — otherwise you could
+          snipe your own launch and collect the penalty. Sells are never affected.
+        </Source>
+      </div>
+    </OptIn>
+  )
+}
+
 function DividendOptIn({
   draft,
   set,
@@ -872,7 +956,7 @@ function DividendOptIn({
   return (
     <OptIn
       question="Pay holders dividends?"
-      hint="Holders earn from every trade, automatically, in whatever token you choose."
+      hint="Every trade accrues a fee to holders, in whatever token you choose. It becomes claimable once somebody sweeps the pool."
       on={on}
       // Turning it on hands holders a quarter by default so the slider starts somewhere real.
       onChange={(v) => set('creatorBps', v ? 7_500 : 10_000)}

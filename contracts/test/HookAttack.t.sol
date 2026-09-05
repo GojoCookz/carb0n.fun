@@ -56,19 +56,19 @@ contract HookAttackTest is FeeHookHarness {
         hook.unlockCallback(payload);
     }
 
-    /// `autoRedeem` is `external` so the auto-sweep path gets a real revert boundary for its
-    /// try/catch. External plus unguarded would mean anyone can drive the payout path directly.
-    function test_attack_outsiderCannotCallAutoRedeem() public {
-        // Read the config FIRST. `_cfgFor` makes an external call to the hook's `poolConfig`
-        // getter, and Solidity evaluates arguments before the call they belong to - so inlining
-        // it would feed the prank and the expectRevert to the getter instead, and the test would
-        // "fail" on a contract that is behaving correctly.
-        FeeHook.PoolConfig memory cfg = _cfgFor();
-
-        vm.prank(attacker);
-        vm.expectRevert(HookBase.NotPoolManager.selector);
-        hook.autoRedeem(poolId, key, cfg);
-    }
+    /// DELETED: `test_attack_outsiderCannotCallAutoRedeem`.
+    ///
+    /// `autoRedeem` was `external` only so the automatic-sweep path's `try/catch` had a real
+    /// revert boundary, and it needed a `msg.sender == address(this)` guard precisely because
+    /// being external made it reachable. **The whole automatic path has been deleted**, so the
+    /// function, its guard and the attack surface it created are all gone. This is a test of a
+    /// removed feature, not a weakened test: there is no longer an externally reachable payout
+    /// entry point on this hook for an outsider to drive. The remaining external surface is
+    /// `sweep` (permissionless BY DESIGN, routing strictly by stored config) and `unlockCallback`
+    /// (guarded, covered above).
+    ///
+    /// Its `_cfgFor` helper went with it - it existed only to build the `PoolConfig` argument
+    /// `autoRedeem` took, and no other test needs one.
 
     // ===========================================================================================
     // Configuration
@@ -91,7 +91,7 @@ contract HookAttackTest is FeeHookHarness {
             creator: attacker,
             creatorBps: 10_000, // the whole fee to the attacker
             rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         vm.prank(attacker);
         vm.expectRevert(FeeHook.OnlyLauncher.selector);
@@ -117,7 +117,7 @@ contract HookAttackTest is FeeHookHarness {
             creator: attacker,
             creatorBps: 2000,
             rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         // Called AS the launcher, which this test contract is.
         vm.expectRevert();
@@ -140,7 +140,7 @@ contract HookAttackTest is FeeHookHarness {
             creator: address(this),
             creatorBps: 0,
             rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         vm.expectRevert(abi.encodeWithSelector(FeeHook.FeeTooHigh.selector, uint16(1001)));
         hook.configurePoolFull(_freshKey(), s);
@@ -163,7 +163,7 @@ contract HookAttackTest is FeeHookHarness {
             creator: address(this),
             creatorBps: 5000, // 60% + 50% = 110% of the fee
             rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         vm.expectRevert();
         hook.configurePoolFull(_freshKey(), s);
@@ -180,29 +180,4 @@ contract HookAttackTest is FeeHookHarness {
         k.tickSpacing = 61;
     }
 
-    function _cfgFor() internal view returns (FeeHook.PoolConfig memory) {
-        (
-            address distributor,
-            Currency pairCurrency,
-            uint16 feeBps,
-            address creator,
-            uint16 creatorBps,
-            bool configured,
-            uint16 sellFeeBps,
-            uint16 burnBps,
-            uint16 platformShareBps,
-            Currency rewardCurrency
-        ) = hook.poolConfig(poolId);
-        return FeeHook.PoolConfig({
-            distributor: distributor,
-            pairCurrency: pairCurrency,
-            feeBps: feeBps,
-            creator: creator,
-            creatorBps: creatorBps,
-            configured: configured,
-            sellFeeBps: sellFeeBps,
-            burnBps: burnBps,
-            platformShareBps: platformShareBps,
-            rewardCurrency: rewardCurrency
-        });
-    }}
+}

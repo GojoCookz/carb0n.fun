@@ -107,6 +107,41 @@ contract FeeHook is HookBase {
         ///      `creatorBps`, `configured`, `sellFeeBps` and `burnBps`, so this costs NO new
         ///      storage slot. `PoolConfig` is loaded into memory on every single swap.
         uint16 platformShareBps;
+        /// @dev The platform's share of a SELL fee, derived from `sellFeeBps` — not from `feeBps`.
+        ///
+        ///      **This exists because deriving one share from the buy rate and applying it to both
+        ///      is finding F-02.** The platform takes a flat share of VOLUME, so its share of a
+        ///      FEE depends on which fee it is. At `feeBps = 100, sellFeeBps = 1000` the buy-derived
+        ///      share is `BPS`, and applying that to converted sell fees handed the platform
+        ///      912 bps of sell volume instead of 100.
+        ///
+        ///      Also packed into slot 2: after `creator`, `creatorBps`, `configured`, `sellFeeBps`,
+        ///      `burnBps` and `platformShareBps` there were 3 bytes spare, so this costs NO new
+        ///      storage slot and no extra SLOAD on the swap path.
+        uint16 sellPlatformShareBps;
+        /// @dev Unix second the opening-fee decay ends. Zero disables the whole mechanism.
+        ///
+        ///      **This is the E-01 mitigation.** A single-sided pool opens at a creator-chosen tick
+        ///      with a hard floor beneath it, which hands the first transaction in the launch block
+        ///      a risk-free call option on the entire supply: audit 05 measured the downside capped
+        ///      at `feeBps` (-3.00 pair) against +157.21 upside, with organic buyers losing 154.82
+        ///      of 200. A dev buy does not defend it - the sniper pays 196.71% of the creator's
+        ///      average price.
+        ///
+        ///      A decaying opening fee is the only option costed in `audit/09-remediation.md` that
+        ///      changes the option's PREMIUM rather than just its size. It does not remove the
+        ///      option; it prices it.
+        ///
+        ///      Packed into slot 3 beside `rewardCurrency` (20 bytes), which had 12 spare. Costs no
+        ///      new storage slot.
+        uint32 openingFeeEndsAt;
+        /// @dev How long that decay runs, kept so the interpolation has a denominator.
+        uint32 openingWindow;
+        /// @dev The buy rate at the instant the market opens, decaying linearly to `feeBps` by
+        ///      `openingFeeEndsAt`. Everything above `feeBps` is routed to the PLATFORM, never to
+        ///      the creator - otherwise a creator could snipe their own launch and collect the
+        ///      penalty they triggered.
+        uint16 openingFeeBps;
         /// @dev What holders are paid IN. Equal to `pairCurrency` on most launches, in which case
         ///      no conversion happens at all and this costs nothing.
         ///
@@ -148,10 +183,73 @@ contract FeeHook is HookBase {
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     /// @notice Paid to whoever calls `sweep`, out of the amount swept. 0.5%.
+    ///
     /// @dev Sweeping costs gas and benefits holders rather than the caller, so without a bounty
     ///      the job depends on altruism and simply does not get done. This makes it a job a bot
     ///      takes the moment it clears their gas, which is what turns accrual into payment.
+    ///
+    ///      **Since there is no automatic path, this bounty is the entire payout mechanism, so
+    ///      the size of pot it actually pays for is a property of the product, not a detail.**
+    ///      Measured in `test/audit/11-sweep/SweepEconomics.t.sol`, on a `Launcher`-seeded pool
+    ///      with no burn wedge, at **20 gwei**:
+    ///
+    ///      ```
+    ///        sweep gas, keeper never paid in this currency : 203,941      (~0.004079 ETH)
+    ///        sweep gas, keeper already holding it          :  85,176      (~0.001704 ETH)
+    ///        BREAK-EVEN POT, first sweep of a pair         : ~0.8158 pair
+    ///        BREAK-EVEN POT, steady state                  : ~0.3407 pair
+    ///        BREAK-EVEN POT, launch with a 30% burn wedge  : ~1.4532 pair
+    ///      ```
+    ///
+    ///      **Read those in PAIR units, not ETH.** The bounty is paid in the pool's pair currency
+    ///      and the gas bill is in ETH, so the figures are directly comparable only on a
+    ///      WETH-paired launch. On any other pair a keeper has to price the pair currency itself,
+    ///      and a pair currency that is thin or unpriceable is one no bot will sweep for.
+    ///
+    ///      The consequence, which the token page must state rather than bury: **a launch whose
+    ///      unswept pot is under roughly a third of a pair unit has nobody paid to pay its
+    ///      holders.** Holders are not at risk - the claims are exact and `sweep` stays open
+    ///      forever - but they wait, and on a quiet or dying pool they wait indefinitely. The
+    ///      creator is the party with both the motive and the cheapest access to fix that, since
+    ///      the same call also pays them `creatorBps`.
     uint16 public constant SWEEP_BOUNTY_BPS = 50;
+
+    /// @notice How far the protocol's OWN swaps may move the price before they stop filling.
+    ///
+    /// @dev **Finding E-05.** `sweep` makes two swaps on the protocol's behalf — converting the
+    ///      sell-tax pile and executing the buyback — and both used to run with
+    ///      `sqrtPriceLimitX96` pinned at the tick extreme, i.e. no floor at all. `sweep` is
+    ///      permissionless and its inputs are public storage, so both were predictable and
+    ///      sandwichable; audit 05 measured a large buy starving the burn by **14.92%**.
+    ///
+    ///      The bound is expressed as a PRICE LIMIT rather than a minimum-output check, and that
+    ///      choice is the important one. A `minOut` revert would brick `sweep`, and `sweep` is the
+    ///      only thing that clears `pendingTokenFees` — that is finding F-05, a self-perpetuating
+    ///      brick that stops dividends forever. A price limit instead makes the swap fill only as
+    ///      far as the bound allows and leaves the remainder unconsumed, which both call sites now
+    ///      hand back to the queue. Slippage becomes a DEFERRAL, never a failure.
+    ///
+    ///      This bounds the leak per sweep. It does not stop a determined sandwicher, because the
+    ///      bound is derived from a price they may already have moved — closing that needs a stored
+    ///      reference price and an SSTORE on every trade, which is not worth it for a periodic swap
+    ///      that audit 05 measured as ~10x underwater to attack. Documented, not hidden.
+    uint16 public constant MAX_SWEEP_SLIP_BPS = 100;
+
+    /// @notice Longest an opening-fee decay may run. Five minutes.
+    /// @dev Bounded so the mechanism cannot become a permanent tax wearing a temporary name. A
+    ///      sniper's edge is measured in blocks, not minutes, so anything longer is punishing
+    ///      ordinary early buyers rather than defending them.
+    uint32 public constant MAX_OPENING_WINDOW = 300;
+
+    /// @notice Highest opening rate a launch may start at. 99%.
+    uint16 public constant MAX_OPENING_FEE_BPS = 9_900;
+
+    /// @notice Pair-currency fees collected ABOVE the normal rate during the opening window.
+    /// @dev Held apart from `pendingFees` because all of it goes to the platform. Folding it into
+    ///      the normal pot would pay the creator a share of the penalty their own launch triggered,
+    ///      which is exactly the self-snipe incentive the window exists to remove.
+    mapping(PoolId => uint256) public pendingOpeningFees;
+
 
     /// @notice The platform's cut, in basis points OF TRADED VOLUME. 1%.
     ///
@@ -189,9 +287,6 @@ contract FeeHook is HookBase {
     mapping(PoolId => uint256) public pendingTokenFees;
     /// @notice Launch tokens bought back and burned per pool. Diagnostics only.
     mapping(PoolId => uint256) public totalBurned;
-    /// @notice Pair-currency backlog at which a swap will opportunistically pay holders.
-    ///         Zero disables the automatic path entirely, leaving only `sweep`.
-    mapping(PoolId => uint256) public autoSweepThreshold;
     /// @notice Graduation threshold and latch, per pool.
     /// @dev A SEPARATE mapping from `poolConfig` on purpose. `_beforeSwap` and `_afterSwap` load
     ///      `poolConfig` into memory on every single trade; folding three more words into that
@@ -216,10 +311,10 @@ contract FeeHook is HookBase {
     /// @dev The pool could not absorb it. Deferred rather than reverted: sweep is the only
     ///      thing that clears this backlog, so a revert here would brick it permanently.
     event SellFeeConversionDeferred(PoolId indexed poolId, uint256 returned);
-    /// @notice An automatic sweep was attempted and failed. The claim stays queued for `sweep`.
-    event AutoSweepSkipped(PoolId indexed poolId, uint256 pending);
     /// @notice Paid to whoever called `sweep`, out of what they swept.
     event SweepBounty(PoolId indexed poolId, address indexed caller, uint256 amount);
+    /// @notice The opening-window penalty, paid whole to the platform. See `openingFeeEndsAt`.
+    event OpeningFeeCollected(PoolId indexed poolId, uint256 amount);
     /// @notice Redeemed and paid out. Emitted on `sweep`, not on the trade that earned it.
     event FeeTaken(
         PoolId indexed poolId,
@@ -247,6 +342,8 @@ contract FeeHook is HookBase {
     error GraduationAlreadyConfigured();
     error GraduationNotConfigured();
     error ThresholdRequired();
+    error OpeningWindowTooLong(uint32 given);
+    error OpeningFeeBelowNormalRate(uint16 given);
     error SupplyRequired();
     /// @notice The buy was cut short by its own price limit, so the fee would have been charged on
     ///         input the pool never spent. See `_assertExactInputBuyFilled`.
@@ -302,6 +399,11 @@ contract FeeHook is HookBase {
         uint16 creatorBps;
         /// @dev Zero means "pay holders in the pair currency", which is the common case.
         Currency rewardCurrency;
+        /// @dev Seconds the opening-fee decay runs for. **Zero disables it**, which is the
+        ///      behaviour every launch had before this existed.
+        uint32 openingWindow;
+        /// @dev The buy rate at the opening instant. Must exceed `feeBps` when a window is set.
+        uint16 openingFeeBps;
     }
 
     function configurePool(
@@ -323,7 +425,7 @@ contract FeeHook is HookBase {
                 creator: creator,
                 creatorBps: creatorBps,
                 rewardCurrency: pairCurrency
-            })
+            , openingWindow: 0, openingFeeBps: 0})
         );
     }
 
@@ -353,6 +455,12 @@ contract FeeHook is HookBase {
         // show the real numbers on the steep part of the curve, where the arithmetic is correct
         // but surprising.
         if (s.feeBps <= PLATFORM_VOLUME_BPS) revert FeeBelowPlatformFloor(s.feeBps);
+        // The SELL rate needs exactly the same floor for exactly the same reason. Zero is legal and
+        // means "sells are free"; anything above zero must still be able to pay the platform's cut
+        // and leave something behind.
+        if (s.sellFeeBps != 0 && s.sellFeeBps <= PLATFORM_VOLUME_BPS) {
+            revert FeeBelowPlatformFloor(s.sellFeeBps);
+        }
 
         PoolId id = key.toId();
         if (poolConfig[id].configured) revert AlreadyConfigured();
@@ -361,6 +469,25 @@ contract FeeHook is HookBase {
         // of that fee the flat rate represents. At 2% it is half; at 10% it is a tenth. Computed
         // once here so the sweep path never divides.
         uint16 platformShareBps = uint16((uint256(PLATFORM_VOLUME_BPS) * BPS) / s.feeBps);
+        // **Derived from the SELL rate, which is the whole of finding F-02.** One share computed
+        // from the buy rate and applied to both is how the platform ended up taking 912 bps of sell
+        // volume on a `feeBps = 100 / sellFeeBps = 1000` launch.
+        uint16 sellPlatformShareBps =
+            s.sellFeeBps == 0 ? 0 : uint16((uint256(PLATFORM_VOLUME_BPS) * BPS) / s.sellFeeBps);
+
+        // Opening-fee window. Zero window means the mechanism is off, which is what every launch
+        // did before it existed. Validated rather than clamped, per the house rule.
+        uint32 openingFeeEndsAt;
+        if (s.openingWindow != 0) {
+            if (s.openingWindow > MAX_OPENING_WINDOW) revert OpeningWindowTooLong(s.openingWindow);
+            if (s.openingFeeBps <= s.feeBps) revert OpeningFeeBelowNormalRate(s.openingFeeBps);
+            if (s.openingFeeBps > MAX_OPENING_FEE_BPS) revert FeeTooHigh(s.openingFeeBps);
+            openingFeeEndsAt = uint32(block.timestamp) + s.openingWindow;
+        } else if (s.openingFeeBps != 0) {
+            // An opening rate with no window to apply it over is a configuration the creator did
+            // not get. Refuse it rather than silently ignoring half of what they asked for.
+            revert OpeningWindowTooLong(0);
+        }
 
         // The creator's and the burn's shares are taken from what REMAINS after the platform, so
         // `creatorBps` means "of my own cut" rather than "of the headline rate". Anything else
@@ -375,6 +502,10 @@ contract FeeHook is HookBase {
             sellFeeBps: s.sellFeeBps,
             burnBps: s.burnBps,
             platformShareBps: platformShareBps,
+            sellPlatformShareBps: sellPlatformShareBps,
+            openingFeeEndsAt: openingFeeEndsAt,
+            openingWindow: s.openingWindow,
+            openingFeeBps: s.openingFeeBps,
             // Zero collapses to the pair currency, so the no-conversion path needs no branch.
             rewardCurrency: Currency.unwrap(s.rewardCurrency) == address(0)
                 ? s.pairCurrency
@@ -448,11 +579,12 @@ contract FeeHook is HookBase {
 
         emit GraduationConfigured(id, token, threshold, supply);
 
-        // Auto-sweep once the backlog reaches 0.1% of the graduation bar. Tied to the threshold
-        // rather than to a constant because the right number is entirely relative to the pool: a
-        // fixed figure is dust on a large launch and unreachable on a small one. A launch that
-        // never crosses it still gets paid - `sweep` is always available and pays a bounty.
-        autoSweepThreshold[id] = threshold / 1000;
+        // NOTE FOR ANYONE READING THE HISTORY. This function used to arm a second, unrelated
+        // mechanism here: `autoSweepThreshold[id] = threshold / 1000`, a backlog level at which a
+        // swap would pay holders on its way through. That mechanism has been DELETED - see the
+        // "There is no automatic sweep" section at the top of `sweep` for why. Graduation keeps
+        // its own threshold because graduation is a signal, and a signal has nothing to do with
+        // when money moves.
     }
 
     /// @notice Latch a pool as graduated if its market cap has reached the threshold.
@@ -634,7 +766,10 @@ contract FeeHook is HookBase {
         bool pairIsCurrency0 = Currency.unwrap(cfg.pairCurrency) == Currency.unwrap(key.currency0);
         bool isBuy = params.zeroForOne == pairIsCurrency0;
 
-        uint16 rate = isBuy ? cfg.feeBps : cfg.sellFeeBps;
+        // A buy inside the opening window pays the decayed rate; everything else pays the normal
+        // one. `_currentBuyFeeBps` returns `cfg.feeBps` unchanged for every launch that never set
+        // a window, so this costs a branch and nothing else.
+        uint16 rate = isBuy ? _currentBuyFeeBps(cfg) : cfg.sellFeeBps;
         if (rate == 0) return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
 
         uint256 amountIn = uint256(-params.amountSpecified);
@@ -699,8 +834,9 @@ contract FeeHook is HookBase {
         Currency feeCurrency = inputIsCurrency0 ? key.currency0 : key.currency1;
         _accrue(id, feeCurrency, isBuy, fee);
 
-        _tryAutoSweep(id, key, cfg);
-
+        // NOTHING ELSE HAPPENS HERE, AND THAT IS THE POINT. This is where an opportunistic payout
+        // used to run. `_accrue` mints an ERC-6909 claim and moves no ERC-20, so after this line
+        // the swap touches no real token balance on the singleton at all. See `sweep`.
         return (IHooks.afterSwap.selector, int128(uint128(fee)));
     }
 
@@ -735,13 +871,20 @@ contract FeeHook is HookBase {
         BalanceDelta delta,
         PoolConfig memory cfg,
         bool pairIsCurrency0
-    ) internal pure {
+    ) internal view {
         // Only the leg that was charged in the pair currency.
         if (params.zeroForOne != pairIsCurrency0) return;
-        if (cfg.feeBps == 0) return;
+
+        // **The rate has to be the one `_beforeSwap` actually charged, not `cfg.feeBps`.** During
+        // an opening-fee window those differ by up to two orders of magnitude, and computing the
+        // expected fee from the normal rate made this guard fire on every ordinary buy inside the
+        // window — the curve legitimately sees only what is left after a 99% fee, and that is not
+        // a price-limited fill.
+        uint16 rate = _currentBuyFeeBps(cfg);
+        if (rate == 0) return;
 
         uint256 requested = uint256(-params.amountSpecified);
-        uint256 fee = (requested * cfg.feeBps) / BPS;
+        uint256 fee = (requested * rate) / BPS;
         if (fee == 0) return;
 
         // What the curve was actually handed, after `_beforeSwap` took the fee out of the input.
@@ -753,58 +896,6 @@ contract FeeHook is HookBase {
         if (consumed + fee < requested) {
             revert PriceLimitedBuyWouldOvercharge(requested, consumed, fee);
         }
-        key;
-    }
-
-    /// @dev Opportunistic payout, attempted once the pair-currency backlog is worth the gas.
-    ///
-    ///      **It can never revert the trade.** The whole attempt is a self-call inside
-    ///      `try/catch`, so a paused pair currency, a blocklisted distributor or a hostile creator
-    ///      makes the sweep a no-op and the swap continues. That isolation is the entire reason
-    ///      this is an external self-call rather than an internal one - Trail of Bits' rule is to
-    ///      keep non-essential code out of the user's flow, and a dividend is non-essential to
-    ///      somebody else's swap.
-    ///
-    ///      It deliberately handles ONLY the pair-currency claims. Converting sell fees and
-    ///      running the buyback both need a swap, and swapping the same pool from inside its own
-    ///      `afterSwap` re-enters a pool whose state is mid-update. Those stay on the manual path.
-    function _tryAutoSweep(PoolId id, PoolKey calldata key, PoolConfig memory cfg) internal {
-        uint256 threshold = autoSweepThreshold[id];
-        if (threshold == 0 || pendingFees[id] < threshold) return;
-
-        try this.autoRedeem(id, key, cfg) {}
-        catch {
-            // Left pending on purpose. `sweep` will collect it later and the trade is unaffected.
-            emit AutoSweepSkipped(id, pendingFees[id]);
-        }
-    }
-
-    /// @dev The auto path's body. External so the `try/catch` above gets a real revert boundary,
-    ///      and gated to this contract so nobody else can drive it.
-    function autoRedeem(PoolId id, PoolKey calldata key, PoolConfig memory cfg) external {
-        if (msg.sender != address(this)) revert NotPoolManager();
-
-        uint256 amount = pendingFees[id];
-        if (amount == 0) return;
-
-        // RESERVE THE BURN SHARE. The buyback needs a swap and the auto path cannot swap, so if
-        // this paid out the whole balance the burn wedge would silently never fire on any pool
-        // busy enough for auto-sweep to handle its volume - the wedge would look armed and do
-        // nothing. The burn share stays queued as a claim for the next manual `sweep` to spend.
-        uint256 reservedForBurn = (amount * cfg.burnBps) / BPS;
-        uint256 payout = amount - reservedForBurn;
-        pendingFees[id] = reservedForBurn;
-        if (payout == 0) return;
-
-        // We are already inside the manager's unlock cycle here, so this must NOT call `unlock`
-        // again - `burn` and `take` go direct. `take` draws on reserves earlier trades already
-        // settled; if the singleton is short, the catch above puts the claim back in the queue.
-        poolManager.burn(address(this), cfg.pairCurrency.toId(), payout);
-        poolManager.take(cfg.pairCurrency, address(this), payout);
-        _routeFee(id, cfg, payout);
-
-        // `key` is unused beyond identifying the pool, but taking it keeps this signature aligned
-        // with `sweep` so the two paths are obviously the same operation.
         key;
     }
 
@@ -831,7 +922,18 @@ contract FeeHook is HookBase {
         poolManager.mint(address(this), feeCurrency.toId(), fee);
 
         if (isBuy) {
-            pendingFees[id] += fee;
+            // Split the opening-window penalty out of the ordinary fee. The normal-rate portion
+            // is routed as usual; the excess is the platform's alone, so a creator cannot snipe
+            // their own launch and collect the penalty it triggers.
+            uint16 normalRate = poolConfig[id].feeBps;
+            uint16 chargedRate = _currentBuyFeeBps(poolConfig[id]);
+            if (chargedRate > normalRate) {
+                uint256 normalPart = (fee * normalRate) / chargedRate;
+                pendingFees[id] += normalPart;
+                pendingOpeningFees[id] += fee - normalPart;
+            } else {
+                pendingFees[id] += fee;
+            }
             totalFeesTaken[id] += fee;
         } else {
             // A sell is charged in LAUNCH TOKENS. It is tracked separately because it has to be
@@ -843,9 +945,48 @@ contract FeeHook is HookBase {
     }
 
     /// @notice Redeem accrued claims for real tokens and pay the creator and the holders.
+    ///
     /// @dev Permissionless and idempotent: anyone may call it, and it is a no-op with nothing
     ///      pending. It is deliberately OUTSIDE the swap path, so a hostile creator, a blocklisted
     ///      distributor or a paused pair currency can never revert somebody else's trade.
+    ///
+    ///      ## THERE IS NO AUTOMATIC SWEEP. THIS IS THE ONLY WAY FEES BECOME PAYMENTS.
+    ///
+    ///      An earlier build attempted an opportunistic payout from inside `_afterSwap`
+    ///      (`_tryAutoSweep` / `autoRedeem`). It was deleted outright, and this is the record of
+    ///      why, because "why is there no automatic path?" is the first question anyone reading
+    ///      this file will ask.
+    ///
+    ///      1. **It never fired on real traffic.** `_afterSwap` returns at its `exactInput` guard
+    ///         before anything else can run, and `rate == 0` kills exact-output sells on a default
+    ///         launch. The ONLY shape that reached it was an exact-OUTPUT buy - which no router,
+    ///         aggregator or swap UI sends by default. Measured: twenty ordinary exact-input buys
+    ///         built a backlog five times over its own bar and paid the distributor, the creator
+    ///         and the platform exactly zero.
+    ///
+    ///      2. **Making it reachable would have broken settlement for other people.** Its body
+    ///         called `poolManager.take()`, i.e. it moved real ERC-20 out of the singleton in the
+    ///         middle of somebody else's swap. `PoolManager._settle` credits a payer with
+    ///         `balanceOfSelf() - syncedReserves`, so anything that leaves between a caller's
+    ///         `sync` and their `settle` is silently deducted from what that caller is credited.
+    ///         `sync -> transfer -> swap -> settle` is perfectly legal v4 and is what an intent
+    ///         solver, a batch executor or any pay-up-front router writes. Measured against a
+    ///         control run of the identical trade: true cost 0.4005 pair, sync-first cost 3.4122
+    ///         pair - **8.5x** - and when the backlog exceeded the prepay it underflowed to a bare
+    ///         panic `0x11` instead, which tells an integrator nothing.
+    ///
+    ///      So the choice was "a feature that does nothing" or "a feature that overcharges
+    ///      strangers 8.5x", and the third option was to delete it. **After the deletion this
+    ///      contract moves no ERC-20 during a swap at all** - `_accrue` only mints an ERC-6909
+    ///      claim - which makes the whole class of mid-swap settlement corruption structurally
+    ///      unreachable rather than merely unlikely.
+    ///
+    ///      ## WHAT THAT COSTS, STATED PLAINLY
+    ///
+    ///      Fees accrue exactly, on every trade, as claims. They become money only when somebody
+    ///      calls this function, and until then a holder's `withdrawableOf` is zero. The bounty in
+    ///      `SWEEP_BOUNTY_BPS` is what makes that somebody exist; see its docstring for the pot
+    ///      size at which it actually pays.
     function sweep(PoolKey calldata key) external returns (uint256 swept) {
         PoolId id = key.toId();
         if (!poolConfig[id].configured) revert NotConfigured();
@@ -889,15 +1030,21 @@ contract FeeHook is HookBase {
         // Doing the buyback before burning its claim opens a pair debt nothing pays, which is
         // exactly the `CurrencyNotSettled` this ordering exists to avoid.
 
-        // 1. Redeem the pair-currency claims into a credit.
-        if (pairAmount != 0) {
-            poolManager.burn(address(this), cfg.pairCurrency.toId(), pairAmount);
+        // 1. Redeem the pair-currency claims into a credit. The opening-window penalty rides along
+        //    as a claim like any other, but is tracked apart so step 4 can route it whole.
+        uint256 openingAmount = pendingOpeningFees[id];
+        if (openingAmount != 0) delete pendingOpeningFees[id];
+        if (pairAmount + openingAmount != 0) {
+            poolManager.burn(address(this), cfg.pairCurrency.toId(), pairAmount + openingAmount);
         }
 
         // 2. Sell fees arrived in launch tokens. Redeem them and swap them for the pair currency,
         //    which lands as more pair credit. `Hooks.noSelfCall` means the manager skips this
         //    hook's own callbacks here, so this internal swap is untaxed and cannot recurse.
         uint256 totalPair = pairAmount;
+        // How much of the pot came from SELL fees. Buy fees are `pairAmount`; everything the
+        // conversion swap produces is sell-origin, and the two carry different platform shares.
+        uint256 fromSells;
         if (tokenAmount != 0) {
             // **The pool may be unable to absorb this, and that must not be fatal.** Production
             // pools are seeded SINGLE-SIDED, so the pair reserve is only ever what buyers put in.
@@ -906,6 +1053,18 @@ contract FeeHook is HookBase {
             // a revert here meant every future sweep reverted too, for every caller, forever.
             // Dividends, creator revenue and platform revenue all stopped permanently, and one
             // dump by any large holder was enough to trigger it.
+            // **This leg is deliberately NOT slippage-bounded, and that is a measured decision.**
+            //
+            // Bounding it was tried. It converts the pile in slices, each slice lands at lower
+            // price impact, and the total pair recovered across many sweeps therefore EXCEEDS one
+            // big sweep — so the 0.5% bounty is farmable by fragmentation. Measured at the 1% bound:
+            // repeated sweeps earned 145.98 pair of bounty against 42.43 for a single sweep, 3.4x,
+            // breaking the round-2 invariant `R2H-14` that exists to rule exactly that out. It also
+            // stopped a carried pile ever draining in full, which is the F-05 property.
+            //
+            // The buyback below IS bounded, because that is the leg audit 05 actually measured
+            // being starved. This leg's exposure is bounded instead by the fact that converting at
+            // a worse price hurts the sweeper's own bounty and the creator's own cut.
             uint160 limit = !pairIsCurrency0
                 ? TickMath.MIN_SQRT_PRICE + 1
                 : TickMath.MAX_SQRT_PRICE - 1;
@@ -944,7 +1103,12 @@ contract FeeHook is HookBase {
                 }
 
                 int128 gained = pairIsCurrency0 ? d.amount0() : d.amount1();
-                if (gained > 0) totalPair += uint256(uint128(gained));
+                if (gained > 0) {
+                    totalPair += uint256(uint128(gained));
+                    // Tracked separately because the platform's share of a SELL fee is derived from
+                    // the sell rate, not the buy rate. See F-02 and `_platformBpsFor`.
+                    fromSells += uint256(uint128(gained));
+                }
             } else {
                 // Nothing was burned, so there is no delta to close. Put it straight back.
                 pendingTokenFees[id] += tokenAmount;
@@ -958,24 +1122,50 @@ contract FeeHook is HookBase {
         uint256 toBurn = (totalPair * cfg.burnBps) / BPS;
         if (toBurn != 0) {
             totalPair -= toBurn;
+
+            (uint160 burnSqrtPrice,,,) = poolManager.getSlot0(id);
             BalanceDelta d = poolManager.swap(
                 key,
                 SwapParams({
                     // Buying the launch token: pay pair in, receive token out.
                     zeroForOne: pairIsCurrency0,
                     amountSpecified: -int256(toBurn),
-                    sqrtPriceLimitX96: pairIsCurrency0
-                        ? TickMath.MIN_SQRT_PRICE + 1
-                        : TickMath.MAX_SQRT_PRICE - 1
+                    // Bounded at `MAX_SWEEP_SLIP_BPS` from spot rather than at the tick extreme.
+                    sqrtPriceLimitX96: _slipLimit(burnSqrtPrice, pairIsCurrency0)
                 }),
                 ""
             );
+
+            // **Return whatever the bound stopped us spending.** This swap could always fill
+            // partially in principle — audit 04 flagged it as having the same unchecked-consumption
+            // shape as the F-05 brick, unreachable only because the seed runs to `maxUsableTick`.
+            // A price limit makes a partial fill LIKELY rather than theoretical, so the leftover
+            // pair credit has to go back into `totalPair` or `unlock` reverts `CurrencyNotSettled`
+            // on the open delta. Closing this is part of the same change, not a separate fix.
+            int128 pairDelta = pairIsCurrency0 ? d.amount0() : d.amount1();
+            uint256 spentPair = pairDelta < 0 ? uint256(uint128(-pairDelta)) : 0;
+            if (spentPair < toBurn) totalPair += toBurn - spentPair;
+
             int128 bought = pairIsCurrency0 ? d.amount1() : d.amount0();
             if (bought > 0) {
                 uint256 burned = uint256(uint128(bought));
                 poolManager.take(tokenCurrency, DEAD, burned);
                 totalBurned[id] += burned;
-                emit Burned(id, toBurn, burned);
+                emit Burned(id, spentPair, burned);
+            }
+        }
+
+        // 3b. The opening-window penalty goes WHOLE to the platform: no burn wedge, no sweep
+        //     bounty, no creator share, no holder share. It is a penalty on sniping, not revenue
+        //     to be divided - and every wei of it that reached the creator would be an incentive
+        //     to snipe their own launch, which is the one thing this mechanism must not create.
+        //
+        //     A failed send leaves it on this contract rather than reverting the sweep, which is
+        //     the same treatment `_routeFee` gives every other recipient.
+        if (openingAmount != 0) {
+            poolManager.take(cfg.pairCurrency, address(this), openingAmount);
+            if (_trySend(Currency.unwrap(cfg.pairCurrency), platformRecipient, openingAmount)) {
+                emit OpeningFeeCollected(id, openingAmount);
             }
         }
 
@@ -995,10 +1185,57 @@ contract FeeHook is HookBase {
                 }
             }
 
-            if (totalPair != 0) _routeFee(id, cfg, totalPair);
+            if (totalPair != 0) {
+                _routeFee(id, cfg, totalPair, _platformBpsFor(cfg, pairAmount, fromSells));
+            }
         }
 
         return "";
+    }
+
+    /// @notice The buy rate right now, including any opening-fee decay still running.
+    ///
+    /// @dev Linear from `openingFeeBps` at the opening instant down to `feeBps` when the window
+    ///      closes. Public so a UI can count the window down live — a decaying fee nobody can see
+    ///      is a tax, and a visible one is a queue.
+    ///
+    ///      Returns `feeBps` unchanged once the window has passed, and for every launch that never
+    ///      set one.
+    function currentBuyFeeBps(PoolId id) public view returns (uint16) {
+        PoolConfig memory cfg = poolConfig[id];
+        return _currentBuyFeeBps(cfg);
+    }
+
+    function _currentBuyFeeBps(PoolConfig memory cfg) internal view returns (uint16) {
+        uint32 endsAt = cfg.openingFeeEndsAt;
+        if (endsAt == 0 || block.timestamp >= endsAt) return cfg.feeBps;
+
+        // `remaining / window` of the way from `feeBps` up to `openingFeeBps`. Integer maths
+        // throughout; it errs downward, so the decay is never harsher than advertised.
+        uint256 remaining = uint256(endsAt) - block.timestamp;
+        uint256 window = cfg.openingWindow;
+        if (window == 0) return cfg.feeBps;
+        if (remaining > window) remaining = window;
+
+        uint256 spread = uint256(cfg.openingFeeBps) - cfg.feeBps;
+        return uint16(cfg.feeBps + (spread * remaining) / window);
+    }
+
+    /// @dev A price bound `MAX_SWEEP_SLIP_BPS` away from spot, in SQRT space.
+    ///
+    ///      Price is the square of `sqrtPriceX96`, so a `b` bps bound on price is `b/2` bps on the
+    ///      square root to first order. Clamped inside the usable range, because handing the
+    ///      manager a limit at or past the extreme reverts `PriceLimitAlreadyExceeded` before it
+    ///      does any work.
+    function _slipLimit(uint160 sqrtPriceX96, bool zeroForOne) internal pure returns (uint160) {
+        uint256 half = uint256(MAX_SWEEP_SLIP_BPS) / 2;
+        uint256 bounded = zeroForOne
+            ? (uint256(sqrtPriceX96) * (BPS - half)) / BPS
+            : (uint256(sqrtPriceX96) * (BPS + half)) / BPS;
+
+        if (bounded <= TickMath.MIN_SQRT_PRICE) return TickMath.MIN_SQRT_PRICE + 1;
+        if (bounded >= TickMath.MAX_SQRT_PRICE) return TickMath.MAX_SQRT_PRICE - 1;
+        return uint160(bounded);
     }
 
     /// @dev Splits a swept fee three ways - platform, creator, holders - and forwards each.
@@ -1012,8 +1249,30 @@ contract FeeHook is HookBase {
     ///      Sends are raw calls: a hostile or blocklisted creator must not be able to revert the
     ///      sweep for everyone else. A failed payout strands the tokens on this contract rather
     ///      than trapping the rest of the distribution.
-    function _routeFee(PoolId id, PoolConfig memory cfg, uint256 fee) internal {
-        uint256 toPlatform = (fee * cfg.platformShareBps) / BPS;
+    /// @dev The platform's share of a MIXED pot, weighted by where the money came from.
+    ///
+    ///      **Finding F-02.** The pot handed to `_routeFee` is buy fees plus converted sell fees,
+    ///      and the platform's flat share of VOLUME implies a different share of each. Applying the
+    ///      buy-derived rate to the whole pot took 912 bps of sell volume on a
+    ///      `feeBps = 100 / sellFeeBps = 1000` launch.
+    ///
+    ///      The burn wedge and the sweep bounty are both taken proportionally from the combined
+    ///      pot, so they scale both origins equally and a single blended rate is exactly equivalent
+    ///      to splitting the pot and routing each half. One division instead of two paths.
+    function _platformBpsFor(PoolConfig memory cfg, uint256 fromBuys, uint256 fromSells)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 total = fromBuys + fromSells;
+        if (total == 0) return cfg.platformShareBps;
+        return (fromBuys * cfg.platformShareBps + fromSells * cfg.sellPlatformShareBps) / total;
+    }
+
+    function _routeFee(PoolId id, PoolConfig memory cfg, uint256 fee, uint256 platformBps)
+        internal
+    {
+        uint256 toPlatform = (fee * platformBps) / BPS;
         uint256 rest = fee - toPlatform;
 
         uint256 toCreator = (rest * cfg.creatorBps) / BPS;

@@ -16,10 +16,9 @@ import {FeeHookHarness} from "./FeeHook.t.sol";
 ///      launch pay the same 1%, and everything above that belongs to the creator.
 ///
 ///      These tests therefore check the RATIO against the trade, and against `feeBps`, rather than
-///      reconstructing an absolute. Three things already come off a fee before it is divided (the
-///      burn wedge, the sweep bounty, and a burn share reserved by an auto-sweep for a later
-///      manual one), so a reconstructed absolute would just re-implement the contract and assert
-///      it against itself.
+///      reconstructing an absolute. Two things come off a fee before it is divided (the burn wedge
+///      and the sweep bounty), so a reconstructed absolute would just re-implement the contract and
+///      assert it against itself.
 contract PlatformFeeTest is FeeHookHarness {
     function _tokenIsCurrency0() internal pure override returns (bool) {
         return true;
@@ -32,7 +31,7 @@ contract PlatformFeeTest is FeeHookHarness {
     /// At the harness's own rate, the platform's share of the fee is exactly the flat volume rate
     /// divided by that fee. This is the arithmetic the whole design rests on.
     function test_platformShareIsDerivedFromTheFeeRate() public view {
-        (,, uint16 feeBps,,,,,, uint16 platformShareBps,) = hook.poolConfig(poolId);
+        (,, uint16 feeBps,,,,,, uint16 platformShareBps,,,,,) = hook.poolConfig(poolId);
 
         uint256 expected = (uint256(hook.PLATFORM_VOLUME_BPS()) * hook.BPS()) / feeBps;
         assertEq(platformShareBps, expected, "platform share was not derived from the fee rate");
@@ -62,13 +61,13 @@ contract PlatformFeeTest is FeeHookHarness {
             creator: creator,
             creatorBps: 5000,
             rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         PoolKey memory k = key;
         k.tickSpacing = 61; // a pool that has never been configured
         hook.configurePoolFull(k, s);
 
-        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(k.toId());
+        (,,,,,,,, uint16 platformShareBps,,,,,) = hook.poolConfig(k.toId());
 
         // Rounding is toward zero on an integer division, so the platform is never overpaid.
         uint256 volumeBpsEarned = (uint256(feeBps) * platformShareBps) / hook.BPS();
@@ -110,7 +109,7 @@ contract PlatformFeeTest is FeeHookHarness {
 
         assertGt(distributed, 0, "nothing was distributed at all");
 
-        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(poolId);
+        (,,,,,,,, uint16 platformShareBps,,,,,) = hook.poolConfig(poolId);
         assertApproxEqRel(
             (platformGot * 10_000) / distributed,
             platformShareBps,
@@ -132,13 +131,13 @@ contract PlatformFeeTest is FeeHookHarness {
             creator: creator,
             creatorBps: 10_000, // everything, and dividends off - "simple mode"
                 rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         PoolKey memory k = key;
         k.tickSpacing = 61;
         hook.configurePoolFull(k, s);
 
-        (,,,,,,,, uint16 platformShareBps,) = hook.poolConfig(k.toId());
+        (,,,,,,,, uint16 platformShareBps,,,,,) = hook.poolConfig(k.toId());
         assertGt(platformShareBps, 0, "a 100% creator share zeroed the platform");
         assertEq(platformShareBps, 5000, "at a 2% fee the platform's half of it is 1% of volume");
     }
@@ -159,7 +158,7 @@ contract PlatformFeeTest is FeeHookHarness {
             creator: creator,
             creatorBps: 5000,
             rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         PoolKey memory k = key;
         k.tickSpacing = 61;
@@ -201,7 +200,7 @@ contract PlatformFeeTest is FeeHookHarness {
             creator: creator,
             creatorBps: 8000,
             rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         PoolKey memory k = key;
         k.tickSpacing = 61;
@@ -237,7 +236,7 @@ contract PlatformFeeTest is FeeHookHarness {
             creator: creator,
             creatorBps: 8000,
             rewardCurrency: Currency.wrap(address(0))
-        });
+        , openingWindow: 0, openingFeeBps: 0});
 
         PoolKey memory k = key;
         k.tickSpacing = 62;

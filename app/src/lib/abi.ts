@@ -35,6 +35,9 @@ export const LAUNCH_PARAMS_COMPONENTS = [
   { name: 'rewardCurrency', type: 'address' },
   { name: 'feeRecipient', type: 'address' },
   { name: 'referrer', type: 'address' },
+  // The E-01 mitigation. Zero window disables it and the launch behaves as it always did.
+  { name: 'openingWindow', type: 'uint32' },
+  { name: 'openingFeeBps', type: 'uint16' },
   {
     name: 'metadata',
     type: 'tuple',

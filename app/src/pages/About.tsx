@@ -59,8 +59,8 @@ export function About() {
             body="Nothing fills up and nothing migrates. Graduation here is a signal — a threshold, a one-way latch and an event for apps to index. It unlocks nothing and pays nothing, because the market cap behind it is a spot price anyone can move inside a single transaction."
           />
           <Risk
-            title="Sell fees do not pay out on the sell"
-            body="Sells can be charged, but the fee arrives in the launch token — a seller pays the token in and has no pair currency to take. Converting it needs a swap, and the automatic path runs inside somebody else's swap, which would re-enter a pool mid-update. So sell fees and the buyback both sit as a claim until a sweep, which anyone can call for a 0.5% bounty. On a quiet pool that can be a while. Buy fees are unaffected."
+            title="Nothing pays out during a trade"
+            body="No fee pays anybody during a trade. Fees accrue inside the swap as claims and become real money only when somebody calls sweep(), which anyone may do for a 0.5% bounty. Sell fees wait a further step: they arrive in the launch token, and converting them to the pair currency needs a swap of its own. An earlier build tried to pay out automatically from inside the swap and it was deleted - it never fired on ordinary trades, and making it fire would have let the hook move tokens mid-swap and silently overcharge any router that pays before it swaps. On a quiet pool a sweep can be a while coming."
           />
           <Risk
             title="Explorers will report every pool here at 0% fee"

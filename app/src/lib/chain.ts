@@ -87,9 +87,9 @@ export const DEPLOYMENTS: { sepolia: Deployment; mainnet: Deployment } = {
     // struct argument CHANGES THE FUNCTION SELECTOR, so the previous launcher could not have
     // accepted a call from this build at all - the button would have reverted on every attempt.
     pairRegistry: '0xd2Ed630c334355e8A38f06FddF9F2C72bf776340',
-    launcher: '0x01Bb4b4f8f70DF56A3F3C754BFFd618D9f9f2Dc6',
-    feeHook: '0xAE97429E14Ee64d9A57b059d1D1d8700fdF060cC',
-    referralVault: '0xc1B8E7cc08826E1460f0895281631F86b0e75449',
+    launcher: '0x900C3d3db6629D421CBE8aB1C5CFC35FC566A133',
+    feeHook: '0xe8fbfdB1A38E87b5cCf52b98dC7510E7E18Fe0CC',
+    referralVault: '0x0497b2983f2802a3492E407fC45898DE917897F7',
     // Redeployed when `ZapRouter` gained a `deadline` argument and a WETH wrap path — the
     // constructor and both entry-point selectors changed, so the previous address could not have
     // accepted a call from this build.

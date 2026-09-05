@@ -29,6 +29,21 @@ import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/Reentrancy
 ///        - PULL  `withdraw()`       - always available, so a holder is never dependent on anyone
 ///                                     else paying gas.
 ///
+///      **PULL IS THE PATH THAT PAYS PEOPLE. PUSH IS A COURTESY, AND NOBODY IS PAID TO PERFORM
+///      IT.** `processBatch` takes no fee and pays its caller nothing - unlike `FeeHook.sweep`,
+///      which pays `SWEEP_BOUNTY_BPS` and is therefore a job a bot will actually take. Measured in
+///      `test/audit/11-sweep/SweepEconomics.t.sol`: walking a two-holder queue costs **146,459
+///      gas** (~0.00293 ETH at 20 gwei) and returns the caller exactly zero. So the realistic
+///      callers are the creator, the platform, or a holder who would rather push than pull - never
+///      an unaffiliated keeper doing it for profit.
+///
+///      That is a deliberate choice, not an oversight. A bounty on the push would have to come out
+///      of the holders' own dividends, and it would pay for walking a queue that any holder can
+///      already skip entirely by calling `withdraw()` themselves for the same gas. Adding a second
+///      incentivised entry point to a room that already has an unlocked door is how you end up
+///      paying somebody to open it. **`withdraw()` is the guarantee; `processBatch` is a
+///      convenience.** Any UI must present it that way round.
+///
 ///      A push send that reverts (blocklisted recipient, hostile receiver) is SKIPPED, not
 ///      bubbled - one bad address must never brick the queue. That is why sends go through a raw
 ///      call rather than SafeERC20.

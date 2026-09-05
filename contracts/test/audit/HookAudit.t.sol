@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test, stdError} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 
 import {PoolManager} from "v4-core/PoolManager.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
@@ -20,7 +20,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Launcher} from "../../src/Launcher.sol";
 import {FeeHook} from "../../src/FeeHook.sol";
-import {HookBase} from "../../src/base/HookBase.sol";
 import {LaunchToken} from "../../src/LaunchToken.sol";
 import {Distributor} from "../../src/Distributor.sol";
 import {PairRegistry} from "../../src/PairRegistry.sol";
@@ -230,7 +229,7 @@ abstract contract HookAuditWorld is Test {
             rewardCurrency: address(0),
             feeRecipient: address(0),
             referrer: address(0),
-            metadata: LaunchMetadata({
+            openingWindow: 0, openingFeeBps: 0, metadata: LaunchMetadata({
                 imageCid: keccak256("image"),
                 bannerCid: keccak256("banner"),
                 infoCid: keccak256("info")
@@ -283,7 +282,8 @@ abstract contract HookAuditWorld is Test {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Swap helpers - deliberately WITHOUT an automatic sweep, unlike `FeeHook.t.sol`'s `_swap`
+    // Swap helpers. These do NOT call `hook.sweep` afterwards, unlike `FeeHook.t.sol`'s `_swap`,
+    // because most of this file is about what a swap does and does not do on its own.
     // ------------------------------------------------------------------------------------------
 
     function _swapRaw(PoolKey memory k, address who, bool zeroForOne, int256 amountSpecified)
@@ -365,54 +365,93 @@ abstract contract HookAuditCases is HookAuditWorld {
     using StateLibrary for IPoolManager;
 
     // -------------------------------------------------------------------------------------------
-    // V-01  The automatic sweep is UNREACHABLE from an exact-input swap.
+    // V-01  REGRESSION GUARD. The automatic sweep used to be unreachable from every exact-input
+    //       swap - i.e. from all real router traffic. It has been DELETED, so it is now
+    //       unreachable from every swap shape, uniformly and by construction.
     // -------------------------------------------------------------------------------------------
 
-    /// @dev `_afterSwap` returns at FeeHook.sol:631 (`if (exactInput) return ...`) - which is
-    ///      BEFORE `_tryAutoSweep` at FeeHook.sol:650. Exact input is the shape every router,
-    ///      aggregator and swap UI sends by default, so on ordinary traffic the automatic payout
-    ///      never runs no matter how large the backlog gets.
+    /// @notice INVERTED from `test_V01_autoSweepIsUnreachableFromExactInputSwaps`.
     ///
-    ///      The same early-return chain also kills it for exact-OUTPUT sells on the default launch:
-    ///      `sellFeeBps == 0` returns at FeeHook.sol:636. So the ONLY shape that can reach the auto
-    ///      path is an exact-output BUY.
-    function test_V01_autoSweepIsUnreachableFromExactInputSwaps() public {
+    /// @dev THE FINDING. `_afterSwap` returned at its `exactInput` guard BEFORE `_tryAutoSweep`,
+    ///      and `rate == 0` killed exact-output sells on a default launch, so the ONLY shape that
+    ///      could reach the automatic payout was an exact-output BUY. Exact input is what every
+    ///      router, aggregator and swap UI sends by default, so on ordinary traffic the feature
+    ///      `Launcher` armed on every single launch never ran, no matter how large the backlog got.
+    ///
+    ///      MEASURED BEFORE, this exact scenario, both currency orderings:
+    ///
+    ///        20 exact-input buys of 5 pair -> backlog 3.0000 pair (6x the 0.5 pair bar)
+    ///        distributor / creator / platform paid                : 0
+    ///        one exact-OUTPUT buy on the same pool                : paid all three immediately
+    ///        pair moved to the distributor by that single trade   : 1.606302278315809874
+    ///
+    ///      WHY IT WAS DELETED RATHER THAN MADE REACHABLE. Moving the call above the `exactInput`
+    ///      guard is a one-line change and it would have made V-02 LIVE for everybody: the auto
+    ///      path's body called `poolManager.take()`, moving real ERC-20 out of the singleton in
+    ///      the middle of somebody else's swap, which silently overcharges any caller that syncs
+    ///      before swapping by the whole swept amount (measured at 8.5x, see `test_V02_fixed_...`).
+    ///      So the honest options were "a feature that does nothing" or "a feature that robs
+    ///      strangers", and the third was to delete it.
+    ///
+    ///      MEASURED AFTER: the identical sequence, including the exact-output buy that used to be
+    ///      the one shape that worked, moves NOTHING to holders. `sweep` does.
+    function test_V01_fixed_noSwapShapePaysHoldersMidTrade() public {
         (address t, PoolKey memory k, PoolId id) = _defaultLaunch();
         Distributor dist = LaunchToken(t).distributor();
 
-        uint256 bar = hook.autoSweepThreshold(id);
-        assertGt(bar, 0, "precondition: the auto path is armed by the launch");
-
         uint256 distBefore = pair.balanceOf(address(dist));
         uint256 creatorBefore = pair.balanceOf(creator);
+        uint256 platformBefore = pair.balanceOf(PLATFORM);
 
-        // Twenty ordinary exact-input buys. The backlog ends many multiples over the bar.
+        // Twenty ordinary exact-input buys - the shape that never reached the auto path.
         for (uint256 i = 0; i < 20; ++i) {
             _buyExactIn(k, alice, 5e18);
         }
 
-        assertGt(hook.pendingFees(id), bar * 5, "backlog is many times the auto-sweep bar");
-        assertEq(pair.balanceOf(address(dist)), distBefore, "AUTO SWEEP NEVER FIRED on exact input");
-        assertEq(pair.balanceOf(creator), creatorBefore, "and nothing reached the creator either");
+        uint256 backlog = hook.pendingFees(id);
+        assertGt(backlog, 2e18, "precondition: a large real backlog exists to be paid out");
+        assertEq(pair.balanceOf(address(dist)), distBefore, "exact input pays holders nothing");
 
-        // The same pool, the same backlog, one exact-OUTPUT buy: now it fires.
+        // THE INVERTED ASSERTION. This is the exact-OUTPUT buy that used to be the one shape that
+        // reached the automatic payout. It no longer pays anybody either.
         _buyExactOut(k, bob, 1_000_000e18);
-        assertGt(
+
+        assertEq(
             pair.balanceOf(address(dist)),
             distBefore,
-            "only the exact-output shape can reach the auto path"
+            "exact OUTPUT no longer pays holders mid-swap either - the auto path is gone"
         );
+        assertEq(pair.balanceOf(creator), creatorBefore, "nor the creator");
+        assertEq(pair.balanceOf(PLATFORM), platformBefore, "nor the platform");
+        assertGt(hook.pendingFees(id), backlog, "and the trade still accrued its own fee");
+
+        // NON-VACUITY. Without this the assertions above would all pass on a build that had
+        // simply stopped charging fees.
+        hook.sweep(k);
+        assertGt(pair.balanceOf(address(dist)), distBefore, "sweep is what pays holders");
+        assertGt(pair.balanceOf(creator), creatorBefore, "and the creator");
+        assertEq(hook.pendingFees(id), 0, "and it clears the whole backlog");
     }
 
-    /// @dev The consequence stated as money: on a pool that only ever sees router traffic, every
-    ///      wei of fee stays an ERC-6909 claim and a holder's `withdrawableOf` stays ZERO until a
-    ///      human or a bot calls `sweep`. The claims are real and safe - they are just not paid.
+    /// @notice **THE RESIDUAL RISK OF THE V-01 FIX, KEPT DELIBERATELY AND NOT INVERTED.**
     ///
-    ///      **Streaming does not fix this and does not soften it.** It adds a second, independent
-    ///      delay on top: after the sweep finally happens, entitlement still takes a full
-    ///      `STREAM_WINDOW` to appear. So V-01 now costs a holder the unbounded wait for a
-    ///      volunteer PLUS 24 hours, and the intermediate assertion below distinguishes the two -
-    ///      un-swept and un-vested are both "owed nothing", for entirely different reasons.
+    /// @dev This test asserted a consequence of the V-01 finding and it is still true after the
+    ///      fix, because deleting the auto path did not make payment automatic - it made it
+    ///      uniformly manual. Every wei of fee stays an ERC-6909 claim and a holder's
+    ///      `withdrawableOf` stays ZERO until a human or a bot calls `sweep`. The claims are real
+    ///      and exact; they are just not paid. Keeping this green is the honest statement that the
+    ///      remediation traded a broken mechanism for an unbroken one that still needs a caller.
+    ///
+    ///      **What makes that caller exist is `SWEEP_BOUNTY_BPS`, and it is only worth their gas
+    ///      above a measurable pot size.** Measured at 20 gwei in
+    ///      `test/audit/11-sweep/SweepEconomics.t.sol`: the break-even pot is ~0.3407 pair in
+    ///      steady state and ~0.8158 pair for a keeper being paid in that currency for the first
+    ///      time. Below it, nobody is paid to pay anyone, and the pot simply waits.
+    ///
+    ///      **Streaming adds a second, independent delay on top.** After the sweep finally
+    ///      happens, entitlement still takes a full `STREAM_WINDOW` to appear. The intermediate
+    ///      assertions below distinguish the two - un-swept and un-vested are both "owed nothing",
+    ///      for entirely different reasons.
     function test_V01b_routerOnlyTrafficLeavesHoldersUnpaidIndefinitely() public {
         (address t, PoolKey memory k, PoolId id) = _defaultLaunch();
         Distributor dist = LaunchToken(t).distributor();
@@ -440,29 +479,47 @@ abstract contract HookAuditCases is HookAuditWorld {
     }
 
     // -------------------------------------------------------------------------------------------
-    // V-02  `take()` inside `afterSwap` corrupts settlement for any integrator that syncs first.
+    // V-02  REGRESSION GUARD. `take()` inside `afterSwap` used to corrupt settlement for any
+    //       integrator that pays before it swaps. There is no longer any `take()` inside any swap.
     // -------------------------------------------------------------------------------------------
 
-    /// @dev `_tryAutoSweep` -> `autoRedeem` calls `poolManager.take(cfg.pairCurrency, ...)` at
-    ///      FeeHook.sol:699, i.e. real ERC-20 leaves the singleton in the MIDDLE of somebody else's
-    ///      swap. `PoolManager._settle` credits `balanceOfSelf() - syncedReserves`, so a caller who
-    ///      `sync`ed the input currency before the swap is credited exactly that much less than it
-    ///      handed over.
+    /// @notice INVERTED from `test_V02_takeInsideAfterSwapCorruptsASyncFirstPayersSettlement`.
     ///
-    ///      Measured against a control run of the identical trade through `PoolSwapTest` (which
-    ///      syncs AFTER the swap and is unaffected): the sync-first payer is debited the true cost
-    ///      PLUS the whole auto-swept amount, and the difference is exactly the shortfall `settle()`
-    ///      reported. Nobody is stealing it - it is paid a second time to the distributor, the
-    ///      creator and the platform.
-    function test_V02_takeInsideAfterSwapCorruptsASyncFirstPayersSettlement() public {
-        (address t, PoolKey memory k, PoolId id) = _defaultLaunch();
-        Distributor dist = LaunchToken(t).distributor();
+    /// @dev THE BUG. `_tryAutoSweep` -> `autoRedeem` called `poolManager.take(cfg.pairCurrency,
+    ///      ...)`, i.e. real ERC-20 left the singleton in the MIDDLE of somebody else's swap.
+    ///      `PoolManager._settle` credits a payer with `balanceOfSelf() - syncedReserves`, so a
+    ///      caller who `sync`ed the input currency BEFORE the swap was credited exactly that much
+    ///      less than it handed over. `sync -> transfer -> swap -> settle` is perfectly legal v4
+    ///      and is what an intent solver, a batch executor or any pay-up-front router writes;
+    ///      Uniswap's own routers sync AFTER the swap and were unaffected, which is why this was
+    ///      latent rather than visible.
+    ///
+    ///      MEASURED BEFORE, against a control run of the IDENTICAL trade through `PoolSwapTest`
+    ///      from the same state snapshot (token = currency0; currency1 matched):
+    ///
+    ///        cost via the Uniswap-supplied router : 0.400539139623279432 pair
+    ///        cost via the sync-first router       : 3.412205328155996308 pair
+    ///        overcharge                           : 3.011666188532716876 pair  (8.5x)
+    ///        settle() shortfall                   : 3.011666188532716876 pair  (identical)
+    ///
+    ///      THE FIX. The auto path was deleted outright rather than repaired. `_accrue` only
+    ///      `mint`s an ERC-6909 claim, which moves no ERC-20 at all, so after the deletion **there
+    ///      is no code path anywhere in this system that moves a real token out of the singleton
+    ///      during a swap.** That makes the whole class structurally unreachable instead of merely
+    ///      unlikely, which is worth more than a patch that keeps the `take` and guards it.
+    ///
+    ///      MEASURED AFTER: `settle()` credits every wei handed over, and the sync-first payer is
+    ///      charged exactly what the standard router pays, to the wei, with the same large backlog
+    ///      sitting unswept.
+    function test_V02_fixed_aSyncFirstPayerIsCreditedEveryWeiTheyHandOver() public {
+        (, PoolKey memory k, PoolId id) = _defaultLaunch();
 
-        // Build a backlog over the auto-sweep bar with exact-input buys (which never auto-sweep).
+        // The same large backlog that used to be stolen out of the payer's synced reserve.
         for (uint256 i = 0; i < 20; ++i) {
             _buyExactIn(k, alice, 5e18);
         }
-        assertGt(hook.pendingFees(id), hook.autoSweepThreshold(id), "backlog is over the bar");
+        uint256 backlog = hook.pendingFees(id);
+        assertGt(backlog, 2e18, "precondition: a large unswept backlog exists to be mis-taken");
 
         uint256 amountOut = 1_000_000e18;
         uint256 snap = vm.snapshotState();
@@ -471,15 +528,12 @@ abstract contract HookAuditCases is HookAuditWorld {
         uint256 before = pair.balanceOf(bob);
         _buyExactOut(k, bob, amountOut);
         uint256 costStandard = before - pair.balanceOf(bob);
-        // Headroom only: `settle()` underflows outright when the hook takes more than the payer
-        // handed over, and that case is `test_V02c`. Here we want the measurable branch.
-        uint256 headroom = pair.balanceOf(address(dist)) + pair.balanceOf(creator)
-            + pair.balanceOf(PLATFORM);
+        assertGt(costStandard, 0, "precondition: the control trade really cost something");
 
         require(vm.revertToState(snap), "snapshot revert failed");
 
         // PROBE: identical trade, paid for before the swap instead of after.
-        uint256 prepay = costStandard * 2 + headroom * 2;
+        uint256 prepay = costStandard * 2;
         before = pair.balanceOf(bob);
         vm.prank(bob);
         uint256 credited = syncRouter.swap(
@@ -500,25 +554,32 @@ abstract contract HookAuditCases is HookAuditWorld {
         emit log_named_uint("cost via the normal router ", costStandard);
         emit log_named_uint("cost via the sync-first one", costProbe);
 
-        assertLt(credited, prepay, "settle() credited LESS than was transferred in");
-        assertGt(costProbe, costStandard, "the sync-first payer was overcharged");
+        assertEq(credited, prepay, "settle() now credits every wei that was transferred in");
+        assertEq(costProbe, costStandard, "and the sync-first payer pays the standard cost");
         assertEq(
-            costProbe - costStandard,
-            prepay - credited,
-            "the overcharge is exactly what the hook took out of the synced reserve"
+            hook.pendingFees(id) > backlog,
+            true,
+            "non-vacuity: the trade was really charged a fee, it just stayed a claim"
         );
     }
 
-    /// @dev The harder form of the same defect. When the auto-swept amount exceeds what the payer
-    ///      handed over between `sync` and `settle`, `PoolManager._settle`'s
-    ///      `reservesNow - reservesBefore` underflows and the whole transaction reverts with a bare
-    ///      panic 0x11. The trade is unexecutable and the revert names nothing the integrator can
-    ///      act on. Whether a given trade lands in this branch depends on the pool's unswept
-    ///      backlog at that block, so it is nondeterministic from the caller's side.
-    function test_V02c_aLargeBacklogMakesTheSyncFirstPayersSwapRevertOutright() public {
+    /// @notice INVERTED from `test_V02c_aLargeBacklogMakesTheSyncFirstPayersSwapRevertOutright`.
+    ///
+    /// @dev THE BUG, harder branch. When the auto-swept amount exceeded what the payer handed over
+    ///      between `sync` and `settle`, `PoolManager._settle`'s `reservesNow - reservesBefore`
+    ///      UNDERFLOWED and the whole transaction reverted with a bare panic `0x11` carrying
+    ///      nothing an integrator could act on. Which branch a trade landed in depended on the
+    ///      pool's unswept backlog at that block, so it was nondeterministic from the caller's
+    ///      side: the same code would work in one block and revert in the next.
+    ///
+    ///      MEASURED BEFORE: with a backlog exceeding a 2x prepay, `vm.expectRevert(stdError.
+    ///      arithmeticError)` was satisfied - the trade was simply unexecutable.
+    ///
+    ///      MEASURED AFTER: the identical call succeeds, with the backlog still unswept, and the
+    ///      buyer receives the launch tokens they asked for.
+    function test_V02c_fixed_aLargeBacklogNoLongerRevertsTheSyncFirstPayer() public {
         (, PoolKey memory k, PoolId id) = _defaultLaunch();
 
-        // A backlog much larger than one small trade's input.
         for (uint256 i = 0; i < 20; ++i) {
             _buyExactIn(k, alice, 5e18);
         }
@@ -531,11 +592,13 @@ abstract contract HookAuditCases is HookAuditWorld {
         uint256 costStandard = before - pair.balanceOf(bob);
         require(vm.revertToState(snap), "snapshot revert failed");
 
+        // THE PRECONDITION THAT USED TO MAKE IT REVERT, asserted so this cannot pass vacuously on
+        // a build where the backlog had quietly stopped accumulating.
         assertLt(costStandard * 2, hook.pendingFees(id), "precondition: backlog > the prepay");
 
+        uint256 tokensBefore = IERC20(_tokenOf(k)).balanceOf(bob);
         vm.prank(bob);
-        vm.expectRevert(stdError.arithmeticError);
-        syncRouter.swap(
+        uint256 credited = syncRouter.swap(
             k,
             SwapParams({
                 zeroForOne: _buyIsZeroForOne(),
@@ -546,11 +609,20 @@ abstract contract HookAuditCases is HookAuditWorld {
             }),
             costStandard * 2
         );
+
+        assertEq(credited, costStandard * 2, "settle() credited the full prepay, no underflow");
+        assertEq(
+            IERC20(_tokenOf(k)).balanceOf(bob) - tokensBefore,
+            amountOut,
+            "and the trade delivered exactly what was asked for"
+        );
     }
 
-    /// @dev The same probe on a pool whose auto path never fires settles to the wei, which pins the
-    ///      cause on the hook's mid-swap `take` and not on the probe's ordering.
-    function test_V02b_theSameProbeIsExactWhenTheAutoPathDoesNotFire() public {
+    /// @dev The same probe on a pool with no backlog at all. Kept as the control that proves the
+    ///      probe itself is faithful: it settled to the wei even on the pre-fix build, so a green
+    ///      reading here has never depended on the fix. `test_V02_fixed_...` is the one that
+    ///      carries the backlog.
+    function test_V02b_theSameProbeIsExactWhenThereIsNoBacklogAtAll() public {
         (, PoolKey memory k,) = _defaultLaunch();
 
         uint256 amountOut = 1_000_000e18;
@@ -860,59 +932,68 @@ abstract contract HookAuditCases is HookAuditWorld {
         attacker.attack(k);
     }
 
-    /// @dev The auto path does NOT call `unlock` - it uses `burn` + `take` directly, which is the
-    ///      only thing that can work inside an already-open cycle. Proven by it succeeding: a nested
-    ///      `unlock` would revert `AlreadyUnlocked` and the `try/catch` would silently turn every
-    ///      auto sweep into an `AutoSweepSkipped`.
-    function test_sound_autoRedeemUsesBurnAndTakeRatherThanANestedUnlock() public {
-        (address t, PoolKey memory k, PoolId id) = _defaultLaunch();
-        Distributor dist = LaunchToken(t).distributor();
+    /// DELETED, all three tests of the automatic sweep, because the feature is gone:
+    ///
+    ///   - `test_sound_autoRedeemUsesBurnAndTakeRatherThanANestedUnlock` - asserted that the auto
+    ///     path avoided a nested `unlock` by using `burn` + `take`. That `take` IS V-02. There is
+    ///     no auto path and therefore no nested-unlock question to answer.
+    ///   - `test_sound_autoRedeemRejectsEveryOutsideCaller` - `autoRedeem` no longer exists, so
+    ///     neither does the external surface its access-control guard protected.
+    ///   - `test_sound_aFailedAutoSweepNeverBreaksTheTrade` - asserted that a failing auto sweep
+    ///     never reverts somebody else's trade. Nothing that can fail runs inside a swap any more.
+    ///
+    /// None of these was weakened to go green: each drove a function that has been removed from
+    /// `src/`. The PROPERTY they were collectively buying - "the payout machinery can never touch
+    /// a trader's swap" - is now stated directly and much more strongly by the test below, which
+    /// measures the singleton's own ERC-20 balance instead of inferring safety from a try/catch.
 
+    /// @notice REPLACES the three deleted auto-sweep tests with the property they were proxies for.
+    ///
+    /// @dev V-02 exists because `PoolManager._settle` credits `balanceOfSelf() - syncedReserves`,
+    ///      so the question that actually matters is not "does the payout path have a try/catch"
+    ///      but **"does any ERC-20 leave the singleton during a swap"**. That is directly
+    ///      measurable and it is measured here rather than argued: across the exact-output buy
+    ///      that used to trigger the auto path, with a large unswept backlog sitting there, the
+    ///      singleton's pair balance must rise by EXACTLY what the trader paid in.
+    ///
+    ///      MEASURED BEFORE: the singleton's balance rose by less than the trader paid, by exactly
+    ///      the auto-swept payout - 1.606302278315809874 pair on this scenario - which is the
+    ///      quantity `settle()` silently deducted from a sync-first caller.
+    ///
+    ///      MEASURED AFTER: zero. Every wei paid in stays in until somebody calls `sweep`.
+    ///
+    ///      Also asserts the first-ever-trade case the deleted `test_sound_aFailedAutoSweep...`
+    ///      covered: a pool that opens holding no pair currency still trades.
+    function test_V02d_fixed_noErc20LeavesTheSingletonDuringASwap() public {
+        (, PoolKey memory k, PoolId id) = _defaultLaunch();
+
+        // The first trade a pool ever sees, against a singleton holding zero pair currency. This
+        // is the case the deleted "a failing auto sweep never breaks the trade" test covered.
+        assertEq(pair.balanceOf(address(manager)), 0, "the pool opens holding zero pair currency");
+        _buyExactOut(k, alice, 1_000_000e18);
+        assertGt(IERC20(_tokenOf(k)).balanceOf(alice), 0, "the first trade completed");
+
+        // Now build the large backlog that used to be taken out mid-swap.
         for (uint256 i = 0; i < 20; ++i) {
             _buyExactIn(k, alice, 5e18);
         }
-        assertGt(hook.pendingFees(id), hook.autoSweepThreshold(id), "over the bar");
+        assertGt(hook.pendingFees(id), 2e18, "precondition: a large unswept backlog exists");
 
-        uint256 distBefore = pair.balanceOf(address(dist));
+        uint256 managerBefore = pair.balanceOf(address(manager));
+        uint256 bobBefore = pair.balanceOf(bob);
+
+        // The exact-output buy: the one shape that reached the auto path.
         _buyExactOut(k, bob, 1_000_000e18);
 
-        assertGt(pair.balanceOf(address(dist)), distBefore, "the auto path completed inside the swap");
-        assertEq(hook.pendingFees(id), 0, "and drained the backlog (burnBps is zero here)");
-    }
+        uint256 paidIn = bobBefore - pair.balanceOf(bob);
+        uint256 managerAfter = pair.balanceOf(address(manager));
+        assertGt(paidIn, 0, "non-vacuity: the trade really moved pair currency");
 
-    /// @dev `autoRedeem` is external so the `try/catch` gets a real revert boundary. It must be
-    ///      unreachable by anyone but the hook itself.
-    function test_sound_autoRedeemRejectsEveryOutsideCaller() public {
-        (, PoolKey memory k, PoolId id) = _defaultLaunch();
-        _buyExactIn(k, alice, 10e18);
-
-        FeeHook.PoolConfig memory cfg;
-        cfg.distributor = address(0xdead);
-        cfg.pairCurrency = Currency.wrap(address(pair));
-
-        vm.prank(alice);
-        vm.expectRevert(HookBase.NotPoolManager.selector);
-        hook.autoRedeem(id, k, cfg);
-    }
-
-    /// @dev A failing auto sweep must never revert somebody else's trade. On the pool's very first
-    ///      trades the singleton may hold no pair currency for the `take` to draw on; the swap still
-    ///      has to complete.
-    function test_sound_aFailedAutoSweepNeverBreaksTheTrade() public {
-        Launcher.LaunchParams memory p = _baseParams();
-        // A very low bar, so the auto path is attempted on the first trade the pool ever sees.
-        // `OPENING_MCAP + 1` no longer launches: the opening tick is SNAPPED, so the pool really
-        // opens at 100.290561036899339019 and a bar below that is now refused `BornGraduated`.
-        // One percent up is still ~0.1 pair of `autoSweepThreshold`, i.e. the same test.
-        p.graduationThreshold = OPENING_MCAP + OPENING_MCAP / 100;
-        (, PoolKey memory k, PoolId id) = _launch(p);
-
-        assertEq(pair.balanceOf(address(manager)), 0, "the pool opens holding zero pair currency");
-
-        // The first trade ever, exact output, which is the shape that reaches `_tryAutoSweep`.
-        _buyExactOut(k, alice, 1_000_000e18);
-        assertGt(IERC20(_tokenOf(k)).balanceOf(alice), 0, "the trade completed");
-        assertGe(hook.pendingFees(id) + hook.totalFeesTaken(id), 0, "and the fee was accounted");
+        assertEq(
+            managerAfter,
+            managerBefore + paidIn,
+            "every wei the trader paid in stayed in the singleton - nothing left mid-swap"
+        );
     }
 
     /// @dev The `beforeInitialize` gate, attacked from every angle a stranger has: a different tick

@@ -182,6 +182,20 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         ///      claim. Never reverts the launch: a bad referrer address must not cost somebody
         ///      their token.
         address referrer;
+        /// @dev Seconds of decaying opening fee. **Zero disables it**, which is what every launch
+        ///      did before it existed.
+        ///
+        ///      This is the E-01 mitigation and it is a per-launch, immutable, creator-chosen
+        ///      parameter. A single-sided pool opens against a hard floor, which hands the first
+        ///      transaction in the launch block a risk-free option on the whole supply — measured
+        ///      at -3.00 pair downside against +157.21 upside, with organic buyers losing 154.82 of
+        ///      200. Setting a window charges a premium for exercising that option early. See
+        ///      `FeeHook.openingFeeEndsAt`.
+        uint32 openingWindow;
+        /// @dev The buy rate at the opening instant, decaying linearly to `feeBps`. Must exceed
+        ///      `feeBps` whenever a window is set. Everything above `feeBps` goes to the platform,
+        ///      never to the creator, so a creator cannot snipe their own launch for profit.
+        uint16 openingFeeBps;
         LaunchMetadata metadata;
     }
 
@@ -462,7 +476,9 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
                 burnBps: p.burnBps,
                 creator: feeRecipient,
                 creatorBps: p.creatorBps,
-                rewardCurrency: Currency.wrap(address(0))
+                rewardCurrency: Currency.wrap(address(0)),
+                openingWindow: p.openingWindow,
+                openingFeeBps: p.openingFeeBps
             })
         );
 
