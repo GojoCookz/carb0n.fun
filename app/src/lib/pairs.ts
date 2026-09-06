@@ -489,20 +489,20 @@ export const PAIRS: Pair[] = [
     liveSince: '2024-01-18',
     risks: r({ mintable: true }),
   },
-  {
-    symbol: 'USDY',
-    name: 'Ondo US Dollar Yield',
-    address: '0x96F6eF951840721AdBF46Ac996b59E0235CB985C',
-    decimals: 18,
-    category: 'rwa',
-    priceable: false,
-    liquidityUsd: 37_279,
-    volume24hUsd: 0,
-    liveSince: '2023-08-03',
-    // Short-term treasuries, tokenised. Yield-bearing, so its price drifts UP by design - which
-    // is a different shape of risk from a peg breaking and worth saying out loud.
-    risks: r({ pausable: true, upgradeable: true, mintable: true }),
-  },
+  // ---------------------------------------------------------------------------------------------
+  // USDY (Ondo US Dollar Yield) WAS HERE AND HAS BEEN REMOVED ON PURPOSE. Do not add it back.
+  //
+  // It is a tokenised short-term US Treasury note - a yield-bearing debt instrument, sold under
+  // Reg S and restricted from US persons by its own issuer. That is a SECURITY, and the rule this
+  // roster is held to is: pair currencies are crypto assets and commodities, never tokenised
+  // securities. Counsel's position is that revenue sharing on its own is not the problem and
+  // tokenised stocks are; a tokenised Treasury note sits on the wrong side of that line for the
+  // same reason a tokenised share does.
+  //
+  // THE TEST FOR ADDING ANYTHING HERE: does the token represent a claim on an issuer's cash flows,
+  // debt, or equity? If yes it does not go in this list, whatever its ticker looks like. Gold
+  // (PAXG, XAUT) is a commodity claim and stays; a Treasury note is not.
+  // ---------------------------------------------------------------------------------------------
   {
     symbol: 'USDf',
     name: 'Falcon USD',
@@ -515,20 +515,17 @@ export const PAIRS: Pair[] = [
     liveSince: '2025-04-01',
     risks: r({ upgradeable: true, mintable: true }),
   },
-  {
-    symbol: 'WHITE',
-    name: 'WhiteRock',
-    address: '0x9cdf242Ef7975D8c68D5C1F5B6905801699b1940',
-    decimals: 18,
-    category: 'rwa',
-    priceable: false,
-    liquidityUsd: 898,
-    volume24hUsd: 0,
-    liveSince: '2024-11-01',
-    // ONE TRILLION supply. Not a red flag by itself, but it means a dividend denominated here is
-    // denominated in a very large number of very small units.
-    risks: r({ upgradeable: true, owned: true }),
-  },
+  // ---------------------------------------------------------------------------------------------
+  // WHITE (WhiteRock) WAS HERE AND HAS BEEN REMOVED ON PURPOSE. Do not add it back.
+  //
+  // The token itself is a plain ERC-20 platform token - checked on chain, no per-share semantics,
+  // no claim on an issuer - so it does NOT fail the cash-flows/debt/equity test above. It is
+  // removed for a different and deliberate reason: WhiteRock's business is tokenised equities, and
+  // the standing instruction is to stay away from that entire area rather than to argue the line.
+  //
+  // It cost nothing to drop. $898 of liquidity, no v4 ETH pool, unroutable for the zap anyway.
+  // When an asset is worth nothing and carries an association, the association is the whole price.
+  // ---------------------------------------------------------------------------------------------
 
   // ===========================================================================================
   // BLUE CHIPS. LINK, AAVE and CRV are three of only eight assets with a DIRECT Chainlink

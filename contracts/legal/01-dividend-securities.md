@@ -1,3 +1,29 @@
+> ## STATUS: COUNSEL HAS WEIGHED IN. READ THIS BEFORE THE ANALYSIS BELOW.
+>
+> The position relayed from counsel, recorded here as it was given:
+>
+> **Revenue sharing on its own is not the issue. Tokenised STOCKS are.**
+>
+> The product decision that follows: **this pad does not touch tokenised equities on Ethereum.**
+> Pair currencies are crypto assets and commodities. Holders receive a share of trading fees in
+> whichever of those the creator picked. No tokenised share, note or other claim on an issuer ever
+> enters the allowlist.
+>
+> **The test any new pair currency must pass**, now written into `app/src/lib/pairs.ts` beside the
+> list itself: *does this token represent a claim on an issuer's cash flows, debt or equity?* If
+> yes, it does not go in. Gold (PAXG, XAUT) is a commodity claim and stays. A tokenised Treasury
+> note is not, and **USDY has been removed** for exactly that reason — it is Reg S, restricted from
+> US persons by its own issuer.
+>
+> **What this does NOT mean.** It does not mean the analysis below is void; it means the branch it
+> was most worried about is closed by a product decision rather than an argument. The memo is kept
+> because the reasoning about the dividend mechanism is still the reasoning, and because a future
+> version that adds a yield-bearing or equity-shaped pair reopens every word of it.
+>
+> Everything under this line was written BEFORE counsel's position and is unchanged. It remains
+> research by an AI, not advice, and four of its citations are flagged unverified.
+
+---
 # 01 — Is the launched token a security? The dividend mechanism under Howey
 
 **Status:** research memo. Read-only pass over `contracts/src/` and `app/src/`. No source file was
