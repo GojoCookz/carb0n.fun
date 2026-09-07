@@ -262,6 +262,20 @@ contract LauncherForkTest is Test {
 
         _buy(holder, token, 0.2e18);
 
+        // **This test used to assert `withdrawableOf(trader) > 0` right here, and it was correct
+        // until the streaming migration.** Killing E-03 (buy, trigger a distribution, claim, sell,
+        // atomically) meant entitlement had to stop being instant, so a zero-duration position now
+        // earns zero BY CONSTRUCTION. The old assertion was still testing the behaviour the fix
+        // removed, and it only surfaced here because the fork suite is not in the default run.
+        //
+        // Asserting the zero FIRST is not bookkeeping. It is the anti-front-running property, and
+        // this is the only place it is checked against the real PoolManager and real WXMR rather
+        // than against mocks.
+        assertEq(dist.withdrawableOf(trader), 0, "a zero-duration hold must be owed nothing");
+        assertGt(wxmr.balanceOf(address(dist)), 0, "but the fee did reach the distributor at once");
+
+        skip(dist.STREAM_WINDOW() + 1);
+
         uint256 owed = dist.withdrawableOf(trader);
         assertGt(owed, 0, "holder accrued from someone else's trade");
 

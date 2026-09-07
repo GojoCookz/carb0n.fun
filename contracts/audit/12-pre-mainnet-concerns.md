@@ -64,6 +64,19 @@ Nothing has ever been deployed to mainnet.
 
 ## C-2. Sweep economics were measured under testnet assumptions
 
+> **MEASURED UPDATE.** At the time of writing, Ethereum mainnet `baseFeePerGas` read **0.040 gwei**
+> from the block header at block 25,920,987 — **500x below the 20 gwei these figures assume.** At
+> that price the break-even is trivially cleared, a full deployment (hook, launcher, vault, a
+> launch, a buy and a sweep) costs on the order of **0.0005 ETH**, and this concern is close to
+> inert *today*.
+>
+> **The risk was never the median, it is the tail.** Gas is volatile; the failure mode is that
+> during a busy period the bounty stops covering the caller's gas, nobody sweeps, and holders
+> silently stop being paid until it clears. The mitigation to consider is still the same — scale
+> the bounty with `block.basefee` rather than fixing it — but the urgency is much lower than the
+> original wording implied, and a mainnet test launch is now cheap enough that it should not be
+> gated on this.
+
 `SweepEconomics.t.sol` establishes break-even at **0.339 pair warm, 0.814 fresh, 1.451 with a 30%
 burn, at 20 gwei.** Those numbers are a function of gas price, and mainnet gas is neither 20 gwei
 nor stable.
