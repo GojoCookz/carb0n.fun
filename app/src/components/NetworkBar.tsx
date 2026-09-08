@@ -8,6 +8,7 @@ import {
   subscribeNetwork,
 } from '../lib/activeNetwork'
 import { NETWORKS, type NetworkId } from '../lib/networks'
+import { isDeployed } from '../lib/activeNetwork'
 import { WalletButton } from './WalletButton'
 
 /**
@@ -39,7 +40,7 @@ export function NetworkBar() {
   const options = selectableNetworks()
   const current = NETWORKS[id]
   const isTestnet = TESTNETS.has(id)
-  const deployed = current.deployment.launcher !== null
+  const deployed = isDeployed(id)
 
   return (
     <div className="lit border-b border-ink-800 bg-ink-950/80 backdrop-blur-xl">
@@ -73,7 +74,7 @@ export function NetworkBar() {
             className="flex items-center gap-1.5 rounded-full border border-ink-700 bg-ink-900 px-2 py-1"
             title={
               !deployed
-                ? 'No launcher is deployed on this network.'
+                ? `No launcher is deployed on ${current.label} yet. Launching opens after the audit.`
                 : isTestnet
                   ? 'A test network. Tokens here hold no real value.'
                   : `Live on ${current.label}. The contracts are unaudited - see the docs before committing real value.`

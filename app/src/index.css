@@ -54,6 +54,27 @@
   /* Warning reads as serious, not festive, against a monochrome field. */
   --color-danger-400: #d98c8c;
 
+  /* ---------------------------------------------------------------------------------------------
+     NETWORK THEMING
+     ---------------------------------------------------------------------------------------------
+     The palette above is the Ethereum identity: near-black ink, bone text, cold steel accents.
+
+     Robinhood Chain gets its own skin, applied by a `data-network` attribute on <html> rather than
+     by prop-drilling a theme through every component. Two reasons: the variables are already the
+     single source of colour for the whole app, so overriding them retints everything at once
+     including elements nobody remembers to update; and it means switching chains cannot leave half
+     the interface on the old palette.
+
+     The Hood palette is warmer and greener - Robinhood's own signature is a bright spring green -
+     but the greens stay MUTED and the surfaces stay dark. A launchpad that suddenly turns bright
+     while holding real money reads as a different, less serious product, and contrast has to
+     survive the change: every text colour below was picked against its own surface, not against
+     the Ethereum one it replaces.
+  --------------------------------------------------------------------------------------------- */
+  --color-hood-500: #00c805;
+  --color-hood-400: #35d43a;
+  --color-hood-300: #7ee382;
+
   --font-display: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
   --font-sans: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
@@ -165,5 +186,42 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+/* Robinhood Chain skin. Same structure, warmer ink and a green accent instead of steel. */
+html[data-network='robinhood'] {
+  --color-ink-950: #04070a;
+  --color-ink-900: #0a1010;
+  --color-ink-850: #101817;
+  --color-ink-800: #16211f;
+  --color-ink-700: #1f2f2b;
+  --color-ink-600: #2b4038;
+
+  --color-bone-50: #eef6f0;
+  --color-bone-200: #c3d6c8;
+  --color-bone-400: #8aa394;
+  --color-bone-500: #67806f;
+  --color-bone-600: #4c6156;
+
+  /* Accents move from cold steel to Robinhood green, kept desaturated enough that large fills do
+     not vibrate against the dark surfaces. */
+  --color-steel-300: #7ee382;
+  --color-steel-400: #35d43a;
+  --color-steel-500: #1f8a2a;
+
+  --color-volt-300: #eafff0;
+  --color-volt-400: #cdf2d6;
+  --color-volt-500: #ffffff;
+  --color-volt-600: #86a893;
+}
+
+/* The switch itself is animated so the change reads as deliberate rather than as a flash of
+   restyled content. Honoured only when the user has not asked for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    transition:
+      background-color 260ms var(--ease-out-soft),
+      color 260ms var(--ease-out-soft);
   }
 }

@@ -24,15 +24,53 @@ import { NETWORKS, type NetworkId, type NetworkInfo } from './networks'
 
 const STORAGE_KEY = 'carb0n.activeNetwork'
 
-/** Networks that actually have a launcher. The ONLY safe source for a network picker. */
+/**
+ * The networks a user may pick between.
+ *
+ * **Sepolia is excluded from the picker even though it has a launcher.** It is a test network; the
+ * tokens on it are worthless and offering it beside two real chains invites someone to launch into
+ * a void and think they shipped. It stays reachable for development via `?network=sepolia`.
+ *
+ * **Ethereum mainnet is INCLUDED even though nothing is deployed there yet**, because hiding it
+ * answers the wrong question. A user who wants Ethereum should see that we know about it and that
+ * it is not open yet - not be left wondering whether the product supports it at all. The launch
+ * controls stay disabled and name that reason; the network is visible, not silently missing.
+ */
+const PRODUCTION: readonly NetworkId[] = ['mainnet', 'robinhood']
+
 export function selectableNetworks(): NetworkInfo[] {
-  return Object.values(NETWORKS).filter((n) => n.deployment.launcher !== null)
+  const forced = devOverride()
+  const ids = forced ? ([...PRODUCTION, forced] as NetworkId[]) : PRODUCTION
+  return ids.map((id) => NETWORKS[id])
 }
 
+/** `?network=sepolia` keeps the testnet reachable for development without shipping it to users. */
+function devOverride(): NetworkId | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const q = new URLSearchParams(window.location.search).get('network')
+    return q && q in NETWORKS ? (q as NetworkId) : null
+  } catch {
+    return null
+  }
+}
+
+/** Whether a network can actually receive a launch right now. */
+export function isDeployed(id: NetworkId): boolean {
+  return NETWORKS[id].deployment.launcher !== null
+}
+
+/**
+ * A network is selectable if it exists and is on offer - NOT if it has a launcher.
+ *
+ * Those came apart when Ethereum mainnet joined the picker without a deployment. Gating selection
+ * on `launcher !== null` would have made the option unclickable with no explanation, which is
+ * worse than letting someone select it and reading why it is closed.
+ */
 function isSelectable(id: string | null): id is NetworkId {
   if (!id) return false
-  const n = (NETWORKS as Record<string, NetworkInfo | undefined>)[id]
-  return !!n && n.deployment.launcher !== null
+  if (!(id in NETWORKS)) return false
+  return selectableNetworks().some((n) => n.id === id)
 }
 
 /**
@@ -42,11 +80,10 @@ function isSelectable(id: string | null): id is NetworkId {
  * audited - but it must never be what a first-time visitor lands on while a production chain is
  * deployed.
  */
+/** Default to a network that can actually receive a launch today. */
 function defaultNetwork(): NetworkId {
-  const live = selectableNetworks()
-  if (live.length === 0) return 'sepolia'
-  const production = live.find((n) => n.id !== 'sepolia')
-  return (production ?? live[0]).id
+  const usable = selectableNetworks().find((n) => n.deployment.launcher !== null)
+  return (usable ?? NETWORKS.robinhood).id
 }
 
 function readStored(): NetworkId {
@@ -73,6 +110,20 @@ export function activeNetwork(): NetworkInfo {
   return NETWORKS[current]
 }
 
+/**
+ * Paints the network's skin by setting `data-network` on <html>.
+ *
+ * **Done here rather than in a component on purpose.** The CSS variables in `index.css` are the
+ * single source of colour for the entire app, so flipping one attribute retints everything at once
+ * - including the elements nobody would remember to update. Driving it from a React effect instead
+ * would mean the theme lags the store by a render and could be missed entirely by anything that
+ * renders outside the tree.
+ */
+function paint(id: NetworkId): void {
+  if (typeof document === 'undefined') return
+  document.documentElement.setAttribute('data-network', id)
+}
+
 export function setActiveNetwork(id: NetworkId): void {
   if (!isSelectable(id)) return
   if (id === current) return
@@ -82,8 +133,13 @@ export function setActiveNetwork(id: NetworkId): void {
   } catch {
     // Not being able to remember the choice is survivable; failing to switch is not.
   }
+  paint(id)
   for (const fn of listeners) fn()
 }
+
+// Paint on load too, so a restored choice is themed before first render rather than flashing the
+// default palette and correcting itself.
+paint(current)
 
 /** `useSyncExternalStore` contract. */
 export function subscribeNetwork(fn: () => void): () => void {
