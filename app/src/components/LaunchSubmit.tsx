@@ -84,9 +84,12 @@ export function LaunchSubmit({
     return <Blocked reason="Fix the items above first." />
   }
 
-  if (!w.installed) {
+  // `canConnect`, not "is an extension installed". On a phone there is never an injected provider,
+  // so the old check blocked the launch form outright on the device most people are holding, even
+  // though WalletConnect could have connected them.
+  if (!w.canConnect) {
     return (
-      <Blocked reason="No Ethereum wallet found in this browser. Install one, then reload this page." />
+      <Blocked reason="No wallet found. Install a browser wallet, or open this page on a device with a wallet app." />
     )
   }
 

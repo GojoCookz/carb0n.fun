@@ -1,10 +1,16 @@
 /**
- * Wallet connection, using viem's `custom` transport over the injected EIP-1193 provider.
+ * Wallet connection, using viem's `custom` transport over an EIP-1193 provider.
  *
  * **No wallet library.** wagmi/RainbowKit/ConnectKit each pull in a connector registry, a query
  * client and a theme layer to solve a problem this app does not have: it targets one chain and
  * sends at most two transactions. viem is already a dependency for reads, and `custom(provider)`
  * is the whole integration.
+ *
+ * **Two providers, one seam.** The provider is no longer always `window.ethereum`. It is either
+ * the injected one or a WalletConnect session, and `getProvider()` is the single place that
+ * decides. Everything downstream - `walletClient()`, `switchToActiveChain()`, the launch and
+ * trade paths - was already routed through it, so adding a second source needed no changes at any
+ * of the ten call sites. See `walletconnect.ts` for why that library and why it loads lazily.
  *
  * Everything here REPORTS rather than throws where the user can act on it, because a rejected
  * signature is a normal outcome, not an error state — a wallet popup the user closes must leave
@@ -12,6 +18,15 @@
  */
 import { createWalletClient, custom, type Address, type WalletClient } from 'viem'
 import { activeNetwork } from './activeNetwork'
+import {
+  activeWalletConnectProvider,
+  connectWalletConnect,
+  disconnectWalletConnect,
+  isConfigured as walletConnectConfigured,
+  restoreWalletConnect,
+} from './walletconnect'
+
+export { walletConnectConfigured, restoreWalletConnect }
 
 /** The subset of EIP-1193 this app uses. */
 type Eip1193 = {
@@ -26,12 +41,44 @@ declare global {
   }
 }
 
+/**
+ * The provider to talk to, in priority order.
+ *
+ * A live WalletConnect session wins over the injected provider. That order is deliberate: the only
+ * way to hold a WC session is to have deliberately scanned a QR code, whereas `window.ethereum` is
+ * injected without asking. If a user on a desktop with MetaMask installed goes out of their way to
+ * connect a phone wallet, sending their transactions to MetaMask instead would be the wrong answer
+ * every time.
+ */
 export function getProvider(): Eip1193 | null {
+  const wc = activeWalletConnectProvider()
+  if (wc) return wc
   return typeof window !== 'undefined' && window.ethereum ? window.ethereum : null
+}
+
+/**
+ * Is there an INJECTED provider? Distinct from "can the user connect at all".
+ *
+ * On a phone browser this is false while WalletConnect is still perfectly available, so this must
+ * not be used to decide whether to offer a connect button - `WalletButton` asks about both.
+ */
+export function hasInjectedWallet(): boolean {
+  return typeof window !== 'undefined' && !!window.ethereum
 }
 
 export function hasWallet(): boolean {
   return getProvider() !== null
+}
+
+/**
+ * Is the live session a WalletConnect one?
+ *
+ * Drives whether "Disconnect" is offered. A site cannot revoke an injected provider's permission -
+ * clearing local state there would show "disconnected" and then silently reconnect on reload,
+ * which is a lie the next page load exposes.
+ */
+export function isWalletConnectSession(): boolean {
+  return activeWalletConnectProvider() !== null
 }
 
 export type WalletError = { code: number; message: string }
@@ -51,11 +98,51 @@ export function walletErrorMessage(e: unknown): string {
   return raw.split('\n')[0].slice(0, 200)
 }
 
-export async function connect(): Promise<Address[]> {
-  const p = getProvider()
-  if (!p) throw new Error('No wallet found.')
-  const accounts = (await p.request({ method: 'eth_requestAccounts' })) as Address[]
-  return accounts
+/** Which way in. `auto` picks the only sensible one for the current device. */
+export type Transport = 'auto' | 'injected' | 'walletconnect'
+
+/**
+ * Connect.
+ *
+ * **`auto` is what makes the phone case work, and it is why this is not just an injected call.**
+ * Every in-form connect button in the app - the one under the launch form, the one in the trade
+ * panel - already calls this function. Routing the no-injected-provider case to WalletConnect here
+ * means all of them start working on mobile without any of them changing.
+ *
+ * Priority when `auto`:
+ *   1. an existing WC session, which is already an answer
+ *   2. an injected provider, because a desktop user with an extension expects their extension
+ *   3. WalletConnect, which on a phone is the only thing left
+ */
+export async function connect(transport: Transport = 'auto'): Promise<Address[]> {
+  if (transport === 'walletconnect') {
+    return (await connectWalletConnect()) as Address[]
+  }
+
+  if (transport === 'injected') {
+    const injected = typeof window !== 'undefined' ? window.ethereum : null
+    if (!injected) throw new Error('No wallet extension found in this browser.')
+    return (await injected.request({ method: 'eth_requestAccounts' })) as Address[]
+  }
+
+  const existing = activeWalletConnectProvider()
+  if (existing) return (await existing.request({ method: 'eth_accounts' })) as Address[]
+
+  if (hasInjectedWallet()) return connect('injected')
+  if (walletConnectConfigured()) return connect('walletconnect')
+
+  throw new Error('No wallet found.')
+}
+
+/**
+ * End the session and forget the account.
+ *
+ * Only meaningful for WalletConnect: an injected provider has no concept of a site disconnecting
+ * itself, so for those this is a no-op and the UI does not offer it. Leaving a WC user with no way
+ * out would strand them on whichever wallet they first scanned.
+ */
+export async function disconnect(): Promise<void> {
+  await disconnectWalletConnect()
 }
 
 /** Accounts already authorised, without prompting. Used to restore state on load. */

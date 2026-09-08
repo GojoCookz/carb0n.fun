@@ -50,7 +50,7 @@ export function TradePanel({
   pairDecimals?: number
   tokenDecimals?: number
 }) {
-  const { account, onRightChain, connect, switchChain, connecting, installed } = useWallet()
+  const { account, onRightChain, connect, switchChain, connecting, canConnect } = useWallet()
 
   // Whether a hop-1 pool actually exists for this pair, read from the deployment record rather
   // than assumed. Offering ETH where there is no ETH pool would send a transaction that reverts
@@ -312,14 +312,15 @@ export function TradePanel({
       )}
 
       <div className="mt-4">
-        {!installed ? (
+        {!canConnect ? (
           <p className="rounded-xl border border-ink-700 bg-ink-950 px-4 py-3 text-center text-[13px] text-bone-500">
-            No browser wallet detected.
+            No wallet found. Install a browser wallet, or open this page on a device with a wallet
+            app.
           </p>
         ) : !account ? (
           <button
             type="button"
-            onClick={connect}
+            onClick={() => void connect()}
             disabled={connecting}
             className="w-full rounded-xl border border-ink-600 bg-ink-800 px-5 py-3 font-display text-[14px] font-bold text-bone-200 transition-colors duration-150 hover:bg-ink-700 disabled:opacity-50"
           >

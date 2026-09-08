@@ -2,13 +2,59 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+
+    <!--
+      ICONS. `favicon.svg` covers every modern desktop browser and scales cleanly. The PNGs
+      exist because two places refuse SVG: Safari ignores SVG for `apple-touch-icon`, so
+      without the 180 an iOS home-screen shortcut is a screenshot of the page; and a few
+      older contexts still want a raster favicon, which is what the 32 is for.
+
+      Regenerate all of them with `node scripts/gen-icons.mjs` after editing favicon.svg -
+      the script documents why it is not a saved dependency.
+    -->
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+
+    <!-- Matches --color-ink-950. Without it, mobile Safari paints the notch area white and
+         the dark app appears to float in a bright frame. -->
+    <meta name="theme-color" content="#050507" />
+
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>carbonado.fun — a launchpad where holders get paid in the pair</title>
+
+    <title>carbonado.fun - a launchpad where holders get paid in the pair</title>
+
+    <!--
+      THIS DESCRIPTION USED TO BE WRONG IN TWO WAYS, on a public page.
+
+      It said "on Ethereum", and it said "38 allowlisted currencies". Neither was true:
+      the contracts are live on Robinhood Chain (4663) and Ethereum mainnet is visible in
+      the picker but explicitly not deployed, and the registry has exactly 30 approved
+      currencies, each of which was read back with `isApproved` after admission.
+
+      If this count changes, it changes in `src/lib/networks.ts` first. That array is the
+      source of truth and it currently has 30 entries.
+    -->
     <meta
       name="description"
-      content="Launch a token on Ethereum against any of 38 allowlisted currencies. Every buy pays holders their share in that same currency, not in more of the token they already hold."
+      content="Launch a token on Robinhood Chain against any of 30 allowlisted currencies. Every buy pays holders their share in that same currency, not in more of the token they already hold."
     />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="carbonado.fun" />
+    <meta property="og:url" content="https://www.carb0n.fun/" />
+    <meta property="og:title" content="carbonado.fun - a launchpad where holders get paid in the pair" />
+    <meta
+      property="og:description"
+      content="Launch a token on Robinhood Chain against any of 30 allowlisted currencies. Every buy pays holders their share in that same currency."
+    />
+    <!-- NO og:image yet, deliberately. Open Graph wants a 1200x630 banner; pointing it at a
+         square icon makes shared links render as a small tile in a grey box, which looks more
+         broken than having no image at all. A real banner is a follow-up. -->
+    <meta name="twitter:card" content="summary" />
+
+    <link rel="canonical" href="https://www.carb0n.fun/" />
   </head>
   <body>
     <div id="root"></div>
