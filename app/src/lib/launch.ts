@@ -429,18 +429,16 @@ export function validate(d: LaunchDraft, pair: Pair | undefined): Issue[] {
       revert: '',
     })
   }
-  // MIRRORS `Launcher.MIN_DEV_BUY_PAIR`. The contract now REJECTS a launch with no opening buy,
-  // because a single-sided pool with zero pair currency cannot pay a seller, reads as dead on
-  // every screener, and hands the first trade a free option. Checking it here too means the
-  // creator is told before they spend gas discovering it.
-  if (d.devBuyPairAmount <= 0) {
-    out.push({
-      field: 'devBuyPairAmount',
-      message:
-        'An opening buy is required. Without one the pool opens with none of the pair currency in it, so it shows no liquidity and cannot fill a sell.',
-      revert: 'OpeningBuyRequired',
-    })
-  }
+  // NO HARD REQUIREMENT ON THE OPENING BUY, and the reason is worth recording.
+  //
+  // A requirement was added here to stop pools opening with zero pair currency. It made SIMPLE
+  // MODE UNLAUNCHABLE: the opening-buy field lives behind a disclosure that only Custom mode
+  // shows, so a simple launch was rejected for not setting a field it never displayed. Reported
+  // immediately by a real user as "tells me to set opening buy but I dont see the field for it".
+  //
+  // The rule was right and the plumbing was missing. Requiring an opening buy is only reasonable
+  // once a creator can fund one from the ETH they already hold, rather than having to go and
+  // source the pair token themselves first. Until that routing exists, this stays advisory.
   if (d.devBuyPairAmount > devBuyCap(d)) {
     out.push({
       field: 'devBuyPairAmount',

@@ -32,7 +32,8 @@ export function LaunchSubmit({
   const net = activeNetwork()
   const launcher = net.deployment.launcher
   const pair = launchablePairFor(draft.pairSymbol)
-  const busy = phase.kind === 'approving' || phase.kind === 'launching'
+  const busy =
+    phase.kind === 'funding' || phase.kind === 'approving' || phase.kind === 'launching'
 
   // --- Terminal state: it worked. ---------------------------------------------------------
   if (phase.kind === 'done') {
@@ -119,7 +120,9 @@ export function LaunchSubmit({
 
   // --- Ready ------------------------------------------------------------------------------
   const label =
-    phase.kind === 'approving'
+    phase.kind === 'funding'
+              ? `Buying ${pair.symbol} with your ETH.`
+              : phase.kind === 'approving'
       ? `Approving ${pair.symbol}…`
       : phase.kind === 'launching'
         ? 'Launching…'

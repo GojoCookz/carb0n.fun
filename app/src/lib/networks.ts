@@ -53,7 +53,7 @@ export const robinhood = defineChain({
   },
 })
 
-export type NetworkId = 'sepolia' | 'mainnet' | 'robinhood'
+export type NetworkId = 'sepolia' | 'mainnet' | 'robinhood' | 'besc' | 'bescTestnet'
 
 export type NetworkInfo = {
   id: NetworkId
@@ -88,6 +88,15 @@ export type NetworkInfo = {
    */
   nativeZap: boolean
   deployment: Deployment
+  /** Existing BESC ecosystem contracts used for market data and external launch flows. */
+  bescInfrastructure?: {
+    wrappedNative: `0x${string}`
+    swapRouter: `0x${string}`
+    swapFactory: `0x${string}`
+    presaleFactory: `0x${string}`
+    vipPassManager: `0x${string}`
+    hyperChartsApi: string
+  }
 }
 
 /**
@@ -109,43 +118,45 @@ const ROBINHOOD_DEPLOYMENT: Deployment = {
   // Deployed after the fact: the original Robinhood deploy shipped the five core contracts and
   // no router, so the trade panel had nothing to call on this chain.
   tradeRouter: '0xD6EdCd3cc28C40b42d6fe31B054eBb93a944A3A6',
+  // Found by reading who actually swaps the live v3 pools; the canonical slots are empty stubs.
+  swapRouter: '0xcaf681a66d020601342297493863e78c959e5cb2',
   zapRouter: null,
   pairs: [
     // Core. Decimals read on-chain, never assumed: USDG is 6 and cbBTC is 8 where nearly
     // everything else is 18, and a wrong value misprices every launch by a power of ten.
-    { symbol: 'WETH', name: 'WETH', address: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73', decimals: 18, ethPoolFee: null },
-    { symbol: 'USDG', name: 'Global Dollar', address: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168', decimals: 6, ethPoolFee: null },
+    { symbol: 'WETH', name: 'WETH', address: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73', decimals: 18, ethPoolFee: null, ethSwapFee: 0 },
+    { symbol: 'USDG', name: 'Global Dollar', address: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168', decimals: 6, ethPoolFee: null, ethSwapFee: 100 },
     // Commodities.
-    { symbol: 'cbBTC', name: 'Coinbase Wrapped BTC', address: '0xCEC185eB182c47d1bA1EFc84e6959e18cd620Be4', decimals: 8, ethPoolFee: null },
-    { symbol: 'SLV', name: 'iShares Silver Trust • Robinhood Token', address: '0x411eFb0E7f985935DAec3D4C3ebaEa0d0AD7D89f', decimals: 18, ethPoolFee: null },
-    { symbol: 'GLD', name: 'SPDR Gold Trust • Robinhood Token', address: '0xC9a981FEE1F9DEc688bb123ccDeCc63D0deBFC4e', decimals: 18, ethPoolFee: null },
-    { symbol: 'PAXG', name: 'Paxos Gold', address: '0xc700C81925D1d1C10F996fA7c0Dee83a54C4Bb8D', decimals: 18, ethPoolFee: null },
+    { symbol: 'cbBTC', name: 'Coinbase Wrapped BTC', address: '0xCEC185eB182c47d1bA1EFc84e6959e18cd620Be4', decimals: 8, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'SLV', name: 'iShares Silver Trust • Robinhood Token', address: '0x411eFb0E7f985935DAec3D4C3ebaEa0d0AD7D89f', decimals: 18, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'GLD', name: 'SPDR Gold Trust • Robinhood Token', address: '0xC9a981FEE1F9DEc688bb123ccDeCc63D0deBFC4e', decimals: 18, ethPoolFee: null, ethSwapFee: 500 },
+    { symbol: 'PAXG', name: 'Paxos Gold', address: '0xc700C81925D1d1C10F996fA7c0Dee83a54C4Bb8D', decimals: 18, ethPoolFee: null, ethSwapFee: null },
     // RobinVista synths: USDG-collateralised, 1x perp-hedged on Hyperliquid.
-    { symbol: 'XMR', name: 'Monero', address: '0x38F728351fd9565087a4fF0ad5049739e0Ce235c', decimals: 18, ethPoolFee: null },
-    { symbol: 'ZEC', name: 'Zcash', address: '0xEc127e99Da1a2eD3d6C0433227154a99B7B29221', decimals: 18, ethPoolFee: null },
-    { symbol: 'SOL', name: 'Solana', address: '0x49F98A382Ccbc05f13b3E3aB323D04aBA975642D', decimals: 18, ethPoolFee: null },
+    { symbol: 'XMR', name: 'Monero', address: '0x38F728351fd9565087a4fF0ad5049739e0Ce235c', decimals: 18, ethPoolFee: null, ethSwapFee: null },
+    { symbol: 'ZEC', name: 'Zcash', address: '0xEc127e99Da1a2eD3d6C0433227154a99B7B29221', decimals: 18, ethPoolFee: null, ethSwapFee: null },
+    { symbol: 'SOL', name: 'Solana', address: '0x49F98A382Ccbc05f13b3E3aB323D04aBA975642D', decimals: 18, ethPoolFee: null, ethSwapFee: null },
     // Community pairs with real depth on this chain.
-    { symbol: 'PONS', name: 'Pons', address: '0x39dBED3a2bd333467115dE45665cC57F813C4571', decimals: 18, ethPoolFee: null },
-    { symbol: 'AI', name: 'Artificial Inu', address: '0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18', decimals: 18, ethPoolFee: null },
-    { symbol: 'CASHCAT', name: 'Cash Cat', address: '0x020bfC650A365f8BB26819deAAbF3E21291018b4', decimals: 18, ethPoolFee: null },
-    { symbol: 'FATCOIN', name: 'FATCOIN', address: '0x12D5ee7917cA430073C3A638ee1e6f0648A98a01', decimals: 18, ethPoolFee: null },
-    { symbol: 'CME', name: 'Commodity Market Exchange', address: '0xe2324FF2a59F8eCBa8c321c6466e59121C00e795', decimals: 18, ethPoolFee: null },
-    { symbol: 'MEME', name: 'A Meme Coin', address: '0x385F4f8ae47651ce5F58F5265395a669f8281e18', decimals: 18, ethPoolFee: null },
-    { symbol: 'BONER', name: 'Boner Coin', address: '0x98096d17e191B3dA1d5f99a6D7b3584351b11E18', decimals: 18, ethPoolFee: null },
-    { symbol: 'MOO', name: 'Memory cow Moo', address: '0xD9dB30BB0D2b8d2eae3826A1372117E058791e18', decimals: 18, ethPoolFee: null },
-    { symbol: 'STONKBROKER', name: 'StonkBroker', address: '0xe934e36A439C94017B64a3FecE66AF12099aBF50', decimals: 18, ethPoolFee: null },
-    { symbol: 'SHROOM', name: 'MUSHROOM', address: '0xab093dEF657F15dF31b33922A95e047aDd645B29', decimals: 18, ethPoolFee: null },
-    { symbol: 'HOOKR', name: 'Hookr.fun', address: '0x18E674231A58c239Dc7DaeDcffE15Ec3A24cff5c', decimals: 18, ethPoolFee: null },
-    { symbol: 'NUDES', name: 'Send Nudes', address: '0xbe98b75361935b18d688409424a869a4C3dC7401', decimals: 18, ethPoolFee: null },
-    { symbol: 'ZZZ', name: 'ZZZ', address: '0x7dbf38976f6D3b9c529e7D9484A71898B409eE6a', decimals: 18, ethPoolFee: null },
-    { symbol: 'DELTA', name: 'Delta', address: '0xe8ffd7e24187F72afB08d75B1bb13088A989a791', decimals: 18, ethPoolFee: null },
-    { symbol: 'TENDIES', name: 'TENDIES', address: '0x45242320DBB855EeA8Fd36804C6487E10E97FCF9', decimals: 18, ethPoolFee: null },
-    { symbol: 'YOLO', name: 'YOLO', address: '0x62C71cd34a52c30d894419CBcc55Db2aFA8032eA', decimals: 18, ethPoolFee: null },
-    { symbol: 'ROBINCAT', name: 'ROBINCAT', address: '0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc', decimals: 18, ethPoolFee: null },
-    { symbol: 'microduck', name: 'microduck', address: '0xD5f1afEA47b1A9eab414D2ee740cF1d6d039E725', decimals: 18, ethPoolFee: null },
-    { symbol: 'PIPEDOG', name: 'pipedog', address: '0x5Cb6F181081301b44905F3ae15419112ecaBd8A6', decimals: 18, ethPoolFee: null },
-    { symbol: 'PAIR', name: 'PAIR', address: '0x6b1d42927B1a84eC28Fa88d4fC6FA7AF404966be', decimals: 18, ethPoolFee: null },
-    { symbol: 'IF', name: 'What If', address: '0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1', decimals: 18, ethPoolFee: null },
+    { symbol: 'PONS', name: 'Pons', address: '0x39dBED3a2bd333467115dE45665cC57F813C4571', decimals: 18, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'AI', name: 'Artificial Inu', address: '0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18', decimals: 18, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'CASHCAT', name: 'Cash Cat', address: '0x020bfC650A365f8BB26819deAAbF3E21291018b4', decimals: 18, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'FATCOIN', name: 'FATCOIN', address: '0x12D5ee7917cA430073C3A638ee1e6f0648A98a01', decimals: 18, ethPoolFee: null, ethSwapFee: null },
+    { symbol: 'CME', name: 'Commodity Market Exchange', address: '0xe2324FF2a59F8eCBa8c321c6466e59121C00e795', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'MEME', name: 'A Meme Coin', address: '0x385F4f8ae47651ce5F58F5265395a669f8281e18', decimals: 18, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'BONER', name: 'Boner Coin', address: '0x98096d17e191B3dA1d5f99a6D7b3584351b11E18', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'MOO', name: 'Memory cow Moo', address: '0xD9dB30BB0D2b8d2eae3826A1372117E058791e18', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'STONKBROKER', name: 'StonkBroker', address: '0xe934e36A439C94017B64a3FecE66AF12099aBF50', decimals: 18, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'SHROOM', name: 'MUSHROOM', address: '0xab093dEF657F15dF31b33922A95e047aDd645B29', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'HOOKR', name: 'Hookr.fun', address: '0x18E674231A58c239Dc7DaeDcffE15Ec3A24cff5c', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'NUDES', name: 'Send Nudes', address: '0xbe98b75361935b18d688409424a869a4C3dC7401', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'ZZZ', name: 'ZZZ', address: '0x7dbf38976f6D3b9c529e7D9484A71898B409eE6a', decimals: 18, ethPoolFee: null, ethSwapFee: 500 },
+    { symbol: 'DELTA', name: 'Delta', address: '0xe8ffd7e24187F72afB08d75B1bb13088A989a791', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'TENDIES', name: 'TENDIES', address: '0x45242320DBB855EeA8Fd36804C6487E10E97FCF9', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'YOLO', name: 'YOLO', address: '0x62C71cd34a52c30d894419CBcc55Db2aFA8032eA', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'ROBINCAT', name: 'ROBINCAT', address: '0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'microduck', name: 'microduck', address: '0xD5f1afEA47b1A9eab414D2ee740cF1d6d039E725', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
+    { symbol: 'PIPEDOG', name: 'pipedog', address: '0x5Cb6F181081301b44905F3ae15419112ecaBd8A6', decimals: 18, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'PAIR', name: 'PAIR', address: '0x6b1d42927B1a84eC28Fa88d4fC6FA7AF404966be', decimals: 18, ethPoolFee: null, ethSwapFee: 3000 },
+    { symbol: 'IF', name: 'What If', address: '0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1', decimals: 18, ethPoolFee: null, ethSwapFee: 10000 },
   ],
 }
 
@@ -180,6 +191,70 @@ export const NETWORKS: Record<NetworkId, NetworkInfo> = {
     usdPricing: false,
     nativeZap: false,
     deployment: ROBINHOOD_DEPLOYMENT,
+  },
+  besc: {
+    id: 'besc',
+    chain: defineChain({
+      id: 2372,
+      name: 'BESC Hyperchain',
+      nativeCurrency: { name: 'BESC', symbol: 'BESC', decimals: 18 },
+      rpcUrls: { default: { http: ['https://rpc.beschyperchain.com'] } },
+      blockExplorers: {
+        default: { name: 'BESC Explorer', url: 'https://explorer.beschyperchain.com' },
+      },
+    }),
+    label: 'BESC',
+    explorer: 'https://explorer.beschyperchain.com',
+    // Carbon Pad has not yet been deployed on BESC.
+    poolManager: '0x0000000000000000000000000000000000000000',
+    usdPricing: false,
+    nativeZap: false,
+    deployment: {
+      pairRegistry: null,
+      launcher: null,
+      tradeRouter: null,
+    swapRouter: null,
+      feeHook: null,
+      referralVault: null,
+      zapRouter: null,
+      pairs: [],
+    },
+    bescInfrastructure: {
+      wrappedNative: '0x33e22F85CC1877697773ca5c85988663388883A0',
+      swapRouter: '0xd0E04BE6fCc3AB9BaCBc14C843bB562Fbfe490fC',
+      swapFactory: '0x20ee72d1b7e36e97566f31761dff14edc35fbf22',
+      presaleFactory: '0x9170dEBcd8EE067c636328cE557Bd0864c44a068',
+      vipPassManager: '0xc0cD67604A0F7720c36546b42de54495e15C02B4',
+      hyperChartsApi: 'https://api.beschypercharts.com',
+    },
+  },
+  bescTestnet: {
+    id: 'bescTestnet',
+    chain: defineChain({
+      id: 36807,
+      name: 'BESC Hyperchain Testnet',
+      nativeCurrency: { name: 'BESC', symbol: 'BESC', decimals: 18 },
+      rpcUrls: { default: { http: ['https://testnet-rpc.beschyperchain.com'] } },
+      blockExplorers: {
+        default: { name: 'BESC Testnet Explorer', url: 'https://testnet-explorer.beschyperchain.com' },
+      },
+    }),
+    label: 'BESC Testnet',
+    explorer: 'https://testnet-explorer.beschyperchain.com',
+    // Carbon Pad has not yet been deployed on BESC testnet.
+    poolManager: '0x0000000000000000000000000000000000000000',
+    usdPricing: false,
+    nativeZap: false,
+    deployment: {
+      pairRegistry: null,
+      launcher: null,
+      tradeRouter: null,
+    swapRouter: null,
+      feeHook: null,
+      referralVault: null,
+      zapRouter: null,
+      pairs: [],
+    },
   },
 }
 

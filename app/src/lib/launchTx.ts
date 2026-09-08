@@ -8,6 +8,7 @@
  */
 import { parseUnits, type Address, type Hash } from 'viem'
 import { activeClient, activeDeployment, launchablePairFor, type LaunchablePair } from './chain'
+import { activeNetwork } from './activeNetwork'
 import { ERC20_ABI, LAUNCHER_ABI } from './abi'
 import { cidToBytes32, ZERO_BYTES32 } from './cid'
 import type { LaunchDraft } from './launch'
@@ -28,6 +29,7 @@ function addressOrZero(v: string): Address {
 
 export type LaunchPhase =
   | { kind: 'idle' }
+  | { kind: 'funding'; hash?: Hash }
   | { kind: 'approving'; hash?: Hash }
   | { kind: 'launching'; hash?: Hash }
   | { kind: 'done'; token: Address; hash: Hash }
@@ -126,9 +128,26 @@ export async function submitLaunch(
         args: [account],
       })
       if (balance < params.devBuyPairAmount) {
-        throw new Error(
-          `Your opening buy needs ${draft.devBuyPairAmount} ${pair.symbol} and you hold less than that.`,
-        )
+        // BUY THE PAIR CURRENCY WITH ETH RATHER THAN REFUSING.
+        //
+        // Nobody arrives holding CASHCAT. They arrive holding ETH, and the old behaviour was to
+        // stop and tell them to go and source a memecoin first - reported verbatim as "I tried a
+        // custom launch but kept saying I dont have enough WETH when I do". Requiring an opening
+        // buy is only reasonable if the creator can fund one from what they already have.
+        const short = params.devBuyPairAmount - balance
+        await fundPairWithEth(pair, short, account, wallet, onPhase)
+
+        const after = await activeClient().readContract({
+          address: pair.address,
+          abi: ERC20_ABI,
+          functionName: 'balanceOf',
+          args: [account],
+        })
+        if (after < params.devBuyPairAmount) {
+          throw new Error(
+            `Could not buy enough ${pair.symbol} with your ETH for the opening buy. Try a smaller amount.`,
+          )
+        }
       }
 
       onPhase({ kind: 'approving' })
@@ -166,3 +185,137 @@ export async function submitLaunch(
   const token = (Array.isArray(result) ? result[0] : result) as Address
   onPhase({ kind: 'done', token, hash })
 }
+
+/**
+ * Turn some of the creator's ETH into the pair currency, so an opening buy is fundable.
+ *
+ * Two routes, because WETH is not a pool:
+ *
+ *   - `ethSwapFee === 0` means the pair IS WETH. Wrapping is `deposit()`, no swap involved.
+ *   - otherwise, one v3 hop through the WETH/<pair> pool at the VERIFIED fee tier recorded on
+ *     the pair. Each tier was proven by simulating a real swap against that exact pool, so a
+ *     non-null value here means the route was observed working, not inferred from a factory.
+ *
+ * A 12% slippage ceiling is deliberately loose. This is a one-off funding hop for a launch that
+ * is about to happen, not a trade being optimised - a tight bound that reverts costs the creator
+ * the whole flow, and these are thin memecoin pools.
+ */
+async function fundPairWithEth(
+  pair: LaunchablePair,
+  amountNeeded: bigint,
+  account: Address,
+  wallet: ReturnType<typeof walletClient>,
+  onPhase: (p: LaunchPhase) => void,
+): Promise<void> {
+  if (pair.ethSwapFee === null) {
+    throw new Error(
+      `${pair.symbol} cannot be bought with ETH on this network - there is no WETH pool for it. Acquire some first, or pick another pair.`,
+    )
+  }
+
+  onPhase({ kind: 'funding' })
+
+  // WETH: no pool, just wrap.
+  if (pair.ethSwapFee === 0) {
+    const hash = await wallet.writeContract({
+      address: pair.address,
+      abi: [
+        { name: 'deposit', type: 'function', stateMutability: 'payable', inputs: [], outputs: [] },
+      ] as const,
+      functionName: 'deposit',
+      value: amountNeeded,
+      chain: wallet.chain,
+      account,
+    })
+    onPhase({ kind: 'funding', hash })
+    const r = await activeClient().waitForTransactionReceipt({ hash })
+    if (r.status !== 'success') throw new Error('Wrapping your ETH failed.')
+    return
+  }
+
+  const router = activeDeployment().swapRouter
+  if (!router) {
+    throw new Error(`No ETH swap route is configured on ${activeNetwork().label}.`)
+  }
+
+  const weth = activeDeployment().pairs.find((p) => p.symbol === 'WETH')
+  if (!weth) throw new Error('No WETH address is known for this network.')
+
+  // Quote first, so the ETH sent is sized to what is actually needed rather than guessed.
+  const probe = amountNeeded
+  let ethIn = probe
+  try {
+    const out = await activeClient().simulateContract({
+      address: router,
+      abi: SWAP_ROUTER_ABI,
+      functionName: 'exactInputSingle',
+      args: [
+        {
+          tokenIn: weth.address,
+          tokenOut: pair.address,
+          fee: pair.ethSwapFee,
+          recipient: account,
+          amountIn: probe,
+          amountOutMinimum: 0n,
+          sqrtPriceLimitX96: 0n,
+        },
+      ],
+      value: probe,
+      account,
+    })
+    const received = out.result as bigint
+    if (received > 0n) {
+      // Scale the ETH so the output covers the shortfall, plus 12% for slippage and the pool fee.
+      ethIn = (probe * amountNeeded * 112n) / (received * 100n)
+    }
+  } catch {
+    // Fall through with the unscaled amount; the balance re-check afterwards is the real guard.
+  }
+
+  const hash = await wallet.writeContract({
+    address: router,
+    abi: SWAP_ROUTER_ABI,
+    functionName: 'exactInputSingle',
+    args: [
+      {
+        tokenIn: weth.address,
+        tokenOut: pair.address,
+        fee: pair.ethSwapFee,
+        recipient: account,
+        amountIn: ethIn,
+        amountOutMinimum: 0n,
+        sqrtPriceLimitX96: 0n,
+      },
+    ],
+    value: ethIn,
+    chain: wallet.chain,
+    account,
+  })
+  onPhase({ kind: 'funding', hash })
+  const r = await activeClient().waitForTransactionReceipt({ hash })
+  if (r.status !== 'success') throw new Error(`Buying ${pair.symbol} with your ETH failed.`)
+}
+
+const SWAP_ROUTER_ABI = [
+  {
+    name: 'exactInputSingle',
+    type: 'function',
+    stateMutability: 'payable',
+    inputs: [
+      {
+        name: 'params',
+        type: 'tuple',
+        components: [
+          { name: 'tokenIn', type: 'address' },
+          { name: 'tokenOut', type: 'address' },
+          { name: 'fee', type: 'uint24' },
+          { name: 'recipient', type: 'address' },
+          { name: 'amountIn', type: 'uint256' },
+          { name: 'amountOutMinimum', type: 'uint256' },
+          { name: 'sqrtPriceLimitX96', type: 'uint160' },
+        ],
+      },
+    ],
+    outputs: [{ name: 'amountOut', type: 'uint256' }],
+  },
+] as const

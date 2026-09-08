@@ -69,6 +69,22 @@ export type LaunchablePair = {
    * anybody's economics.
    */
   ethPoolFee: number | null
+
+  /**
+   * v3 fee tier of the WETH pool used to buy this pair WITH NATIVE ETH, or null if none exists.
+   *
+   * **This is what lets a creator fund an opening buy without already holding the pair token.**
+   * Nobody arrives holding CASHCAT. They arrive holding ETH, and telling them to go and source
+   * a memecoin first is how a launch form loses people - reported verbatim as "I tried a custom
+   * launch but kept saying I dont have enough WETH when I do".
+   *
+   * Every value here was PROVEN by simulating a real 0.001 ETH swap against that exact pool and
+   * fee tier on chain 4663, not read from a factory listing. 24 of the 30 pairs route; PAXG,
+   * XMR, ZEC, SOL and FATCOIN have no WETH pool and must be sourced manually.
+   *
+   * Zero is the special case for WETH itself: no pool, just `deposit()`.
+   */
+  ethSwapFee: number | null
 }
 
 export type Deployment = {
@@ -86,6 +102,14 @@ export type Deployment = {
    * aggregator rather than from us.
    */
   tradeRouter: `0x${string}` | null
+  /**
+   * A Uniswap v3 SwapRouter, used to turn a creator's ETH into the pair currency.
+   *
+   * Found by reading who successfully swaps the live pools rather than by guessing canonical
+   * addresses - the canonical v3 factory and SwapRouter02 slots on Robinhood hold 2 KB stubs
+   * that answer nothing.
+   */
+  swapRouter: `0x${string}` | null
   /** ETH in / ETH out routing, so a buyer never has to source the pair currency. */
   zapRouter: `0x${string}` | null
   /** Empty until the registry is deployed AND its approvals have been read from the chain. */
@@ -108,6 +132,7 @@ export const DEPLOYMENTS: { sepolia: Deployment; mainnet: Deployment } = {
     pairRegistry: '0xd2Ed630c334355e8A38f06FddF9F2C72bf776340',
     launcher: '0x900C3d3db6629D421CBE8aB1C5CFC35FC566A133',
     tradeRouter: '0xdd48D62D1127f12838a5672B457843B81844E62F',
+    swapRouter: null,
     feeHook: '0xe8fbfdB1A38E87b5cCf52b98dC7510E7E18Fe0CC',
     referralVault: '0x0497b2983f2802a3492E407fC45898DE917897F7',
     // Redeployed when `ZapRouter` gained a `deadline` argument and a WETH wrap path — the
@@ -119,10 +144,10 @@ export const DEPLOYMENTS: { sepolia: Deployment; mainnet: Deployment } = {
     pairs: [
       // No ETH pool for these two. A zap through them would revert `PoolNotInitialized`, so the
       // panel must not offer ETH on a launch paired against them.
-      { symbol: 'tWETH', name: 'Test WETH', address: '0x12FdCD633e5829E7Da7DACd8707432e9574aA156', decimals: 18, ethPoolFee: null },
-      { symbol: 'tWXMR', name: 'Test Wrapped Monero', address: '0x23f8dc6fD672fC62a900d96aad44D851216A877F', decimals: 18, ethPoolFee: null },
+      { symbol: 'tWETH', name: 'Test WETH', address: '0x12FdCD633e5829E7Da7DACd8707432e9574aA156', decimals: 18, ethPoolFee: null, ethSwapFee: null },
+      { symbol: 'tWXMR', name: 'Test Wrapped Monero', address: '0x23f8dc6fD672fC62a900d96aad44D851216A877F', decimals: 18, ethPoolFee: null, ethSwapFee: null },
       // Seeded by `DeployZap`: tick 69060, ~997 tPAXG to the ether, at a price we invented.
-      { symbol: 'tPAXG', name: 'Test Paxos Gold', address: '0x5B36658F7EF7c79c4e7ec46463FeB04012744F0c', decimals: 18, ethPoolFee: 3000 },
+      { symbol: 'tPAXG', name: 'Test Paxos Gold', address: '0x5B36658F7EF7c79c4e7ec46463FeB04012744F0c', decimals: 18, ethPoolFee: 3000, ethSwapFee: null },
     ],
   },
   // Mainnet needs an audit first. Nothing is deployed and nothing may be.
@@ -130,6 +155,7 @@ export const DEPLOYMENTS: { sepolia: Deployment; mainnet: Deployment } = {
     pairRegistry: null,
     launcher: null,
     tradeRouter: null,
+    swapRouter: null,
     feeHook: null,
     referralVault: null,
     zapRouter: null,
