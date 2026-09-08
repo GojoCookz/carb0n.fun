@@ -77,6 +77,15 @@ export type Deployment = {
   feeHook: `0x${string}` | null
   /** Splits the platform's cut between referrers and the treasury. */
   referralVault: `0x${string}` | null
+  /**
+   * The v4 swap router the trade panel calls.
+   *
+   * **This was a hardcoded Sepolia constant in `tradeTx.ts`.** On Robinhood Chain that address
+   * has ZERO BYTES OF CODE, so every Buy and Sell from the site called nothing at all - and it
+   * went unnoticed because the only swaps those pools have seen came from an external
+   * aggregator rather than from us.
+   */
+  tradeRouter: `0x${string}` | null
   /** ETH in / ETH out routing, so a buyer never has to source the pair currency. */
   zapRouter: `0x${string}` | null
   /** Empty until the registry is deployed AND its approvals have been read from the chain. */
@@ -98,6 +107,7 @@ export const DEPLOYMENTS: { sepolia: Deployment; mainnet: Deployment } = {
     // accepted a call from this build at all - the button would have reverted on every attempt.
     pairRegistry: '0xd2Ed630c334355e8A38f06FddF9F2C72bf776340',
     launcher: '0x900C3d3db6629D421CBE8aB1C5CFC35FC566A133',
+    tradeRouter: '0xdd48D62D1127f12838a5672B457843B81844E62F',
     feeHook: '0xe8fbfdB1A38E87b5cCf52b98dC7510E7E18Fe0CC',
     referralVault: '0x0497b2983f2802a3492E407fC45898DE917897F7',
     // Redeployed when `ZapRouter` gained a `deadline` argument and a WETH wrap path — the
@@ -119,6 +129,7 @@ export const DEPLOYMENTS: { sepolia: Deployment; mainnet: Deployment } = {
   mainnet: {
     pairRegistry: null,
     launcher: null,
+    tradeRouter: null,
     feeHook: null,
     referralVault: null,
     zapRouter: null,
@@ -180,10 +191,31 @@ const SEPOLIA_STANDIN: Record<string, string> = {
   PAXG: 'tPAXG',
 }
 
-export function launchablePairFor(mainnetSymbol: string): LaunchablePair | null {
-  const testSymbol = SEPOLIA_STANDIN[mainnetSymbol]
-  if (!testSymbol) return null
-  return DEPLOYMENTS.sepolia.pairs.find((p) => p.symbol === testSymbol) ?? null
+/**
+ * The launchable pair for a symbol, ON THE NETWORK THE USER IS ACTUALLY ON.
+ *
+ * **This resolved through `DEPLOYMENTS.sepolia` unconditionally** - it mapped a mainnet symbol
+ * to a Sepolia stand-in and searched the Sepolia roster, on every network. On Robinhood Chain
+ * that returned either nothing or an address with no code there.
+ *
+ * The visible symptom was a launch dying with "The contract function 'allowance' reverted",
+ * which is exactly what `allowance()` does when called on an address holding zero bytes. It
+ * only ever surfaced for launches WITH an opening buy, because that is the single code path
+ * that reads an allowance - so the bug hid behind an optional field.
+ *
+ * The stand-in map is kept as a SEPOLIA-ONLY FALLBACK: its mocks really are named differently
+ * (tWETH for WETH), so a draft written against the mainnet roster still has to resolve there.
+ */
+export function launchablePairFor(symbol: string): LaunchablePair | null {
+  const pairs = activeDeployment().pairs
+
+  const direct = pairs.find((p) => p.symbol === symbol)
+  if (direct) return direct
+
+  const standin = SEPOLIA_STANDIN[symbol]
+  if (standin) return pairs.find((p) => p.symbol === standin) ?? null
+
+  return null
 }
 
 export const mainnetClient = createPublicClient({

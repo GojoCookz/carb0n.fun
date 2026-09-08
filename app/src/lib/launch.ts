@@ -429,6 +429,18 @@ export function validate(d: LaunchDraft, pair: Pair | undefined): Issue[] {
       revert: '',
     })
   }
+  // MIRRORS `Launcher.MIN_DEV_BUY_PAIR`. The contract now REJECTS a launch with no opening buy,
+  // because a single-sided pool with zero pair currency cannot pay a seller, reads as dead on
+  // every screener, and hands the first trade a free option. Checking it here too means the
+  // creator is told before they spend gas discovering it.
+  if (d.devBuyPairAmount <= 0) {
+    out.push({
+      field: 'devBuyPairAmount',
+      message:
+        'An opening buy is required. Without one the pool opens with none of the pair currency in it, so it shows no liquidity and cannot fill a sell.',
+      revert: 'OpeningBuyRequired',
+    })
+  }
   if (d.devBuyPairAmount > devBuyCap(d)) {
     out.push({
       field: 'devBuyPairAmount',

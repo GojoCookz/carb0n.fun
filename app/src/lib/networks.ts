@@ -106,6 +106,9 @@ const ROBINHOOD_DEPLOYMENT: Deployment = {
   launcher: '0xCc491F9962CA5545163ac425210b69e24AC29a96',
   feeHook: '0xdC0244274F0b4E60Ec4433bfA9d3Ff0632CAa0Cc',
   referralVault: '0x6E87800BEDf09ddA439Ae78c820c58427Ca57947',
+  // Deployed after the fact: the original Robinhood deploy shipped the five core contracts and
+  // no router, so the trade panel had nothing to call on this chain.
+  tradeRouter: '0xD6EdCd3cc28C40b42d6fe31B054eBb93a944A3A6',
   zapRouter: null,
   pairs: [
     // Core. Decimals read on-chain, never assumed: USDG is 6 and cbBTC is 8 where nearly

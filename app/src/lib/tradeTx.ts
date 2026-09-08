@@ -10,11 +10,23 @@
  * `TradeRouter` swaps first and settles from the delta. See `src/TradeRouter.sol`.
  */
 import { parseUnits, type Address, type Hash } from 'viem'
+import { activeNetwork } from './activeNetwork'
 import { activeClient, activeDeployment } from './chain'
 import { ERC20_ABI } from './abi'
 import { walletClient } from './wallet'
 
-export const TRADE_ROUTER: Address = '0xdd48D62D1127f12838a5672B457843B81844E62F'
+/**
+ * The router for the ACTIVE network.
+ *
+ * This was a module-level constant holding a Sepolia address, which meant every trade on
+ * Robinhood Chain called an address with no code. A function, not a constant, because the
+ * answer changes when the user switches network.
+ */
+export function tradeRouter(): Address {
+  const a = activeDeployment().tradeRouter
+  if (!a) throw new Error(`No trade router is deployed on ${activeNetwork().label}.`)
+  return a
+}
 
 /** Every launch opens with this spacing. Mirrors `TICK_SPACING` in `launchTx.ts`. */
 const TICK_SPACING = 60
@@ -122,7 +134,7 @@ export async function submitTrade(
     address: inToken,
     abi: ERC20_ABI,
     functionName: 'allowance',
-    args: [opts.account, TRADE_ROUTER],
+    args: [opts.account, tradeRouter()],
   })
   if (allowance < amountIn) {
     onPhase({ kind: 'approving' })
@@ -130,7 +142,7 @@ export async function submitTrade(
       address: inToken,
       abi: ERC20_ABI,
       functionName: 'approve',
-      args: [TRADE_ROUTER, amountIn],
+      args: [tradeRouter(), amountIn],
       chain: wallet.chain,
       account: opts.account,
     })
@@ -141,7 +153,7 @@ export async function submitTrade(
 
   // Quote by simulating the real call, then set the floor from that.
   const quote = await activeClient().simulateContract({
-    address: TRADE_ROUTER,
+    address: tradeRouter(),
     abi: TRADE_ROUTER_ABI,
     functionName: 'swap',
     args: [key, zeroForOne, amountIn, 0n, opts.account],
@@ -152,7 +164,7 @@ export async function submitTrade(
 
   onPhase({ kind: 'trading' })
   const { request } = await activeClient().simulateContract({
-    address: TRADE_ROUTER,
+    address: tradeRouter(),
     abi: TRADE_ROUTER_ABI,
     functionName: 'swap',
     args: [key, zeroForOne, amountIn, minOut, opts.account],
@@ -185,7 +197,7 @@ export async function quoteTrade(opts: {
     if (amountIn === 0n) return null
 
     const quote = await activeClient().simulateContract({
-      address: TRADE_ROUTER,
+      address: tradeRouter(),
       abi: TRADE_ROUTER_ABI,
       functionName: 'swap',
       args: [key, zeroForOne, amountIn, 0n, opts.account],

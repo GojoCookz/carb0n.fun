@@ -95,6 +95,18 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     ///      large enough to own the float is a rug in progress. We revert rather than silently
     ///      trimming: silent adjustment is how users get surprised.
     uint16 public constant MAX_DEV_BUY_BPS = 1000; // 10% of supply
+
+    /// @notice The smallest opening buy a launch may have, in pair-currency base units.
+    ///
+    /// @dev Deliberately a floor rather than a percentage. A percentage of the opening cap
+    ///      would scale to nothing for a small launch, which is exactly the launch that most
+    ///      needs a resting bid.
+    ///
+    ///      This is a DUST THRESHOLD. It exists to make zero liquidity unreachable, not to set
+    ///      an economically meaningful size - the pair roster runs from 6-decimal USDG to
+    ///      18-decimal memecoins, so any percentage-of-supply rule would be wrong for one end
+    ///      or the other. Small enough to be trivial for every approved currency.
+    uint256 public constant MIN_DEV_BUY_PAIR = 1e12;
     /// @notice Smallest max-wallet cap a launch may set, as a share of supply.
     /// @dev Below this the cap stops being anti-whale and becomes a transfer blocker.
     uint16 public constant MIN_MAX_WALLET_BPS = 10; // 0.1%
@@ -276,6 +288,7 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
     error SupplyTooLow();
     error SeedTooLow();
     error DevBuyTooLarge(uint256 given, uint256 cap);
+    error OpeningBuyRequired(uint256 given, uint256 minimum);
     error MaxWalletTooSmall(uint16 given);
     error GraduationThresholdTooLow(uint256 given, uint256 openingMarketCap);
     /// @notice The pool opened at or above its own graduation bar. See `_assertNotBornGraduated`.
@@ -445,6 +458,14 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
                 maxWallet_: p.maxWalletBps == 0 ? 0 : (p.supply * p.maxWalletBps) / BPS,
                 minPushPayout: p.minPushPayout,
                 minShareForQueue: p.minShareForQueue,
+                pairRegistry: address(pairRegistry),
+                // The basket seat goes to the SAME address the creator fees go to, not to the
+                // launching wallet. They are deliberately allowed to differ - a team splitter or a
+                // multisig is a different key from the hot one that signs a launch - and the seat
+                // that redirects holder payouts belongs with the party that owns the revenue, not
+                // with whoever happened to broadcast the transaction. This is the same expression
+                // `_configureHook` uses for `creator`, so the two can never drift apart.
+                basketController: p.feeRecipient == address(0) ? msg.sender : p.feeRecipient,
                 metadata: p.metadata
             })
         );
@@ -531,6 +552,24 @@ contract Launcher is IUnlockCallback, ReentrancyGuardTransient {
         // holding 30% on a published 365-day linear release is a different proposition from one
         // holding 30% nobody was told about. `VestRequiresDevBuy` stops a vest being requested
         // with nothing to put in it.
+        // EVERY LAUNCH MUST OPEN WITH LIQUIDITY ON BOTH SIDES.
+        //
+        // The pool is seeded single-sided, so without an opening buy it holds the entire supply and
+        // ZERO pair currency. It cannot pay a single seller, every screener reads it as no
+        // liquidity / no price / no market cap, and the first trade of any size moves the price
+        // arbitrarily. HOOD1 launched that way and spent its first day looking abandoned while
+        // being perfectly functional.
+        //
+        // It also closes the free-option window documented at the top of this contract: whoever
+        // trades first against an untouched pool gets an entry measured at -3.00 pair downside
+        // against +157.21 upside. Requiring the creator to take that first fill removes it.
+        //
+        // Enforced HERE rather than in the launch form because the form is one caller of a
+        // permissionless function. A rule that only exists in the UI is not a rule.
+        if (p.devBuyPairAmount < MIN_DEV_BUY_PAIR) {
+            revert OpeningBuyRequired(p.devBuyPairAmount, MIN_DEV_BUY_PAIR);
+        }
+
         if (p.vestDuration == 0) {
             uint256 devCap = (p.openingMarketCap * MAX_DEV_BUY_BPS) / BPS;
             if (p.devBuyPairAmount > devCap) revert DevBuyTooLarge(p.devBuyPairAmount, devCap);
