@@ -109,3 +109,45 @@ export function cidToBytes32(raw: string): CidResult {
 
   return { ok: false, reason: 'Not an IPFS CID. Expected one starting Qm… or b…' }
 }
+
+/**
+ * Rebuild a CID string from the 32-byte digest stored on chain.
+ *
+ * ## The codec is NOT recoverable, and that is the whole problem
+ *
+ * The token stores only the digest. A CID is version + CODEC + multihash + digest, so rebuilding
+ * one means guessing the codec byte. Pinata returns raw (0x55, afkrei...) for small files and
+ * dag-pb (0x70, afybei...) for anything it chunks - so the right answer differs PER FILE.
+ *
+ * Measured on two real launches: TESTCAT resolves as bafkrei and 403s as bafybei; BBC CAT is the
+ * exact opposite. Guessing one codec means roughly half of all images are permanently broken,
+ * which is what shipped.
+ *
+ * Both candidates are returned and the caller tries them in turn. The digest is the same in both,
+ * so at most one extra request is ever made, and only when the first misses.
+ */
+export function digestToCids(digest: string): string[] {
+  const hex = digest.replace(/^0x/, '')
+  if (hex.length !== 64 || /^0+$/.test(hex)) return []
+  const bytes = (hex.match(/../g) ?? []).map((h) => parseInt(h, 16))
+  // 0x55 raw, 0x70 dag-pb. Raw first: it is what our own uploader produces for typical art.
+  return [0x55, 0x70].map((codec) => encodeCid([0x01, codec, 0x12, 0x20, ...bytes]))
+}
+
+const B32 = 'abcdefghijklmnopqrstuvwxyz234567'
+
+function encodeCid(bytes: number[]): string {
+  let value = 0
+  let bits = 0
+  let out = ''
+  for (const b of bytes) {
+    value = (value << 8) | b
+    bits += 8
+    while (bits >= 5) {
+      out += B32[(value >> (bits - 5)) & 31]
+      bits -= 5
+    }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31]
+  return 'b' + out
+}

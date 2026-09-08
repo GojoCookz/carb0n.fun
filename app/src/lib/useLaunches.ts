@@ -98,9 +98,14 @@ export function useLaunches(): LaunchesState {
               bigint,
             ]
 
-            const [name, symbol] = await Promise.all([
+            const [name, symbol, meta] = await Promise.all([
               activeClient().readContract({ address: token, abi: tokenAbi, functionName: 'name' }),
               activeClient().readContract({ address: token, abi: tokenAbi, functionName: 'symbol' }),
+              // The artwork the creator paid gas to store. `metadata()` was in the ABI and was
+              // never called, so every board tile fell back to two grey initials.
+              activeClient()
+                .readContract({ address: token, abi: tokenAbi, functionName: 'metadata' })
+                .catch(() => null),
             ])
 
             const known = pairFor(pairAddr)
@@ -142,8 +147,11 @@ export function useLaunches(): LaunchesState {
               address: token,
               name: name as string,
               symbol: symbol as string,
-              imageCid: '',
-              bannerCid: '',
+              // WAS HARDCODED EMPTY. `metadata()` is in the ABI and was being called, and the
+              // result was dropped on the floor - so every board tile rendered initials
+              // instead of the artwork the creator paid gas to store.
+              imageCid: meta ? (meta[0] as string) : '',
+              bannerCid: meta ? (meta[1] as string) : '',
               // The real, on-chain pair. `pair` below carries the mainnet identity for display.
               chainPair: pairAddr,
               pair:

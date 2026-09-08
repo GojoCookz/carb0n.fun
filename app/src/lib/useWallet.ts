@@ -43,6 +43,24 @@ export type WalletState = {
   switchChain: () => Promise<void>
 }
 
+
+/**
+ * EVERY `useWallet()` CALL HAS ITS OWN STATE, and that was a real bug.
+ *
+ * The header connects, sets its own `account`, and no other component finds out. A user
+ * connected in the top bar and the claim panel below still said "connect a wallet" - reported as
+ * "I already connected the wallet... actually needed to refresh". Reloading worked because on a
+ * fresh mount every instance re-reads `eth_accounts` independently.
+ *
+ * `accountsChanged` does not reliably cover it: several wallets do not emit it for the first
+ * `eth_requestAccounts` of a session, only for later switches. So connection is broadcast
+ * explicitly instead of hoping the provider does it.
+ */
+const listeners = new Set<() => void>()
+
+function announceWalletChange() {
+  for (const fn of listeners) fn()
+}
 export function useWallet(): WalletState {
   const hasInjected = hasInjectedWallet()
   const hasWalletConnect = walletConnectConfigured()
@@ -60,6 +78,21 @@ export function useWallet(): WalletState {
   // WalletConnect is restored FIRST and awaited, because `currentAccounts()` reads through
   // `getProvider()` - if the WC session has not been re-attached by then, a returning mobile user
   // reads as disconnected and is asked to scan a QR code they already scanned.
+  // Re-read whenever ANY instance connects or disconnects.
+  useEffect(() => {
+    const onChange = () => {
+      void (async () => {
+        const [accts, id] = await Promise.all([currentAccounts(), currentChainId()])
+        setAccount(accts[0] ?? null)
+        setChainId(id)
+      })()
+    }
+    listeners.add(onChange)
+    return () => {
+      listeners.delete(onChange)
+    }
+  }, [])
+
   useEffect(() => {
     let live = true
     void (async () => {
@@ -115,6 +148,7 @@ export function useWallet(): WalletState {
       setProviderEpoch((n) => n + 1)
       setAccount(accts[0] ?? null)
       setChainId(await currentChainId())
+      announceWalletChange()
     } catch (e) {
       setError(walletErrorMessage(e))
     } finally {
@@ -127,6 +161,7 @@ export function useWallet(): WalletState {
     await doDisconnect()
     setAccount(null)
     setChainId(null)
+    announceWalletChange()
     setProviderEpoch((n) => n + 1)
   }, [])
 

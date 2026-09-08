@@ -53,6 +53,7 @@ export function Token() {
     listing?.address ?? null,
     listing?.chainPair ?? null,
     account ?? null,
+    claimNonce,
   )
 
   const history = usePriceHistory(
@@ -134,7 +135,7 @@ export function Token() {
         account,
       })
       const r = await activeClient().waitForTransactionReceipt({ hash })
-      if (r.status !== 'success') throw new Error('The sweep reverted.')
+      if (r.status !== 'success') throw new Error('The claim reverted.')
       setClaimNonce((n) => n + 1)
     } catch (e) {
       if (!isUserRejection(e)) setSweepError(walletErrorMessage(e))

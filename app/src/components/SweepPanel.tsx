@@ -60,7 +60,7 @@ export function SweepPanel({
     <div className="rounded-2xl border border-ink-700 bg-ink-900 p-4">
       <div className="flex items-baseline justify-between gap-2">
         <h2 className="font-display text-[14px] font-bold text-bone-50">Unswept fees</h2>
-        <span className="font-display text-[11px] font-bold text-bone-500">anyone can sweep</span>
+        <span className="font-display text-[11px] font-bold text-bone-500">anyone can trigger this</span>
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-4">
@@ -94,7 +94,7 @@ export function SweepPanel({
         {sweeping
           ? 'Confirming…'
           : !account
-            ? 'Connect a wallet to sweep'
+            ? 'Connect a wallet to claim'
             : !anything
               ? 'Nothing to sweep'
               : bounty !== null && bounty > 0n
@@ -105,7 +105,7 @@ export function SweepPanel({
       {error && <p className="mt-2 text-[12px] leading-relaxed text-danger-400">{error}</p>}
 
       <p className="mt-3 border-t border-ink-800 pt-3 text-[11px] leading-relaxed text-bone-500">
-        Sweeping pays holders, the creator and the platform, and pays{' '}
+        Claiming pays holders, the creator and the platform, and pays{' '}
         <span className="text-bone-400">you 0.5%</span> of what it releases for the gas. Nobody is
         obliged to do it — on a small or quiet pool the bounty will not cover the transaction, and
         the fees simply wait. Claiming what you are already owed never depends on this.

@@ -133,6 +133,16 @@ export function useTokenDetail(
   token: Address | null,
   pair: Address | null,
   account: Address | null,
+  /**
+   * Bump to force a refetch.
+   *
+   * **Without this, nothing on the page changed after a claim or a sweep.** The caller already
+   * incremented a nonce and used it as a React `key`, which remounts the subtree but re-runs
+   * nothing - the hook's effect was keyed on [token, pair, account], none of which change when a
+   * transaction lands. A user had to reload the page to see money they had just moved, and
+   * reported exactly that.
+   */
+  nonce = 0,
 ): TokenDetail {
   const [state, setState] = useState<TokenDetail>({ kind: 'loading' })
 
@@ -270,7 +280,7 @@ export function useTokenDetail(
     return () => {
       live = false
     }
-  }, [token, pair, account])
+  }, [token, pair, account, nonce])
 
   return state
 }

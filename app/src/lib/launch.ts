@@ -50,6 +50,16 @@ export const SIMPLE_PRESET = {
   /** 100% of the creator's own cut — the platform's slice is taken before this applies. */
   creatorBps: 10_000,
   maxWalletBps: 0,
+  // DELIBERATELY ABSENT: the dev buy is NOT reset when switching to simple mode.
+  //
+  // It used to be forced to 0 here, and simple mode never rendered the field, so a simple
+  // launch could not take any supply at all. The creator watched their own launch open and
+  // then had to snipe it from an external bot to hold any of their own token - reported
+  // exactly that way by the first outside user to launch on the pad.
+  //
+  // Everything else in this preset is a SIMPLIFICATION - one fee, no dividends, no locks.
+  // Taking the creator out of their own launch is not a simplification, it is a missing
+  // feature wearing a preset as a disguise.
   devBuyPairAmount: 0,
   vestDuration: 0,
   vestCliff: 0,

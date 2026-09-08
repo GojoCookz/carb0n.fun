@@ -1,4 +1,6 @@
 import { useState } from 'react'
+import { ipfsCandidates, ipfsWalk } from '../lib/ipfs'
+import { digestToCids } from '../lib/cid'
 import { Link } from 'react-router-dom'
 import { TokenLogo } from './TokenLogo'
 import { GraduationBar } from './GraduationBar'
@@ -6,7 +8,9 @@ import { formatUsd, shortAddress } from '../lib/chain'
 import { fmtAmount, fmtBps, fmtDuration } from '../lib/launch'
 import { ageLabel, type LaunchListing } from '../lib/listing'
 
-const IPFS_GATEWAY = 'https://ipfs.io/ipfs/'
+// The gateway lives in `lib/ipfs.ts`. It used to be `https://ipfs.io/ipfs/` here, which
+// started returning 429 and blanked every image on the pad - see that file for the
+// measurement and why a shared public gateway is not infrastructure.
 
 /**
  * One launch on the board.
@@ -315,10 +319,10 @@ function Banner({ cid }: { cid: string }) {
   return (
     <div className="relative h-[92px] w-full overflow-hidden bg-ink-800">
       <img
-        src={`${IPFS_GATEWAY}${cid}`}
+        src={ipfsCandidates(cid, digestToCids(cid))[0]}
         alt=""
         loading="lazy"
-        onError={() => setFailed(true)}
+        onError={ipfsWalk(ipfsCandidates(cid, digestToCids(cid)), () => setFailed(true))}
         className="size-full object-cover"
       />
       {/* Keeps the badges and ticker legible over arbitrary user art. */}
@@ -350,10 +354,10 @@ function Avatar({ cid, symbol }: { cid: string; symbol: string }) {
 
   return (
     <img
-      src={`${IPFS_GATEWAY}${cid}`}
+      src={ipfsCandidates(cid, digestToCids(cid))[0]}
       alt=""
       loading="lazy"
-      onError={() => setFailed(true)}
+      onError={ipfsWalk(ipfsCandidates(cid, digestToCids(cid)), () => setFailed(true))}
       className="relative z-10 -mt-5 size-12 shrink-0 rounded-xl border-2 border-ink-850 bg-ink-800 object-cover"
     />
   )

@@ -277,7 +277,45 @@ export function Launch() {
         <SectionTitle>4 · Fees and guards</SectionTitle>
 
         {draft.mode === 'simple' ? (
-          <SimpleTerms split={split} />
+          <>
+            <SimpleTerms split={split} />
+
+            {/*
+              THE DEV BUY IS NOT AN ADVANCED OPTION.
+
+              This field existed only in Custom mode, and the simple preset forced it to zero, so
+              a simple launch minted the whole supply into the pool and left the creator holding
+              NONE OF THEIR OWN TOKEN. The first outside launch on the pad hit exactly that: the
+              creator watched it open and then had to buy his own coin back from a sniping bot.
+
+              Simplifying means fewer decisions, not fewer outcomes. Taking the creator out of
+              their own launch was never a simplification.
+            */}
+            <Card className="p-5">
+              <NumberField
+                label="Dev buy"
+                constraint={`up to ${fmtAmount(devBuyCap(draft))} ETH`}
+                hint={
+                  <>
+                    <strong className="text-bone-200">
+                      How much of your own token you start with.
+                    </strong>{' '}
+                    Bought in the same transaction as the launch, at the opening price, before
+                    anybody else can trade. Paid from the ETH already in your wallet.
+                    <br />
+                    <br />
+                    Leave it at zero and you hold none of your own token, and the first buyer
+                    gets the best entry that will ever exist.
+                  </>
+                }
+                value={draft.devBuyPairAmount}
+                onChange={(v) => set('devBuyPairAmount', v)}
+                unit="ETH"
+                optional
+                error={issueFor(issues, 'devBuyPairAmount')?.message}
+              />
+            </Card>
+          </>
         ) : (
           <>
             <DividendOptIn draft={draft} set={set} pair={pair} />
@@ -382,10 +420,10 @@ export function Launch() {
         </Disclosure>
 
         <Disclosure
-          title="Wallet cap and opening buy"
+          title="Wallet cap and dev buy"
           summary={
             `${draft.maxWalletBps === 0 ? 'no wallet cap' : `${fmtBps(draft.maxWalletBps)} max wallet`}` +
-            ` · ${draft.devBuyPairAmount > 0 ? `opening buy ${fmtAmount(draft.devBuyPairAmount)} ${pair?.symbol ?? ''}` : 'no opening buy, pool starts empty'}`
+            ` · ${draft.devBuyPairAmount > 0 ? `dev buy ${fmtAmount(draft.devBuyPairAmount)} ${pair?.symbol ?? ''}` : 'no dev buy, pool starts empty'}`
           }
         >
           <BpsSlider
@@ -403,7 +441,7 @@ export function Launch() {
             error={issueFor(issues, 'maxWalletBps')?.message}
           />
           <NumberField
-            label="Your opening buy"
+            label="Dev buy"
             constraint={
               draft.vestDuration > 0
                 ? 'uncapped while locked'
@@ -412,7 +450,7 @@ export function Launch() {
             hint={
               <>
                 <strong className="text-bone-200">
-                  This is what stops the pool opening empty.
+                  This is how you get any of your own token.
                 </strong>{' '}
                 The whole supply is seeded on one side, so until somebody buys there is zero{' '}
                 {pair?.symbol ?? 'pair'} in the pool. Screeners read that as no liquidity. An
