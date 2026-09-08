@@ -47,6 +47,14 @@ export const ADDRESSES = {
  */
 export type LaunchablePair = {
   symbol: string
+  /**
+   * Display name, READ FROM THE CONTRACT rather than written by hand.
+   *
+   * On Robinhood Chain a symbol identifies nothing - four separate contracts answer `XMR`, five
+   * answer `WETH` - so the only name that can be trusted is the one `name()` returns. Fetched by
+   * `scripts/read-hood-pairs.mjs`, which also re-checks decimals.
+   */
+  name: string
   address: `0x${string}`
   decimals: number
   /**
@@ -101,10 +109,10 @@ export const DEPLOYMENTS: { sepolia: Deployment; mainnet: Deployment } = {
     pairs: [
       // No ETH pool for these two. A zap through them would revert `PoolNotInitialized`, so the
       // panel must not offer ETH on a launch paired against them.
-      { symbol: 'tWETH', address: '0x12FdCD633e5829E7Da7DACd8707432e9574aA156', decimals: 18, ethPoolFee: null },
-      { symbol: 'tWXMR', address: '0x23f8dc6fD672fC62a900d96aad44D851216A877F', decimals: 18, ethPoolFee: null },
+      { symbol: 'tWETH', name: 'Test WETH', address: '0x12FdCD633e5829E7Da7DACd8707432e9574aA156', decimals: 18, ethPoolFee: null },
+      { symbol: 'tWXMR', name: 'Test Wrapped Monero', address: '0x23f8dc6fD672fC62a900d96aad44D851216A877F', decimals: 18, ethPoolFee: null },
       // Seeded by `DeployZap`: tick 69060, ~997 tPAXG to the ether, at a price we invented.
-      { symbol: 'tPAXG', address: '0x5B36658F7EF7c79c4e7ec46463FeB04012744F0c', decimals: 18, ethPoolFee: 3000 },
+      { symbol: 'tPAXG', name: 'Test Paxos Gold', address: '0x5B36658F7EF7c79c4e7ec46463FeB04012744F0c', decimals: 18, ethPoolFee: 3000 },
     ],
   },
   // Mainnet needs an audit first. Nothing is deployed and nothing may be.

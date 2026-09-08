@@ -20,7 +20,8 @@
  * worse than the storage. It is validated on read: a stored value naming a network that has since
  * lost its deployment falls back to the default rather than being trusted.
  */
-import { NETWORKS, type NetworkId, type NetworkInfo } from './networks'
+import { NETWORKS, pairsForNetwork, type NetworkId, type NetworkInfo } from './networks'
+import type { Pair } from './pairs'
 
 const STORAGE_KEY = 'carb0n.activeNetwork'
 
@@ -145,4 +146,16 @@ paint(current)
 export function subscribeNetwork(fn: () => void): () => void {
   listeners.add(fn)
   return () => listeners.delete(fn)
+}
+
+/**
+ * The pair roster for whichever network is selected right now.
+ *
+ * Lives here rather than in `networks.ts` because it needs `activeNetworkId`, and `activeNetwork`
+ * already imports `networks` - defining it the other way round makes the two modules import each
+ * other. It works at runtime, since the call is inside a function body, but a cycle that only
+ * survives because of evaluation order is a trap for whoever edits it next.
+ */
+export function activePairs(): Pair[] {
+  return pairsForNetwork(activeNetworkId())
 }

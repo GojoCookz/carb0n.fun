@@ -23,14 +23,33 @@
  * resolves nowhere, recorded permanently in write-once metadata.
  */
 
-function endpoint(): string | null {
+/**
+ * Where uploads POST to.
+ *
+ * **Defaults to the same-origin `/api/pin`, which is the route this repo ships.** It used to
+ * require `VITE_PIN_ENDPOINT` to be set before uploads were even offered, which meant the shipped
+ * site told every creator "no pinning key is configured" and pushed them at a paste-a-CID field -
+ * while the function was sitting right there, correctly deployed, answering 405 to GET.
+ *
+ * Requiring an environment variable to name a path that is fixed by the deployment is not
+ * configuration, it is a step somebody has to remember. The override stays for pointing a local
+ * dev build at a remote endpoint.
+ */
+function endpoint(): string {
   const v = import.meta.env.VITE_PIN_ENDPOINT
-  return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null
+  return typeof v === 'string' && v.trim().length > 0 ? v.trim() : '/api/pin'
 }
 
-/** False until an upload endpoint is configured. The UI must say so rather than fail on submit. */
+/**
+ * Is there somewhere to upload to? Now always true, because the route always exists.
+ *
+ * **This does NOT mean the server can pin.** `/api/pin` answers 503 until `PINATA_JWT` is set in
+ * the server environment. That is deliberately a runtime error with a specific message rather than
+ * a hidden UI state: a missing key is an operator problem to fix, not a reason to make every
+ * creator paste a content hash by hand.
+ */
 export function pinningConfigured(): boolean {
-  return endpoint() !== null
+  return true
 }
 
 export type PinResult = { cid: string }
@@ -59,6 +78,13 @@ export async function pinImage(blob: Blob, filename: string): Promise<PinResult>
       throw new Error('The upload service rejected the request.')
     }
     if (res.status === 413) throw new Error('That file is too large to upload.')
+    // 503 is the ONE case the operator can fix, so it must not read as a generic failure. The
+    // route returns it when PINATA_JWT is absent from the server environment.
+    if (res.status === 503) {
+      throw new Error(
+        'Image uploads are switched off on the server. PINATA_JWT is not set for this deployment.',
+      )
+    }
     throw new Error(`The upload failed (HTTP ${res.status}).`)
   }
 

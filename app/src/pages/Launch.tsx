@@ -4,12 +4,12 @@ import { LaunchSubmit } from '../components/LaunchSubmit'
 import { ModeToggle, OptIn } from '../components/ModeToggle'
 import { ImageUpload } from '../components/ImageUpload'
 import { BANNER_SPEC, ICON_SPEC } from '../lib/imageFile'
-import { pinningConfigured } from '../lib/pin'
 import { TextField, NumberField, BpsSlider, Disclosure, Stat, Source } from '../components/Form'
 import { GraduationBar } from '../components/GraduationBar'
 import { LaunchSummary } from '../components/LaunchSummary'
 import { TokenLogo } from '../components/TokenLogo'
 import { formatUsd } from '../lib/chain'
+import { activePairs } from '../lib/activeNetwork'
 import { useDraft } from '../lib/draft-context'
 import { ethRouteFor, ETH_ROUTE_CHEAP_BPS } from '../lib/ethRoute'
 import { usePairUsd, usdOf } from '../lib/usePairUsd'
@@ -40,7 +40,6 @@ import {
   type LaunchDraft,
 } from '../lib/launch'
 import {
-  PAIRS,
   depthBand,
   depthNote,
   formatLiquidity,
@@ -165,8 +164,7 @@ export function Launch() {
             onChange={(v) => set('bannerCid', v)}
           />
 
-          <CidFallback draft={draft} set={set} />
-        </Card>
+                  </Card>
       </section>
 
       {/* --- 2. Pair -------------------------------------------------------------------- */}
@@ -185,7 +183,7 @@ export function Launch() {
               </span>
               <span className="mt-0.5 block text-[11.5px] leading-snug text-bone-500">
                 The deepest market on Ethereum. Switch to Custom to pick from{' '}
-                {PAIRS.length} others.
+                {activePairs().length} others.
               </span>
             </span>
           </Card>
@@ -719,7 +717,7 @@ function PairPicker({ selected, onPick }: { selected: Pair | undefined; onPick: 
 
       {open && (
         <div className="grid grid-cols-2 gap-2">
-          {PAIRS.map((p) => {
+          {activePairs().map((p) => {
             const active = p.symbol === selected.symbol
             return (
               <button
@@ -1001,7 +999,7 @@ function RewardPicker({
 }) {
   return (
     <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-1">
-      {PAIRS.map((p) => (
+      {activePairs().map((p) => (
         <button
           key={p.symbol}
           type="button"
@@ -1061,73 +1059,6 @@ function FeeWalletOptIn({
   )
 }
 
-/**
- * The old CID text boxes, kept as an escape hatch rather than deleted.
- *
- * Two groups still need them: anyone who already pinned their art somewhere and does not want it
- * re-uploaded, and everyone at all while no pinning key is configured. It is COLLAPSED by
- * default, because a form that shows the expert path and the normal path with equal weight has
- * not actually chosen a normal path.
- *
- * It opens itself when uploads are off, since in that state it is the only way through.
- */
-function CidFallback({
-  draft,
-  set,
-}: {
-  draft: LaunchDraft
-  set: <K extends keyof LaunchDraft>(key: K, value: LaunchDraft[K]) => void
-}) {
-  const configured = pinningConfigured()
-  const [open, setOpen] = useState(!configured)
-
-  return (
-    <div className="rounded-xl border border-ink-700 bg-ink-900">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        aria-expanded={open}
-        className="flex w-full items-center justify-between gap-3 px-3.5 py-2.5 text-left"
-      >
-        <span className="min-w-0">
-          <span className="block font-display text-[12.5px] font-semibold text-bone-300">
-            Already have an IPFS CID?
-          </span>
-          <span className="mt-0.5 block text-[11px] text-bone-500">
-            {configured
-              ? 'Paste it instead of uploading.'
-              : 'Uploads are off, so this is the way through for now.'}
-          </span>
-        </span>
-        <span aria-hidden className="shrink-0 text-bone-500">
-          {open ? '−' : '+'}
-        </span>
-      </button>
-
-      {open && (
-        <div className="space-y-4 border-t border-ink-700 px-3.5 pb-4 pt-3.5">
-          <TextField
-            label="Image CID"
-            hint="Stored on chain as bytes32, so a link that rots cannot take the token with it."
-            value={draft.imageCid}
-            onChange={(v) => set('imageCid', v.trim())}
-            placeholder="bafybeigdyrzt5."
-            mono
-          />
-          <TextField
-            label="Banner CID"
-            hint="1500 x 500."
-            value={draft.bannerCid}
-            onChange={(v) => set('bannerCid', v.trim())}
-            placeholder="bafybeih4x2q."
-            mono
-            optional
-          />
-        </div>
-      )}
-    </div>
-  )
-}
 
 function Review({
   issues,

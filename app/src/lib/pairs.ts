@@ -48,6 +48,19 @@ export type Pair = {
   decimals: number
   category: PairCategory
   priceable: boolean
+  /**
+   * Has anybody actually looked at this token's bytecode?
+   *
+   * **Defaults to true only because every hand-written entry below WAS reviewed.** The Robinhood
+   * roster is generated from the on-chain registry rather than written here, and nothing in this
+   * repo has audited those contracts, so they arrive with `reviewed: false`.
+   *
+   * It exists because the depth panel prints "no admin powers in bytecode" whenever `riskCount`
+   * is zero. For a token nobody examined, an empty risk list means "we did not look", and
+   * rendering that as a clean bill of health would be a fabricated safety claim on the one screen
+   * where somebody is deciding what to trade against.
+   */
+  reviewed?: boolean
   /** Total DEX liquidity on Ethereum, USD, measured 2026-08-31. */
   liquidityUsd: number
   /** 24h volume across Ethereum pools, USD, measured 2026-08-31. */
