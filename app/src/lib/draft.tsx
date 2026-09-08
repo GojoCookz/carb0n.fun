@@ -1,6 +1,6 @@
-import { useCallback, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { DEFAULT_DRAFT, type LaunchDraft } from './launch'
-import { PAIRS } from './pairs'
+import { activePairs, subscribeNetwork } from './activeNetwork'
 import { DraftContext } from './draft-context'
 
 /**
@@ -84,7 +84,32 @@ export function DraftProvider({ children }: { children: ReactNode }) {
     setDraft(DEFAULT_DRAFT)
   }, [])
 
-  const pair = useMemo(() => PAIRS.find((p) => p.symbol === draft.pairSymbol), [draft.pairSymbol])
+  /**
+   * Resolve the selected pair AGAINST THE ACTIVE NETWORK'S ROSTER.
+   *
+   * **This looked the symbol up in `PAIRS` - the hand-written Ethereum list - while the picker
+   * offers the active network's approved currencies.** On Robinhood Chain the two lists barely
+   * overlap, so picking XMR set `pairSymbol = 'XMR'`, the lookup found nothing in the Ethereum
+   * list, `pair` came back `undefined`, and `PairPicker`'s `if (!selected) return null` erased the
+   * entire "What it trades against" section. Choosing a currency made the chooser disappear.
+   *
+   * Two defences, because either alone leaves a hole:
+   *
+   * 1. Look in the right list.
+   * 2. **Never return undefined when the roster is non-empty.** A draft persists in sessionStorage
+   *    across a network switch, so a symbol that was valid on one chain can be meaningless on the
+   *    next. Falling back to the first approved currency keeps the form usable; returning nothing
+   *    deletes a section of the page and gives the user no way to fix it.
+   */
+  const [networkTick, setNetworkTick] = useState(0)
+  useEffect(() => subscribeNetwork(() => setNetworkTick((n) => n + 1)), [])
+
+  const pair = useMemo(() => {
+    const roster = activePairs()
+    return roster.find((p) => p.symbol === draft.pairSymbol) ?? roster[0]
+    // `networkTick` is the dependency that matters here even though it is not read: switching
+    // networks changes what `activePairs()` returns without changing `draft.pairSymbol`.
+  }, [draft.pairSymbol, networkTick])
   const value = useMemo(
     () => ({draft, pair, set, setDraft: replace, reset}),
     [draft, pair, set, replace, reset],

@@ -634,8 +634,29 @@ export const PAIRS: Pair[] = [
 export const DEFAULT_PAIR = PAIRS.find((p) => p.symbol === 'WETH') ?? PAIRS[0]
 
 /** Token logos, served by DexScreener and keyed on the lowercased contract address. */
-export function logoUrl(p: Pair): string {
-  return `https://dd.dexscreener.com/ds-data/tokens/ethereum/${p.address.toLowerCase()}.png`
+/**
+ * DexScreener's chain slug, which is NOT the same string as our network id.
+ *
+ * This function existed with `ethereum` hardcoded into the path, so every Robinhood address asked
+ * DexScreener for a token on the wrong chain, got a 404, and fell back to two grey initials. All
+ * thirty Robinhood tiles were blank for that one word.
+ *
+ * Measured after fixing: 24 of the 30 Robinhood currencies have an image on the `robinhood` path.
+ * The six without are the non-meme assets - WETH, USDG, cbBTC, SLV, GLD, PAXG - which have no
+ * DexScreener presence there at all. Those fall through to `TokenLogo`'s generated mark.
+ */
+const DEXSCREENER_CHAIN: Record<string, string> = {
+  mainnet: 'ethereum',
+  robinhood: 'robinhood',
+  // Testnet tokens are mocks that no aggregator has ever seen. Sending the request anyway would
+  // just be 30 guaranteed 404s per page load.
+  sepolia: '',
+}
+
+export function logoUrl(p: Pair, networkId = 'mainnet'): string {
+  const chain = DEXSCREENER_CHAIN[networkId] ?? 'ethereum'
+  if (!chain) return ''
+  return `https://dd.dexscreener.com/ds-data/tokens/${chain}/${p.address.toLowerCase()}.png`
 }
 
 export function riskCount(p: Pair): number {
