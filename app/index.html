@@ -21,6 +21,23 @@
          the dark app appears to float in a bright frame. -->
     <meta name="theme-color" content="#050507" />
 
+    <!--
+      TYPE. Loaded from the stylesheet endpoint rather than pinned @font-face rules, because the
+      previous version hardcoded versioned gstatic file URLs and the JetBrains Mono one started
+      returning 404. Every monospace figure on the site - prices, market caps, addresses - had
+      silently fallen back to a system font, while Space Grotesk still resolved. Half-right type
+      is worse than consistently wrong type, and nothing surfaced it until a user's console log.
+
+      preconnect on both hosts because the CSS and the font files come from different origins, and
+      without it the browser cannot start the second handshake until the first has finished.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300..700&family=JetBrains+Mono:wght@400..700&display=swap"
+    />
+
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
     <title>carbonado.fun - a launchpad where holders get paid in the pair</title>

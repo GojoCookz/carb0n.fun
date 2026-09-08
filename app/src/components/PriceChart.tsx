@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { toCandles, type PricePoint } from '../lib/priceHistory'
+import { useDexUsd } from '../lib/dexPrice'
 
 /**
  * Market cap over time, from the pool's own swaps.
@@ -36,13 +37,19 @@ export function PriceChart({
   pairSymbol,
   loading,
   supply,
+  pairAddress,
 }: {
   points: PricePoint[]
   pairSymbol: string
   loading: boolean
   /** Total supply, whole tokens. Fixed at mint - there is no mint or burn. */
   supply: number
+  /** Pair currency address, used only to fetch a USD quote for display. */
+  pairAddress?: string | null
 }) {
+  // A third-party quote, never an oracle. Null when there is none, and the UI then shows the
+  // pair-denominated figure alone rather than inventing a dollar value.
+  const pairUsd = useDexUsd(pairAddress)
   const [mode, setMode] = useState<'candle' | 'line'>('candle')
   const [hover, setHover] = useState<number | null>(null)
 
@@ -90,7 +97,7 @@ export function PriceChart({
     const slot = n > 1 ? iw / n : iw
     const bodyW = Math.max(2, Math.min(18, slot * 0.62))
 
-    return { x, y, line, area, bodyW }
+    return { x, y, line, area, bodyW, lo, hi }
   }, [effective, candles, points])
 
   const first = points[0]?.price ?? 0
@@ -104,7 +111,7 @@ export function PriceChart({
 
   if (loading) {
     return (
-      <Frame pairSymbol={pairSymbol}>
+      <Frame pairSymbol={pairSymbol} pairUsd={pairUsd}>
         <div className="flex h-[220px] items-center justify-center">
           <div className="h-px w-2/3 animate-pulse bg-ink-600" />
         </div>
@@ -114,7 +121,7 @@ export function PriceChart({
 
   if (points.length === 0) {
     return (
-      <Frame pairSymbol={pairSymbol}>
+      <Frame pairSymbol={pairSymbol} pairUsd={pairUsd}>
         <div className="flex h-[220px] flex-col items-center justify-center gap-1.5 text-center">
           <p className="font-display text-[14px] font-semibold text-bone-300">No trades yet.</p>
           <p className="max-w-[36ch] text-[12px] leading-relaxed text-bone-500">
@@ -129,11 +136,14 @@ export function PriceChart({
   return (
     <Frame
       pairSymbol={pairSymbol}
+      pairUsd={pairUsd}
       headline={
         <div className="flex items-center gap-3">
           <span className="flex items-baseline gap-2">
             <span className="tnum font-mono text-[17px] font-semibold text-bone-100">
-              {fmtCap(shownPrice * supply)}
+              {pairUsd
+                ? `$${fmtCap(shownPrice * supply * pairUsd)}`
+                : `${fmtCap(shownPrice * supply)} ${pairSymbol}`}
             </span>
             <span
               className={`tnum text-[12px] font-semibold ${up ? 'text-steel-300' : 'text-danger-400'}`}
@@ -179,6 +189,34 @@ export function PriceChart({
           setHover(Math.max(0, Math.min(n - 1, i)))
         }}
       >
+        {/* Y axis. Three gridlines is enough to read a level off; more is noise at this size. */}
+        {geo &&
+          [0, 0.5, 1].map((frac) => {
+            const v = geo.lo + (geo.hi - geo.lo) * (1 - frac)
+            const yy = PAD.t + frac * (H - PAD.t - PAD.b)
+            return (
+              <g key={frac}>
+                <line
+                  x1={PAD.l}
+                  y1={yy}
+                  x2={W - PAD.r}
+                  y2={yy}
+                  stroke="currentColor"
+                  strokeOpacity="0.07"
+                  className="text-bone-50"
+                />
+                <text
+                  x={W - PAD.r}
+                  y={yy - 3}
+                  textAnchor="end"
+                  className="fill-bone-600 text-[9px]"
+                >
+                  {pairUsd ? `$${fmtCap(v * supply * pairUsd)}` : fmtCap(v * supply)}
+                </text>
+              </g>
+            )
+          })}
+
         <defs>
           <linearGradient id="pc-fill" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="currentColor" stopOpacity="0.26" />
@@ -255,7 +293,7 @@ export function PriceChart({
         </span>
         <span className="tnum">
           {activeCandle
-            ? `O ${fmtCap(activeCandle.o * supply)}  H ${fmtCap(activeCandle.h * supply)}  L ${fmtCap(activeCandle.l * supply)}  C ${fmtCap(activeCandle.c * supply)}`
+            ? `O ${fmtCap(activeCandle.o * supply)}  H ${fmtCap(activeCandle.h * supply)}  L ${fmtCap(activeCandle.l * supply)}  C ${fmtCap(activeCandle.c * supply)} ${pairSymbol}`
             : `${fmtPrice(shownPrice)} ${pairSymbol} per token`}
         </span>
       </div>
@@ -267,10 +305,13 @@ function Frame({
   children,
   pairSymbol,
   headline,
+  pairUsd,
 }: {
   children: React.ReactNode
   pairSymbol: string
   headline?: React.ReactNode
+  /** Third-party USD quote for the pair, or null. Shown so the reader can check the conversion. */
+  pairUsd?: number | null
 }) {
   return (
     <div className="rounded-(--radius-card) border border-ink-700 bg-ink-850 p-4">
@@ -283,8 +324,16 @@ function Frame({
       {children}
       <p className="mt-2 text-[10px] leading-relaxed text-bone-600">
         Market cap is price x supply, and supply is fixed at mint - there is no mint or burn. Read
-        from the pool&rsquo;s own <span className="font-mono">Swap</span> events, not an indexer. No
-        dollar figure: there is no price feed on this chain.
+        from the pool&rsquo;s own <span className="font-mono">Swap</span> events, not an indexer.
+        {pairUsd ? (
+          <>
+            {' '}Dollar figures use a DexScreener quote for {pairSymbol} (
+            <span className="tnum">${pairUsd < 0.01 ? pairUsd.toFixed(6) : pairUsd.toFixed(4)}</span>
+            ), not an on-chain oracle - there is no price feed on this chain.
+          </>
+        ) : (
+          ' No dollar figure: there is no price feed on this chain and no quote for this pair.'
+        )}
       </p>
     </div>
   )

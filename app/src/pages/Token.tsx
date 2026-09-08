@@ -164,6 +164,7 @@ export function Token() {
             pairSymbol={listing.pair.symbol}
             loading={history.loading}
             supply={history.supply}
+            pairAddress={listing.chainPair}
           />
 
           {detail.kind === 'ready' && (

@@ -42,7 +42,7 @@ for (const [name, w, h] of [
 
   await page.goto(`http://localhost:4323/t/${HOOD1}`, { waitUntil: 'networkidle' })
   // Log queries against a live RPC are slower than the page.
-  await page.waitForTimeout(9000)
+  await page.waitForTimeout(20000)
 
   const state = await page.evaluate(() => {
     const txt = document.body.innerText

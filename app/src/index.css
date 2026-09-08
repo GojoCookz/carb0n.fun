@@ -149,21 +149,18 @@
   pointer-events: none;
 }
 
-@font-face {
-  font-family: 'Space Grotesk';
-  src: url('https://fonts.gstatic.com/s/spacegrotesk/v16/V8mQoQDjQSkFtoMM3T6r8E7mF71Q-gOoraIAEj7oUXskPMBBSSJLm2E.woff2')
-    format('woff2');
-  font-weight: 300 700;
-  font-display: swap;
-}
+/*
+  FONTS ARE LOADED FROM THE GOOGLE FONTS STYLESHEET, in `index.html`, not from @font-face here.
 
-@font-face {
-  font-family: 'JetBrains Mono';
-  src: url('https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPVmUsaaDhw.woff2')
-    format('woff2');
-  font-weight: 400 700;
-  font-display: swap;
-}
+  These two rules used to hardcode versioned `fonts.gstatic.com` file URLs. **Google rotates those
+  paths, and the JetBrains Mono one 404'd** - caught in a user's console log, at which point every
+  monospace figure on the site (prices, market caps, contract addresses) had silently fallen back
+  to whatever the OS supplies. Space Grotesk still resolved, so half the type was right and half
+  was not, which is worse than either.
+
+  A versioned URL pinned by hand is a dependency that expires without telling anyone. The
+  stylesheet endpoint resolves to whatever the current files are, so it cannot rot the same way.
+*/
 
 html {
   background: var(--color-ink-950);
