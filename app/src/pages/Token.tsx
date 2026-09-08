@@ -23,6 +23,8 @@ import { LaunchCard } from '../components/LaunchCard'
 import { DividendPanel } from '../components/DividendPanel'
 import { TokenFacts } from '../components/TokenFacts'
 import { SweepPanel } from '../components/SweepPanel'
+import { PriceChart } from '../components/PriceChart'
+import { usePriceHistory } from '../lib/usePriceHistory'
 
 const WITHDRAW_ABI = parseAbi(['function withdraw()'])
 // Named components: viem takes an object for a named tuple and an array for an unnamed one, so an
@@ -51,6 +53,14 @@ export function Token() {
     listing?.address ?? null,
     listing?.chainPair ?? null,
     account ?? null,
+  )
+
+  const history = usePriceHistory(
+    detail.kind === 'ready' ? detail.poolId : null,
+    listing?.address ?? null,
+    listing?.chainPair ?? null,
+    18,
+    listing?.pair.decimals ?? 18,
   )
 
   if (state.kind === 'idle' || state.kind === 'loading') {
@@ -148,6 +158,12 @@ export function Token() {
             apart, and made the reader check whether they were different. */}
         <div className="min-w-0 space-y-5">
           <LaunchCard listing={listing} />
+
+          <PriceChart
+            points={history.points}
+            pairSymbol={listing.pair.symbol}
+            loading={history.loading}
+          />
 
           {detail.kind === 'ready' && (
             <TokenFacts
