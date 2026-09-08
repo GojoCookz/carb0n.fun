@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Card, SectionTitle, Pill } from '../components/Primitives'
 import { Stat, Source } from '../components/Form'
-import { DEPLOYMENTS } from '../lib/chain'
+import { ReferralDesk } from '../components/ReferralDesk'
 
 /**
  * The referral programme.
@@ -14,18 +14,22 @@ import { DEPLOYMENTS } from '../lib/chain'
  *   the third hop because they compound downward. This one does not, which is what
  *   makes recruiting recruiters worth more than recruiting traders.
  *
- * HONESTY, and it is a real gap rather than a deployment detail: **our fee has no
- * platform wedge to pay referrals out of.** `FeeHook._routeFee` splits the fee to the
- * creator and to holders, and that is all of it. A referral must never be paid out of
- * the creator's or the holders' share, so this feature needs a contract change before
- * it can pay anyone. The page says so rather than implying a code is waiting.
+ * **That gap is closed.** This docstring used to say our fee had no platform wedge to pay
+ * referrals out of, and that stopped being true when `FeeHook` gained `platformShareBps` and a
+ * `platformRecipient`. `ReferralVault` is deployed, holds the tier schedule, and accrues per
+ * currency - so the page carries a live desk instead of describing the feature in the future
+ * tense while the contract was already able to pay.
+ *
+ * The principle the old note was protecting still holds, and is enforced in the contract rather
+ * than promised here: a referral is paid from the PLATFORM's cut, never from the creator's share
+ * and never from the holders'.
  */
 export function Rewards() {
-  const notDeployed = DEPLOYMENTS.mainnet.pairRegistry === null
-
   return (
     <div className="space-y-6">
       <Hero />
+
+      <ReferralDesk />
 
       <section className="space-y-3.5">
         <SectionTitle>How it will work</SectionTitle>
@@ -98,43 +102,27 @@ export function Rewards() {
 
       <Calculator />
 
-      <section className="space-y-3.5">
-        <SectionTitle>Your code</SectionTitle>
-        <Card className="lit p-5">
-          <div className="grid grid-cols-2 gap-5">
-            <Stat label="Your code" value="—" sub="issued at launch" />
-            <Stat label="Accrued" value="—" sub="nothing has traded" />
-          </div>
-          <button
-            type="button"
-            disabled
-            className="mt-5 w-full cursor-not-allowed rounded-xl bg-ink-800 px-5 py-3.5 font-display text-[15px] font-bold text-bone-500"
-          >
-            Generate referral link
-          </button>
-          <p className="mt-2 text-center text-[12px] leading-snug text-bone-500">
-            {notDeployed
-              ? 'Nothing is deployed, and the fee has no platform share to pay referrals from yet. Both are needed before a code can pay anyone.'
-              : 'Connect a wallet to generate your link.'}
-          </p>
-        </Card>
-      </section>
+
 
       <section className="space-y-3.5">
-        <SectionTitle>What has to happen first</SectionTitle>
+        <SectionTitle>What is still true</SectionTitle>
         <Card className="lit border-danger-400/25 p-5">
           <p className="text-[13px] leading-relaxed text-bone-400">
             <span className="font-semibold text-bone-50">
-              The fee currently has no platform share.
+              A referral is paid from the platform&rsquo;s cut, never from the creator&rsquo;s share
+              and never from the holders&rsquo;.
             </span>{' '}
-            <span className="font-mono text-[12px] text-bone-200">FeeHook._routeFee</span> splits
-            every fee between the creator and holders — that is the whole of it. A referral must
-            be paid out of the platform&rsquo;s own cut and never out of the creator&rsquo;s or the
-            holders&rsquo;, so a platform wedge has to exist before any of the above can pay.
+            That is enforced in{' '}
+            <span className="font-mono text-[12px] text-bone-200">FeeHook</span> by{' '}
+            <span className="font-mono text-[12px] text-bone-200">platformShareBps</span>, which
+            routes a wedge of each fee to{' '}
+            <span className="font-mono text-[12px] text-bone-200">ReferralVault</span>. The vault
+            splits that wedge across five levels and holds each balance per currency until it is
+            claimed.
           </p>
           <Source>
-            Stated here rather than buried, because the alternative is a page that looks like a
-            code is waiting for you when the contract cannot pay one.
+            The contracts are unaudited. A referral balance is a real on-chain claim, and every
+            caveat that applies to the rest of the product applies to it too.
           </Source>
         </Card>
       </section>
