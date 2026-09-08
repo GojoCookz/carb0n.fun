@@ -163,6 +163,7 @@ export function Token() {
             points={history.points}
             pairSymbol={listing.pair.symbol}
             loading={history.loading}
+            supply={history.supply}
           />
 
           {detail.kind === 'ready' && (

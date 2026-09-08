@@ -38,6 +38,8 @@ export const SWAP_EVENT = parseAbiItem(
 
 export type PricePoint = {
   block: number
+  /** Unix seconds. Zero when the block header could not be fetched. */
+  time: number
   /** Price of ONE launch token, in pair currency. */
   price: number
   /** Pair-currency size of the swap, absolute, for volume bars. */
@@ -128,6 +130,7 @@ export async function fetchPriceHistory(a: HistoryArgs): Promise<PricePoint[]> {
 
     points.push({
       block: Number(l.blockNumber ?? 0n),
+      time: 0,
       price,
       size,
       up: prev === 0 ? true : price >= prev,
@@ -136,4 +139,91 @@ export async function fetchPriceHistory(a: HistoryArgs): Promise<PricePoint[]> {
   }
 
   return points
+}
+
+/**
+ * Fill in block timestamps.
+ *
+ * Candles are TIME buckets, and a swap log carries only a block number. Block height is a
+ * tempting proxy but it is wrong the moment block production stutters, which is exactly when
+ * a chart matters.
+ *
+ * Bounded to `MAX_BLOCK_LOOKUPS` distinct blocks. A busy pool would otherwise fire hundreds
+ * of `eth_getBlockByNumber` calls to draw a picture, and past that point candles are dense
+ * enough that a few missing ones change nothing.
+ */
+const MAX_BLOCK_LOOKUPS = 120
+
+export async function fillTimestamps(
+  client: PublicClient,
+  points: PricePoint[],
+): Promise<PricePoint[]> {
+  const blocks = [...new Set(points.map((p) => p.block))].slice(-MAX_BLOCK_LOOKUPS)
+  const times = new Map<number, number>()
+
+  await Promise.all(
+    blocks.map(async (b) => {
+      try {
+        const blk = await client.getBlock({ blockNumber: BigInt(b) })
+        times.set(b, Number(blk.timestamp))
+      } catch {
+        // A missing header is not worth failing the chart over.
+      }
+    }),
+  )
+
+  return points.map((p) => ({ ...p, time: times.get(p.block) ?? 0 }))
+}
+
+export type Candle = {
+  t: number
+  o: number
+  h: number
+  l: number
+  c: number
+  /** Pair-currency volume traded inside the bucket. */
+  v: number
+}
+
+/**
+ * Bucket swaps into OHLC candles.
+ *
+ * **Empty buckets are dropped rather than carried forward.** A flat candle drawn across a
+ * period with no trades looks exactly like a period of stable price, and on a new launch that
+ * is the difference between "nobody traded" and "the price held". The gap is the information.
+ *
+ * The bucket size adapts to the span so a token minutes old and one weeks old both get a
+ * readable number of candles, rather than one fat bar or four hundred slivers.
+ */
+export function toCandles(points: PricePoint[], target = 40): Candle[] {
+  const usable = points.filter((p) => p.time > 0)
+  if (usable.length === 0) return []
+  if (usable.length === 1) {
+    const p = usable[0]
+    return [{ t: p.time, o: p.price, h: p.price, l: p.price, c: p.price, v: p.size }]
+  }
+
+  const first = usable[0].time
+  const last = usable[usable.length - 1].time
+  const span = Math.max(1, last - first)
+  const bucket = Math.max(1, Math.floor(span / target))
+
+  const out: Candle[] = []
+  let cur: Candle | null = null
+
+  for (const p of usable) {
+    const slot = Math.floor((p.time - first) / bucket)
+    const slotTime = first + slot * bucket
+    if (!cur || cur.t !== slotTime) {
+      if (cur) out.push(cur)
+      cur = { t: slotTime, o: p.price, h: p.price, l: p.price, c: p.price, v: p.size }
+    } else {
+      cur.h = Math.max(cur.h, p.price)
+      cur.l = Math.min(cur.l, p.price)
+      cur.c = p.price
+      cur.v += p.size
+    }
+  }
+  if (cur) out.push(cur)
+  return out
 }

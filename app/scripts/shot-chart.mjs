@@ -27,7 +27,8 @@ await new Promise((r) => server.listen(4323, r))
 
 mkdirSync('.shots', { recursive: true })
 const browser = await chromium.launch()
-const HOOD1 = '0x95144cA61fa514929CC79B6006222c17a5F387c9'
+// TESTCAT - the current test launch, paired against CASHCAT.
+const HOOD1 = '0xe5be828144498E945E55DeE62C5cCc0B4180ac18'
 
 for (const [name, w, h] of [
   ['chart-m', 390, 900],
