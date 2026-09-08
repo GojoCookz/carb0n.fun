@@ -119,6 +119,60 @@ library Addresses {
     address internal constant SEPOLIA_WXMR = address(0);
 
     // ===========================================================================================
+    // Robinhood Chain (4663) - Arbitrum Nitro, gas token is ETH
+    // ===========================================================================================
+    //
+    // **The contracts in `src/` need no changes to run here.** Verified: there is not one
+    // `block.chainid`, hard-coded PoolManager, or network constant anywhere in `src/`. Every
+    // dependency arrives through a constructor argument, so porting is a deploy-script and
+    // registry exercise rather than a rewrite.
+    //
+    // All byte counts below read from `rpc.mainnet.chain.robinhood.com` via `eth_getCode`.
+
+    uint256 internal constant ROBINHOOD_CHAIN_ID = 4663;
+
+    // --- Uniswap v4 ---
+    //
+    // **NOT at the canonical L1 address.** `0x000000000004444c5dc75cB358380D2e3dE08A90` returns
+    // zero bytes on 4663, so anything that assumes the well-known address silently deploys
+    // against nothing. This one is the real PoolManager: 24,009 bytes, the exact size Uniswap
+    // ships and the same figure `foundry.toml` cites for the EIP-170 discussion.
+    address internal constant ROBINHOOD_POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951; // 24,009 b
+
+    // --- Shared infrastructure, same addresses as L1 ---
+    // CREATE2_DEPLOYER and PERMIT2 above are deployed here too, at identical addresses, so hook
+    // address mining works unchanged. Confirmed 69 b and 9,152 b respectively.
+    address internal constant ROBINHOOD_MULTICALL3 = 0xcA11bde05977b3631167028862bE2a173976CA11; // 3,808 b
+
+    // --- Pair currencies ---
+    //
+    // `usdg()` on BaseStonk's `RhPairRegistry` returns this address, which is the only
+    // independent confirmation available that it is the canonical one. **Three separate
+    // contracts on this chain answer `symbol() == "USDG"`** with 279k, 173k and 169k holders;
+    // this is the 279k one. 170 bytes, so it is a proxy. 6 decimals, NOT 18.
+    address internal constant ROBINHOOD_USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168; // 170 b, 6 dp
+
+    /// @dev **This is a bridged ERC-20 named WETH, not a WETH9 wrapper.** 533,961 holders makes it
+    ///      the canonical one by usage, but `deposit()` and `withdraw(uint256)` do not appear in
+    ///      its bytecode, and none of the four other `WETH`/`wETH` contracts on this chain expose
+    ///      them either.
+    ///
+    ///      **Consequence for `ZapRouter`.** Its ETH-in path wraps native ether and its ETH-out
+    ///      path unwraps. Neither works against a token that cannot wrap. Passing this address as
+    ///      the router's `_weth` would produce a router that reverts on every zap, so the ETH
+    ///      entry point must be resolved before the zap ships on 4663 - either by finding a real
+    ///      wrapper, deploying one, or routing natively. `Launcher`, `FeeHook` and `PairRegistry`
+    ///      are unaffected and can ship without it.
+    address internal constant ROBINHOOD_WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73; // 2,202 b, 18 dp
+
+    /// @dev **No Chainlink aggregator has been located on 4663.** That is not a blocker: the
+    ///      UNPRICEABLE tier in `PairRegistry` (`approvePairWithoutOracle`) already exists for
+    ///      exactly this case - it was built for WXMR on L1, which is liquid and unfeedable - and
+    ///      quotes openings in units of the pair asset instead of dollars. Set only if one is
+    ///      found and verified.
+    address internal constant ROBINHOOD_ETH_USD_FEED = address(0);
+
+    // ===========================================================================================
     // Helpers
     // ===========================================================================================
 
@@ -127,6 +181,19 @@ library Addresses {
     function poolManager(uint256 chainId) internal pure returns (address) {
         if (chainId == MAINNET_CHAIN_ID) return MAINNET_POOL_MANAGER;
         if (chainId == SEPOLIA_CHAIN_ID) return SEPOLIA_POOL_MANAGER;
+        if (chainId == ROBINHOOD_CHAIN_ID) return ROBINHOOD_POOL_MANAGER;
+        revert("Addresses: unsupported chain");
+    }
+
+    /// @notice True where a launch can be opened at a DOLLAR market cap, false where openings must
+    ///         be quoted in units of the pair asset.
+    /// @dev Kept next to `poolManager` on purpose: these are the two facts a deploy script needs
+    ///      about a chain before it can do anything, and separating them is how one gets updated
+    ///      without the other.
+    function hasUsdFeed(uint256 chainId) internal pure returns (bool) {
+        if (chainId == MAINNET_CHAIN_ID) return true;
+        if (chainId == SEPOLIA_CHAIN_ID) return true; // mock aggregator, see test/mocks
+        if (chainId == ROBINHOOD_CHAIN_ID) return false;
         revert("Addresses: unsupported chain");
     }
 }
