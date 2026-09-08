@@ -392,8 +392,25 @@ contract PairRegistryTest is Test {
         return Addresses.poolManager(chainId);
     }
 
+    /// @dev **This used to assert on chain 4663, described as "deliberately no longer supported".**
+    ///      Robinhood Chain is supported now - the contracts are deployed there - so the assertion
+    ///      was testing a fact that had stopped being true, and it failed the moment the address
+    ///      book learned the chain. That is the test working: it is a guard against the address
+    ///      book silently answering for a network nobody configured.
+    ///
+    ///      Re-pointed at a chain id that is genuinely unknown and has no prospect of being added,
+    ///      so the guard keeps testing the property rather than a particular chain's status.
     function test_addressBook_revertsOnUnknownChain() public {
         vm.expectRevert("Addresses: unsupported chain");
-        this.callPoolManager(4663); // Robinhood Chain - deliberately no longer supported
+        this.callPoolManager(999_999_999);
+    }
+
+    /// @dev The positive half, added alongside: every chain we DO claim to support must answer with
+    ///      a non-zero PoolManager. Without this, deleting a branch from `Addresses.poolManager`
+    ///      would still pass the negative test above and break every deploy on that chain.
+    function test_addressBook_answersForEverySupportedChain() public view {
+        assertTrue(Addresses.poolManager(Addresses.MAINNET_CHAIN_ID) != address(0), "mainnet");
+        assertTrue(Addresses.poolManager(Addresses.SEPOLIA_CHAIN_ID) != address(0), "sepolia");
+        assertTrue(Addresses.poolManager(Addresses.ROBINHOOD_CHAIN_ID) != address(0), "robinhood");
     }
 }

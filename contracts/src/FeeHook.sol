@@ -214,6 +214,35 @@ contract FeeHook is HookBase {
     ///      the same call also pays them `creatorBps`.
     uint16 public constant SWEEP_BOUNTY_BPS = 50;
 
+    /// @notice Ceiling on the gas-indexed bounty top-up, as a share of the pot. 5%.
+    ///
+    /// @dev **`SWEEP_BOUNTY_BPS` alone is blind to gas, and that is finding C-2.** A flat 0.5% of
+    ///      the pot is generous when the pot is large and worthless when gas spikes: the caller's
+    ///      cost is denominated in ETH and moves with `block.basefee`, while the reward is
+    ///      denominated in the pair and does not move at all. During a busy period the bounty stops
+    ///      covering the caller's gas, nobody sweeps, and holders silently stop being paid until it
+    ///      clears. Nothing is lost - claims stay exact and `sweep` stays open - but the product
+    ///      quietly stops working, which is the worst shape a failure can take.
+    ///
+    ///      **The fix has to be bounded in BOTH directions.** Scaling the bounty with gas without a
+    ///      ceiling would hand the entire pot to a caller who sweeps during an artificial spike -
+    ///      and since anyone may call `sweep` at any time, a caller who can influence gas can
+    ///      choose that moment. So the gas-indexed component is capped here at 5% of the pot, and
+    ///      the flat 0.5% remains the normal case. The top-up only binds when the flat rate would
+    ///      genuinely fail to cover a sweep.
+    ///
+    ///      **Deliberately NOT a governance parameter.** A settable bounty is a lever over holder
+    ///      funds, and this contract has no admin over a live pool by design.
+    uint16 public constant SWEEP_BOUNTY_MAX_BPS = 500;
+
+    /// @notice Gas units the top-up assumes a sweep costs when pricing itself in ETH.
+    ///
+    /// @dev Measured, not guessed: `test/audit/11-sweep/SweepEconomics.t.sol` records 203,941 gas
+    ///      for a keeper that has never held the pair currency and 85,176 for one that has. The
+    ///      higher figure is used, because the caller who needs the incentive is exactly the one
+    ///      paying to open a fresh balance.
+    uint256 public constant SWEEP_GAS_ESTIMATE = 203_941;
+
     /// @notice How far the protocol's OWN swaps may move the price before they stop filling.
     ///
     /// @dev **Finding E-05.** `sweep` makes two swaps on the protocol's behalf — converting the
@@ -1174,7 +1203,7 @@ contract FeeHook is HookBase {
         if (totalPair != 0) {
             poolManager.take(cfg.pairCurrency, address(this), totalPair);
 
-            uint256 bounty = (totalPair * SWEEP_BOUNTY_BPS) / BPS;
+            uint256 bounty = _sweepBounty(totalPair);
             if (bounty != 0 && sweepCaller != address(0)) {
                 totalPair -= bounty;
                 // Raw send: a caller that cannot receive must not strand everyone else's payout.
@@ -1314,6 +1343,70 @@ contract FeeHook is HookBase {
 
     /// @dev Raw call so a hostile or non-standard recipient cannot revert the whole swap. A failed
     ///      payout leaves the tokens on this contract rather than trapping every trader in the pool.
+    /// @notice The sweep bounty: a flat share of the pot, topped up when gas makes that too little.
+    ///
+    /// @dev **Finding C-2.** The flat `SWEEP_BOUNTY_BPS` is denominated in the pair currency and
+    ///      never moves; the caller's cost is denominated in ETH and moves with `block.basefee`.
+    ///      When gas spikes the reward stops covering the cost, nobody sweeps, and holders quietly
+    ///      stop being paid. This makes the bounty respond to gas instead of ignoring it.
+    ///
+    ///      **What this deliberately does NOT do: convert ETH into pair units.** Doing that
+    ///      honestly needs an ETH/pair price, and every source for one here is manipulable by the
+    ///      caller who is about to be paid - the pool's own `sqrtPriceX96` most of all, since
+    ///      `sweep` is permissionless and a caller can move the price in the same transaction that
+    ///      reads it. A bounty computed from a price the recipient controls is not a bounty, it is
+    ///      a withdrawal. Several pair currencies on Robinhood Chain have no USD feed at all, so
+    ///      there is not even an off-pool fallback.
+    ///
+    ///      So the top-up is a pure function of `block.basefee` scaled against a REFERENCE basefee,
+    ///      applied to the pot and hard-capped. It says "gas is 20x its reference, so pay up to 20x
+    ///      the flat rate, but never more than `SWEEP_BOUNTY_MAX_BPS` of the pot." No oracle, no
+    ///      price, nothing the caller can move.
+    ///
+    ///      **The cap is the security property.** Without it, a caller able to inflate
+    ///      `block.basefee` - by spamming the block they sweep in - could scale the bounty toward
+    ///      the whole pot. With it, the worst case is 5% and the flat 0.5% remains the normal path.
+    ///      `block.basefee` is a protocol value, not a caller input, but it is influenceable, and
+    ///      the difference between influenceable and controllable is exactly what the cap covers.
+    /// @notice What `sweep` would pay its caller for a given pot, at the CURRENT basefee.
+    ///
+    /// @dev Public so a keeper can decide whether a sweep is worth sending before spending gas to
+    ///      find out, and so the UI can show the figure rather than describing it. It is the same
+    ///      code path `sweep` uses, not a reimplementation - a preview that can disagree with the
+    ///      thing it previews is worse than no preview.
+    function previewSweepBounty(uint256 totalPair) external view returns (uint256) {
+        return _sweepBounty(totalPair);
+    }
+
+    function _sweepBounty(uint256 totalPair) internal view returns (uint256) {
+        uint256 flat = (totalPair * SWEEP_BOUNTY_BPS) / BPS;
+
+        // The basefee at which the flat rate is considered sufficient. Below this, no top-up.
+        // 1 gwei: comfortably above Robinhood Chain's ~0.3 gwei and Ethereum's current ~0.04, so on
+        // a normal day this branch never fires and the bounty is exactly what it always was.
+        uint256 refBasefee = 1 gwei;
+        uint256 basefee = block.basefee;
+        if (basefee <= refBasefee) return flat;
+
+        uint256 ceiling = (totalPair * SWEEP_BOUNTY_MAX_BPS) / BPS;
+
+        // **`flat * basefee` overflows before the cap can bind, and the test caught it.**
+        // A 1,000-token pot gives a 5e18 flat bounty; multiplying that by an adversarial
+        // `type(uint64).max` basefee exceeds uint256 and panics. A revert here is not a harmless
+        // failure: `_sweepBounty` runs inside `sweep`, so an attacker able to push the basefee high
+        // enough could brick sweeping for a pool entirely - turning a payout bug into a denial of
+        // service against holders.
+        //
+        // Comparing the RATIO against the cap first means the multiplication only happens on the
+        // branch where the result is known to be small. Division cannot overflow.
+        uint256 multiple = basefee / refBasefee;
+        if (multiple != 0 && flat > ceiling / multiple) return ceiling;
+
+        // Integer division floors, which errs toward paying the caller LESS - the safe direction.
+        uint256 scaled = (flat * basefee) / refBasefee;
+        return scaled > ceiling ? ceiling : scaled;
+    }
+
     function _trySend(address token, address to, uint256 amount) internal returns (bool) {
         (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
         return ok && (ret.length == 0 || abi.decode(ret, (bool)));
