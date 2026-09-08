@@ -1,0 +1,50 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+
+  "//": [
+    "ROOT-LEVEL Vercel config, and it exists because of a specific 404.",
+    "",
+    "This repo is a monorepo: `app/` (the Vite SPA) and `contracts/` (Foundry). Vercel builds",
+    "from the repository root unless told otherwise, and the root has no index.html - so the",
+    "first deploy returned 404 NOT_FOUND on every path including `/`. Nothing was broken in the",
+    "app; Vercel was looking at the wrong directory.",
+    "",
+    "Setting Root Directory to `app` in the dashboard fixes it too, but that is a click a human",
+    "has to remember on every new project and preview environment. This file makes the correct",
+    "layout a property of the repo instead, so a fresh import works with no dashboard state.",
+    "",
+    "Paths below are relative to the REPO ROOT, which is why they all start with `app/`."
+  ],
+
+  "buildCommand": "cd app && bun install && bun run build",
+  "outputDirectory": "app/dist",
+  "installCommand": "echo 'install handled inside buildCommand'",
+  "framework": null,
+
+  "//rewrites": [
+    "The negative lookahead is load-bearing. An SPA needs every unknown path to fall through to",
+    "index.html, but the naive `/(.*)` rule swallows /api/* as well - the upload endpoint would",
+    "return the HTML shell and fail with a JSON parse error pointing nowhere near the cause.",
+    "Verified against /, /token/0x.., /create, /assets/* and /api/pin."
+  ],
+  "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }],
+
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), microphone=(), geolocation=(), payment=()"
+        }
+      ]
+    },
+    {
+      "source": "/assets/(.*)",
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }]
+    }
+  ]
+}
