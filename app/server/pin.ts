@@ -55,7 +55,16 @@ export async function handlePin(req: Request): Promise<Response> {
     return new Response(JSON.stringify({ error: 'origin not allowed' }), { status: 403, headers })
   }
 
-  const jwt = process.env.PINATA_JWT
+  /**
+   * TRIMMED, AND THAT IS NOT COSMETIC.
+   *
+   * A JWT pasted into a dashboard field frequently arrives with a trailing newline or a stray
+   * space. `Bearer <token>\n` is not a legal HTTP header value, so `fetch` throws a TypeError
+   * before any request leaves the function - which surfaces as an unhandled 500 with no useful
+   * message, rather than as an auth failure. That is exactly what happened here: 503 became 500
+   * the moment the variable was set.
+   */
+  const jwt = (process.env.PINATA_JWT ?? '').trim()
   if (!jwt) {
     // Fail loudly on the SERVER, vaguely to the client. A misconfigured deploy should page an
     // operator, not teach a visitor what is missing.
@@ -85,19 +94,55 @@ export async function handlePin(req: Request): Promise<Response> {
   out.append('file', file, file.name || 'upload')
   out.append('pinataOptions', JSON.stringify({ cidVersion: 1 }))
 
-  const res = await fetch(PINATA_ENDPOINT, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${jwt}` },
-    body: out,
-  })
+  /**
+   * EVERY REMAINING FAILURE PATH IS CAUGHT.
+   *
+   * This function previously had no route to a 500, yet returned one: the upstream `fetch` and the
+   * `res.json()` below can both THROW rather than return a bad status, and an exception escaping
+   * an Edge handler becomes an opaque 500 that says nothing to the user and nothing to us.
+   *
+   * A launch form is the worst place for that. "The upload failed (HTTP 500)" tells a creator
+   * neither what broke nor whether retrying helps, so each distinct cause now gets its own status
+   * and its own server-side log line.
+   */
+  let res: Response
+  try {
+    res = await fetch(PINATA_ENDPOINT, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${jwt}` },
+      body: out,
+    })
+  } catch (e) {
+    // Almost always a malformed credential: a JWT with a newline in it makes the Authorization
+    // header illegal and fetch rejects before sending. Never echo the message - it can quote the
+    // token back.
+    console.error('pinata request could not be sent', (e as Error)?.message)
+    return new Response(JSON.stringify({ error: 'upload service unreachable' }), {
+      status: 502,
+      headers,
+    })
+  }
 
   if (!res.ok) {
     // Log upstream detail server-side; return none of it. The body can name the account.
     console.error('pinata rejected upload', res.status, await res.text().catch(() => ''))
-    return new Response(JSON.stringify({ error: 'upload failed' }), { status: 502, headers })
+    // 401/403 from Pinata means the key is wrong or lacks pinFileToIPFS. Distinguish it, because
+    // that is an operator fix and every other 502 is not.
+    const bad = res.status === 401 || res.status === 403
+    return new Response(
+      JSON.stringify({ error: bad ? 'upload service rejected the key' : 'upload failed' }),
+      { status: 502, headers },
+    )
   }
 
-  const body = (await res.json()) as { IpfsHash?: string }
+  let body: { IpfsHash?: string }
+  try {
+    body = (await res.json()) as { IpfsHash?: string }
+  } catch {
+    console.error('pinata returned a non-JSON body')
+    return new Response(JSON.stringify({ error: 'no cid returned' }), { status: 502, headers })
+  }
+
   if (!body.IpfsHash) {
     return new Response(JSON.stringify({ error: 'no cid returned' }), { status: 502, headers })
   }
