@@ -25,7 +25,21 @@ import { ERC20_ABI } from './abi'
 import { walletClient } from './wallet'
 import { poolKeyFor, type TradePhase } from './tradeTx'
 
-export const ZAP_ROUTER = activeDeployment().zapRouter as Address
+/**
+ * The zap router for the ACTIVE network, or null where there is none.
+ *
+ * **This was a module-level `const`, which is the bug this file would otherwise have.** A const is
+ * evaluated once at import time, so it captured whichever network happened to be active when the
+ * module first loaded and then never changed - switching networks would keep routing through the
+ * old chain's router, or through `undefined`.
+ *
+ * On Robinhood Chain this is null on purpose: the WETH there is a bridged ERC-20 with no
+ * `deposit()`, so a router built against it would revert on every zap. `canZap` already gates on
+ * it, so the UI offers the direct route only and never presents a control that cannot work.
+ */
+export function zapRouter(): Address | null {
+  return (activeDeployment().zapRouter as Address | null) ?? null
+}
 
 /** Every launch opens with this spacing, and the ETH pool was seeded to match. */
 const TICK_SPACING = 60
@@ -197,7 +211,7 @@ export function ethPoolKeysFor(pair: Address) {
 
 /** True when this launch can be traded in ETH at all. */
 export function zapAvailable(pair: Address | null): boolean {
-  return Boolean(ZAP_ROUTER) && pair !== null && ethPoolFeeFor(pair) !== null
+  return Boolean(zapRouter()) && pair !== null && ethPoolFeeFor(pair) !== null
 }
 
 /**
@@ -247,7 +261,8 @@ export type ZapArgs = {
 /** What the two hops would return right now. Null when the route cannot be quoted at all. */
 export async function quoteZap(opts: ZapArgs): Promise<bigint | null> {
   const ethKeys = ethPoolKeysFor(opts.pair)
-  if (ethKeys.length === 0 || !ZAP_ROUTER) return null
+  const router = zapRouter()
+  if (ethKeys.length === 0 || !router) return null
 
   const { key: tokenKey } = poolKeyFor(opts.token, opts.pair)
   const inDecimals = opts.isBuy ? 18 : opts.tokenDecimals
@@ -256,7 +271,7 @@ export async function quoteZap(opts: ZapArgs): Promise<bigint | null> {
 
   try {
     await activeClient().simulateContract({
-      address: ZAP_ROUTER,
+      address: router,
       abi: ZAP_ROUTER_ABI,
       functionName: opts.isBuy ? 'quoteZapBuy' : 'quoteZapSell',
       args: [ethKeys, tokenKey, amountIn],
@@ -287,7 +302,8 @@ export async function submitZap(
   onPhase: (p: TradePhase) => void,
 ): Promise<void> {
   const ethKeys = ethPoolKeysFor(opts.pair)
-  if (ethKeys.length === 0 || !ZAP_ROUTER) throw new Error('There is no ETH pool for this pair yet.')
+  const router = zapRouter()
+  if (ethKeys.length === 0 || !router) throw new Error('There is no ETH pool for this pair yet.')
 
   const { key: tokenKey } = poolKeyFor(opts.token, opts.pair)
   const inDecimals = opts.isBuy ? 18 : opts.tokenDecimals
@@ -314,7 +330,7 @@ export async function submitZap(
       address: opts.token,
       abi: ERC20_ABI,
       functionName: 'allowance',
-      args: [opts.account, ZAP_ROUTER],
+      args: [opts.account, router],
     })
     if (allowance < amountIn) {
       onPhase({ kind: 'approving' })
@@ -322,7 +338,7 @@ export async function submitZap(
         address: opts.token,
         abi: ERC20_ABI,
         functionName: 'approve',
-        args: [ZAP_ROUTER, amountIn],
+        args: [router, amountIn],
         chain: wallet.chain,
         account: opts.account,
       })
@@ -348,7 +364,7 @@ export async function submitZap(
 
   onPhase({ kind: 'trading' })
   const { request } = await activeClient().simulateContract({
-    address: ZAP_ROUTER,
+    address: router,
     abi: ZAP_ROUTER_ABI,
     ...(opts.isBuy
       ? {

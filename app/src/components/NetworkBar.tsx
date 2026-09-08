@@ -8,6 +8,7 @@ import {
   subscribeNetwork,
 } from '../lib/activeNetwork'
 import { NETWORKS, type NetworkId } from '../lib/networks'
+import { WalletButton } from './WalletButton'
 
 /**
  * Top bar: who we are, which chain, and whether anything is live.
@@ -48,6 +49,7 @@ export function NetworkBar() {
         </Link>
 
         <span className="ml-auto flex shrink-0 items-center gap-2">
+          <WalletButton />
           {/* A native <select> on purpose: it is keyboard accessible, works on mobile without a
               portal, and cannot drift out of sync with the store because its value IS the store. */}
           <label className="sr-only" htmlFor="network-select">
