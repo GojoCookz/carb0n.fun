@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { NetworkBar } from './components/NetworkBar'
+import { NetworkLeaves } from './components/LeafField'
 import { BottomNav } from './components/BottomNav'
 import { DraftProvider } from './lib/draft'
 import { Launch } from './pages/Launch'
@@ -13,7 +14,10 @@ import { About } from './pages/About'
 export default function App() {
   return (
     <DraftProvider>
-      <div className="min-h-dvh bg-ink-950">
+      <div className="relative min-h-dvh bg-ink-950">
+        {/* Behind everything, Robinhood only, unmounted elsewhere. See LeafField for why canvas. */}
+        <NetworkLeaves />
+
         <header className="sticky top-0 z-40">
           <NetworkBar />
         </header>

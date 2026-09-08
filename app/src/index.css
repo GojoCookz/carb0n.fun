@@ -54,6 +54,21 @@
   /* Warning reads as serious, not festive, against a monochrome field. */
   --color-danger-400: #d98c8c;
 
+  /*
+    GOLD - MONEY, AND ONLY MONEY.
+
+    Declared here rather than inside a network block so the utilities exist everywhere, but the
+    RULE is what matters: gold marks value that has actually moved or is actually owed - dividends
+    paid, an amount claimable, a realised yield. Never a heading, never a border, never a hover.
+
+    Kept slightly warm and slightly desaturated from a pure yellow, because saturated gold on a
+    dark field reads as a warning colour and this must never be confused with `danger`.
+  */
+  --color-gold-300: #ffe9a8;
+  --color-gold-400: #f0c14b;
+  --color-gold-500: #cf9c22;
+  --color-gold-600: #96700f;
+
   /* ---------------------------------------------------------------------------------------------
      NETWORK THEMING
      ---------------------------------------------------------------------------------------------
@@ -190,30 +205,53 @@ body {
 }
 
 /* Robinhood Chain skin. Same structure, warmer ink and a green accent instead of steel. */
+/*
+  EMERALD, BLACK, GOLD, WHITE.
+
+  The previous version of this block described its own accents as "kept desaturated enough that
+  large fills do not vibrate", and that caution is exactly what made it read flat: a single muted
+  green on near-neutral grey, with nothing to play against.
+
+  This palette works on FOUR materials rather than one hue:
+
+    BLACK    a green-cast black, not neutral. Every surface carries a trace of the accent, so
+             panels feel cut from the same stone rather than grey boxes with a green button.
+    EMERALD  the structural accent, and now genuinely saturated. It is the interface.
+    GOLD     reserved for VALUE - dividends, claims, yield, earnings. Nothing decorative is gold,
+             so gold anywhere on screen always means money.
+    WHITE    the highlight. Rare, and always the brightest thing in its area.
+
+  The gold/emerald split is the reason this can be loud without becoming noise: two accents with
+  different jobs read as a system, where one accent used for everything reads as a theme.
+*/
 html[data-network='robinhood'] {
-  --color-ink-950: #04070a;
-  --color-ink-900: #0a1010;
-  --color-ink-850: #101817;
-  --color-ink-800: #16211f;
-  --color-ink-700: #1f2f2b;
-  --color-ink-600: #2b4038;
+  /* Ground. Green-cast blacks - the hue is present at every depth, not just on accents. */
+  --color-ink-950: #02090a;
+  --color-ink-900: #05130f;
+  --color-ink-850: #081c16;
+  --color-ink-800: #0c281e;
+  --color-ink-700: #14392a;
+  --color-ink-600: #1d5039;
 
-  --color-bone-50: #eef6f0;
-  --color-bone-200: #c3d6c8;
-  --color-bone-400: #8aa394;
-  --color-bone-500: #67806f;
-  --color-bone-600: #4c6156;
+  /* Text ramp, warmed toward mint so it sits in the same family as the accent. */
+  --color-bone-50: #f0fdf6;
+  --color-bone-200: #b6f0cd;
+  --color-bone-400: #7fc79f;
+  --color-bone-500: #5a9a76;
+  --color-bone-600: #427459;
 
-  /* Accents move from cold steel to Robinhood green, kept desaturated enough that large fills do
-     not vibrate against the dark surfaces. */
-  --color-steel-300: #7ee382;
-  --color-steel-400: #35d43a;
-  --color-steel-500: #1f8a2a;
+  /* The emerald. Saturated on purpose. */
+  --color-steel-300: #6ee7b7;
+  --color-steel-400: #10d982;
+  --color-steel-500: #059669;
 
-  --color-volt-300: #eafff0;
-  --color-volt-400: #cdf2d6;
+  --color-volt-300: #ecfdf5;
+  --color-volt-400: #a7f3d0;
   --color-volt-500: #ffffff;
-  --color-volt-600: #86a893;
+  --color-volt-600: #5eead4;
+
+  /* Warning has to survive a field this green without turning festive. */
+  --color-danger-400: #ff8f7a;
 }
 
 /* The switch itself is animated so the change reads as deliberate rather than as a flash of
@@ -224,4 +262,92 @@ html[data-network='robinhood'] {
       background-color 260ms var(--ease-out-soft),
       color 260ms var(--ease-out-soft);
   }
+}
+
+/* -----------------------------------------------------------------------------------------------
+   ROBINHOOD - DEPTH AND RESPONSE
+
+   The brief was "not vibrant, needs to be more interactive". Those are one problem: a surface that
+   never responds to being touched reads as a picture of an app rather than an app. Everything
+   below is scoped to the Robinhood theme so the Ethereum identity stays austere.
+
+   All of it is transform, opacity, colour and shadow only - properties the compositor can animate
+   without re-laying-out the page. Nothing here animates width, height, top or left.
+   ----------------------------------------------------------------------------------------------- */
+
+html[data-network='robinhood'] {
+  /* A single emerald wash anchored top-centre plus a colder gold one off to the right, so the page
+     has a LIGHT SOURCE rather than being uniformly dark. This is most of the reason the black
+     stops reading as flat grey. */
+  background-image:
+    radial-gradient(1100px 620px at 50% -12%, rgba(16, 217, 130, 0.11), transparent 62%),
+    radial-gradient(760px 420px at 88% 8%, rgba(240, 193, 75, 0.055), transparent 60%);
+  background-attachment: fixed;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html[data-network='robinhood'] [class*='rounded-2xl'],
+  html[data-network='robinhood'] [class*='rounded-xl'] {
+    transition:
+      transform 220ms var(--ease-out-soft),
+      border-color 220ms var(--ease-out-soft),
+      box-shadow 220ms var(--ease-out-soft);
+  }
+}
+
+/* A real press. Scale rather than a colour change, so it survives every button variant. */
+html[data-network='robinhood'] button:not(:disabled):active {
+  transform: scale(0.975);
+}
+
+/* Hover is gated behind a real pointer. On touch, :hover sticks after a tap and leaves the last
+   thing you pressed looking permanently focused. */
+@media (hover: hover) {
+  html[data-network='robinhood'] button:not(:disabled):hover {
+    border-color: color-mix(in oklab, var(--color-steel-400) 55%, transparent);
+    box-shadow:
+      0 0 0 1px color-mix(in oklab, var(--color-steel-400) 22%, transparent),
+      0 8px 26px -14px color-mix(in oklab, var(--color-steel-400) 70%, transparent);
+  }
+}
+
+/* Focus must be LOUDER than hover, never quieter. Keyboard users are not second class. */
+html[data-network='robinhood'] :focus-visible {
+  outline: 2px solid var(--color-steel-400);
+  outline-offset: 2px;
+}
+
+/*
+  GOLD IS MONEY. `.value` marks a figure representing value actually moved or actually owed.
+
+  Deliberately one class rather than a colour utility sprinkled through components: the rule "gold
+  always means money" only holds if a single place decides what earns it.
+*/
+html[data-network='robinhood'] .value {
+  color: var(--color-gold-400);
+  text-shadow: 0 0 22px color-mix(in oklab, var(--color-gold-400) 26%, transparent);
+}
+
+/* The mark in the header gets a slow emerald pulse - the only ambient motion in the chrome, and
+   what stops the header reading as printed. */
+@media (prefers-reduced-motion: no-preference) {
+  html[data-network='robinhood'] header svg {
+    animation: hood-mark-glow 5.5s ease-in-out infinite;
+  }
+}
+
+@keyframes hood-mark-glow {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 3px rgba(16, 217, 130, 0.22));
+  }
+  50% {
+    filter: drop-shadow(0 0 11px rgba(16, 217, 130, 0.5));
+  }
+}
+
+/* Content sits above the leaf canvas, so text never competes with a leaf passing behind it. */
+html[data-network='robinhood'] main {
+  position: relative;
+  z-index: 1;
 }

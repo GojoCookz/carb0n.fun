@@ -9,7 +9,7 @@ import { GraduationBar } from '../components/GraduationBar'
 import { LaunchSummary } from '../components/LaunchSummary'
 import { TokenLogo } from '../components/TokenLogo'
 import { formatUsd } from '../lib/chain'
-import { activePairs } from '../lib/activeNetwork'
+import { activeNetwork, activePairs } from '../lib/activeNetwork'
 import { useDraft } from '../lib/draft-context'
 import { ethRouteFor, ETH_ROUTE_CHEAP_BPS } from '../lib/ethRoute'
 import { usePairUsd, usdOf } from '../lib/usePairUsd'
@@ -256,7 +256,7 @@ export function Launch() {
                   </>
                 ) : (
                   <>
-                    There is no {pair.symbol}/USD feed on Ethereum L1, so this build shows no dollar
+                    There is no {pair.symbol}/USD feed on {activeNetwork().label}, so this build shows no dollar
                     figure for it. The threshold is {fmtAmount(draft.graduationThreshold)}{' '}
                     {pair.symbol} on chain either way.
                   </>
@@ -385,7 +385,7 @@ export function Launch() {
           title="Wallet cap and opening buy"
           summary={
             `${draft.maxWalletBps === 0 ? 'no wallet cap' : `${fmtBps(draft.maxWalletBps)} max wallet`}` +
-            ` · dev buy ${draft.devBuyPairAmount > 0 ? `${fmtAmount(draft.devBuyPairAmount)} ${pair?.symbol ?? ''}` : 'none'}`
+            ` · ${draft.devBuyPairAmount > 0 ? `opening buy ${fmtAmount(draft.devBuyPairAmount)} ${pair?.symbol ?? ''}` : 'no opening buy, pool starts empty'}`
           }
         >
           <BpsSlider
@@ -411,8 +411,18 @@ export function Launch() {
             }
             hint={
               <>
-                Optional. Runs as a normal swap inside the launch and pays the normal fee — you do
-                not get a free entry.
+                <strong className="text-bone-200">
+                  This is what stops the pool opening empty.
+                </strong>{' '}
+                The whole supply is seeded on one side, so until somebody buys there is zero{' '}
+                {pair?.symbol ?? 'pair'} in the pool. Screeners read that as no liquidity. An
+                opening buy is simply the first buy, made in the same transaction, and it also
+                closes the window where whoever trades first against an untouched pool gets the
+                best entry that will ever exist.
+                <br />
+                <br />
+                Optional. Runs as a normal swap and pays the normal fee — you do not get a free
+                entry.
               </>
             }
             value={draft.devBuyPairAmount}
@@ -663,7 +673,7 @@ function Hero() {
         <div className="absolute -right-10 -top-24 size-64 rounded-full bg-bone-50/[0.07] blur-[64px]" />
       </div>
       <div className="relative">
-        <Pill tone="volt">ETHEREUM L1</Pill>
+        <Pill tone="volt">{activeNetwork().label.toUpperCase()}</Pill>
         {/* The headline used to be "Holders get paid in the pair", which was the product when
             dividends WERE the product. They are now one switch among several, and Simple mode has
             them off entirely - so the old headline contradicted the mode selector directly beneath
