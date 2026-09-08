@@ -8,14 +8,14 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import type { Address } from 'viem'
-import { sepolia } from 'viem/chains'
+import { activeNetwork } from './activeNetwork'
 import {
   connect as doConnect,
   currentAccounts,
   currentChainId,
   getProvider,
   hasWallet,
-  switchToSepolia,
+  switchToActiveChain,
   walletErrorMessage,
 } from './wallet'
 
@@ -88,7 +88,7 @@ export function useWallet(): WalletState {
   const switchChain = useCallback(async () => {
     setError(null)
     try {
-      await switchToSepolia()
+      await switchToActiveChain()
       setChainId(await currentChainId())
     } catch (e) {
       setError(walletErrorMessage(e))
@@ -99,7 +99,7 @@ export function useWallet(): WalletState {
     installed,
     account,
     chainId,
-    onRightChain: chainId === sepolia.id,
+    onRightChain: chainId === activeNetwork().chain.id,
     connecting,
     error,
     connect,

@@ -10,7 +10,7 @@
  * `TradeRouter` swaps first and settles from the delta. See `src/TradeRouter.sol`.
  */
 import { parseUnits, type Address, type Hash } from 'viem'
-import { sepoliaClient, DEPLOYMENTS } from './chain'
+import { activeClient, activeDeployment } from './chain'
 import { ERC20_ABI } from './abi'
 import { walletClient } from './wallet'
 
@@ -68,7 +68,7 @@ export function poolKeyFor(token: Address, pair: Address) {
       currency1: (tokenIsCurrency0 ? pair : token) as Address,
       fee: 0,
       tickSpacing: TICK_SPACING,
-      hooks: DEPLOYMENTS.sepolia.feeHook as Address,
+      hooks: activeDeployment().feeHook as Address,
     },
     /** Spending the PAIR currency — i.e. the direction that buys the launch token. */
     buyIsZeroForOne: !tokenIsCurrency0,
@@ -107,7 +107,7 @@ export async function submitTrade(
   const amountIn = parseUnits(String(opts.amount), inDecimals)
   if (amountIn === 0n) throw new Error('Enter an amount first.')
 
-  const balance = await sepoliaClient.readContract({
+  const balance = await activeClient().readContract({
     address: inToken,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
@@ -118,7 +118,7 @@ export async function submitTrade(
   const wallet = walletClient(opts.account)
 
   // Approve only the shortfall, and only when there is one.
-  const allowance = await sepoliaClient.readContract({
+  const allowance = await activeClient().readContract({
     address: inToken,
     abi: ERC20_ABI,
     functionName: 'allowance',
@@ -135,12 +135,12 @@ export async function submitTrade(
       account: opts.account,
     })
     onPhase({ kind: 'approving', hash: approveHash })
-    const r = await sepoliaClient.waitForTransactionReceipt({ hash: approveHash })
+    const r = await activeClient().waitForTransactionReceipt({ hash: approveHash })
     if (r.status !== 'success') throw new Error('The approval failed.')
   }
 
   // Quote by simulating the real call, then set the floor from that.
-  const quote = await sepoliaClient.simulateContract({
+  const quote = await activeClient().simulateContract({
     address: TRADE_ROUTER,
     abi: TRADE_ROUTER_ABI,
     functionName: 'swap',
@@ -151,7 +151,7 @@ export async function submitTrade(
   const minOut = (expected * BigInt(10_000 - opts.slippageBps)) / 10_000n
 
   onPhase({ kind: 'trading' })
-  const { request } = await sepoliaClient.simulateContract({
+  const { request } = await activeClient().simulateContract({
     address: TRADE_ROUTER,
     abi: TRADE_ROUTER_ABI,
     functionName: 'swap',
@@ -161,7 +161,7 @@ export async function submitTrade(
   const hash = await wallet.writeContract({ ...request, account: opts.account, chain: wallet.chain })
   onPhase({ kind: 'trading', hash })
 
-  const receipt = await sepoliaClient.waitForTransactionReceipt({ hash })
+  const receipt = await activeClient().waitForTransactionReceipt({ hash })
   if (receipt.status !== 'success') throw new Error('The trade reverted.')
 
   onPhase({ kind: 'done', amountOut: expected, hash })
@@ -184,7 +184,7 @@ export async function quoteTrade(opts: {
     const amountIn = parseUnits(String(opts.amount), inDecimals)
     if (amountIn === 0n) return null
 
-    const quote = await sepoliaClient.simulateContract({
+    const quote = await activeClient().simulateContract({
       address: TRADE_ROUTER,
       abi: TRADE_ROUTER_ABI,
       functionName: 'swap',

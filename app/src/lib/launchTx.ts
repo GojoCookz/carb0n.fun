@@ -7,7 +7,7 @@
  * none is done twice.
  */
 import { parseUnits, type Address, type Hash } from 'viem'
-import { sepoliaClient, DEPLOYMENTS, launchablePairFor, type LaunchablePair } from './chain'
+import { activeClient, activeDeployment, launchablePairFor, type LaunchablePair } from './chain'
 import { ERC20_ABI, LAUNCHER_ABI } from './abi'
 import { cidToBytes32, ZERO_BYTES32 } from './cid'
 import type { LaunchDraft } from './launch'
@@ -104,14 +104,14 @@ export async function submitLaunch(
   account: Address,
   onPhase: (p: LaunchPhase) => void,
 ): Promise<void> {
-  const launcher = DEPLOYMENTS.sepolia.launcher
+  const launcher = activeDeployment().launcher
   if (!launcher) throw new Error('No launcher deployed.')
 
   const params = buildParams(draft, pair)
   const wallet = walletClient(account)
 
   if (params.devBuyPairAmount > 0n) {
-    const allowance = await sepoliaClient.readContract({
+    const allowance = await activeClient().readContract({
       address: pair.address,
       abi: ERC20_ABI,
       functionName: 'allowance',
@@ -119,7 +119,7 @@ export async function submitLaunch(
     })
 
     if (allowance < params.devBuyPairAmount) {
-      const balance = await sepoliaClient.readContract({
+      const balance = await activeClient().readContract({
         address: pair.address,
         abi: ERC20_ABI,
         functionName: 'balanceOf',
@@ -141,14 +141,14 @@ export async function submitLaunch(
         account,
       })
       onPhase({ kind: 'approving', hash: approveHash })
-      const receipt = await sepoliaClient.waitForTransactionReceipt({ hash: approveHash })
+      const receipt = await activeClient().waitForTransactionReceipt({ hash: approveHash })
       if (receipt.status !== 'success') throw new Error('The approval transaction failed.')
     }
   }
 
   onPhase({ kind: 'launching' })
 
-  const { request, result } = await sepoliaClient.simulateContract({
+  const { request, result } = await activeClient().simulateContract({
     address: launcher,
     abi: LAUNCHER_ABI,
     functionName: 'launch',
@@ -159,7 +159,7 @@ export async function submitLaunch(
   const hash = await wallet.writeContract({ ...request, account, chain: wallet.chain })
   onPhase({ kind: 'launching', hash })
 
-  const receipt = await sepoliaClient.waitForTransactionReceipt({ hash })
+  const receipt = await activeClient().waitForTransactionReceipt({ hash })
   if (receipt.status !== 'success') throw new Error('The launch transaction reverted.')
 
   // `result` is [token, poolId] from the simulation. The receipt proves it actually happened.

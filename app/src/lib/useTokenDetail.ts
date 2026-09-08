@@ -7,7 +7,7 @@
  */
 import { useEffect, useState } from 'react'
 import { parseAbi, keccak256, encodeAbiParameters, type Address } from 'viem'
-import { sepoliaClient, DEPLOYMENTS } from './chain'
+import { activeClient, activeDeployment } from './chain'
 import { poolKeyFor } from './tradeTx'
 
 const TOKEN_ABI = parseAbi([
@@ -138,7 +138,7 @@ export function useTokenDetail(
 
   useEffect(() => {
     let live = true
-    const feeHook = DEPLOYMENTS.sepolia.feeHook as Address | null
+    const feeHook = activeDeployment().feeHook as Address | null
     if (!token || !pair || !feeHook) {
       setState({ kind: 'error', message: 'Nothing deployed to read from on this network.' })
       return
@@ -147,7 +147,7 @@ export function useTokenDetail(
     ;(async () => {
       try {
         const poolId = poolIdOf(token, pair)
-        const distributor = await sepoliaClient.readContract({
+        const distributor = await activeClient().readContract({
           address: token,
           abi: TOKEN_ABI,
           functionName: 'distributor',
@@ -161,7 +161,7 @@ export function useTokenDetail(
         // to `Distributor` — `streamFinish` is not on that bytecode and reverts. One missing
         // getter must not blank the whole panel, and a field that cannot be read has to arrive
         // here as `null` so the UI can render an absence instead of a confident zero.
-        const reads = await sepoliaClient.multicall({
+        const reads = await activeClient().multicall({
           allowFailure: true,
           contracts: [
             { ...d, functionName: 'payoutToken' },
@@ -198,7 +198,7 @@ export function useTokenDetail(
         let queueScanTruncated = false
         if (account && queueLength > 0) {
           const scanTo = Math.min(queueLength, QUEUE_SCAN_LIMIT)
-          const entries = (await sepoliaClient.multicall({
+          const entries = (await activeClient().multicall({
             allowFailure: false,
             contracts: Array.from({ length: scanTo }, (_, i) => ({
               ...d,

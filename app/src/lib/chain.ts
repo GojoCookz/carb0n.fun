@@ -6,7 +6,9 @@
  * came from. Where we have no data yet (because nothing is deployed), the UI says so
  * instead of rendering a plausible-looking zero.
  */
-import { createPublicClient, http, formatUnits } from 'viem'
+import { createPublicClient, http, formatUnits, type Chain, type PublicClient } from 'viem'
+import { activeNetwork, activeNetworkId } from './activeNetwork'
+import { clientFor } from './networks'
 import { mainnet, optimism, sepolia } from 'viem/chains'
 
 /** Verified on-chain 2026-08-31 via eth_getCode. Byte counts in contracts/script/Addresses.sol */
@@ -131,8 +133,30 @@ export function ethPoolFeeFor(chainPair: string | null): number | null {
   return p?.ethPoolFee ?? null
 }
 
-/** The only network a launch may currently be sent to. */
-export const LAUNCH_CHAIN = sepolia
+/**
+ * The network a launch is sent to, resolved at RUNTIME from the active-network store.
+ *
+ * **This used to be `export const LAUNCH_CHAIN = sepolia`, and that constant was the bug.** The
+ * app went on talking to a test network after Robinhood Chain went live with thirty approved
+ * pairs, because fourteen files imported a build-time value. A getter means every consumer follows
+ * the toggle without any of them knowing a toggle exists.
+ *
+ * Kept as a function rather than a mutable binding so a stale copy cannot be captured at import
+ * time - the exact failure mode being replaced.
+ */
+export function launchChain(): Chain {
+  return activeNetwork().chain
+}
+
+/** The client for whichever network is active. Replaces the hardcoded `sepoliaClient`. */
+export function activeClient(): PublicClient {
+  return clientFor(activeNetworkId())
+}
+
+/** The deployment for whichever network is active. Replaces `DEPLOYMENTS.sepolia`. */
+export function activeDeployment(): Deployment {
+  return activeNetwork().deployment
+}
 
 /**
  * Which Sepolia test token stands in for a mainnet pair currency.

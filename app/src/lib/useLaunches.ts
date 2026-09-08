@@ -11,7 +11,7 @@
  */
 import { useEffect, useState } from 'react'
 import { parseAbi, type Address } from 'viem'
-import { sepoliaClient, DEPLOYMENTS } from './chain'
+import { activeClient, activeDeployment } from './chain'
 import { LAUNCHER_ABI } from './abi'
 import { poolIdOf } from './useTokenDetail'
 import type { LaunchListing } from './listing'
@@ -41,7 +41,7 @@ export type LaunchesState =
 /** Match an on-chain pair address back to the allowlist entry the UI knows how to render. */
 function pairFor(address: string) {
   const lower = address.toLowerCase()
-  const testnet = DEPLOYMENTS.sepolia.pairs.find((p) => p.address.toLowerCase() === lower)
+  const testnet = activeDeployment().pairs.find((p) => p.address.toLowerCase() === lower)
   if (testnet) {
     // The Sepolia stand-ins are named `tWETH`/`tWXMR`; show the real pair they represent.
     const real = PAIRS.find((p) => `t${p.symbol}`.toLowerCase() === testnet.symbol.toLowerCase())
@@ -54,8 +54,8 @@ export function useLaunches(): LaunchesState {
   const [state, setState] = useState<LaunchesState>({ kind: 'idle' })
 
   useEffect(() => {
-    const launcher = DEPLOYMENTS.sepolia.launcher
-    const feeHook = DEPLOYMENTS.sepolia.feeHook
+    const launcher = activeDeployment().launcher
+    const feeHook = activeDeployment().feeHook
     if (!launcher || !feeHook) {
       setState({ kind: 'ok', listings: [] })
       return
@@ -66,7 +66,7 @@ export function useLaunches(): LaunchesState {
 
     void (async () => {
       try {
-        const count = await sepoliaClient.readContract({
+        const count = await activeClient().readContract({
           address: launcher,
           abi: LAUNCHER_ABI,
           functionName: 'launchCount',
@@ -80,7 +80,7 @@ export function useLaunches(): LaunchesState {
 
         const rows = await Promise.all(
           indices.map((i) =>
-            sepoliaClient.readContract({
+            activeClient().readContract({
               address: launcher,
               abi: LAUNCHER_ABI,
               functionName: 'launches',
@@ -99,14 +99,14 @@ export function useLaunches(): LaunchesState {
             ]
 
             const [name, symbol] = await Promise.all([
-              sepoliaClient.readContract({ address: token, abi: tokenAbi, functionName: 'name' }),
-              sepoliaClient.readContract({ address: token, abi: tokenAbi, functionName: 'symbol' }),
+              activeClient().readContract({ address: token, abi: tokenAbi, functionName: 'name' }),
+              activeClient().readContract({ address: token, abi: tokenAbi, functionName: 'symbol' }),
             ])
 
             const known = pairFor(pairAddr)
             const pairSymbol = known
               ? known.symbol
-              : await sepoliaClient.readContract({
+              : await activeClient().readContract({
                   address: pairAddr,
                   abi: pairAbi,
                   functionName: 'symbol',
@@ -117,7 +117,7 @@ export function useLaunches(): LaunchesState {
             // charges 3% — a placeholder rendered as a fact, which is the one thing this file's
             // own docstring forbids. A read that fails still yields zeros, but it fails loudly in
             // the console rather than silently agreeing with the old lie.
-            const cfg = await sepoliaClient
+            const cfg = await activeClient()
               .readContract({
                 address: feeHook,
                 abi: hookAbi,

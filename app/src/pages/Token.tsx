@@ -16,7 +16,7 @@ import { useLaunches } from '../lib/useLaunches'
 import { useTokenDetail } from '../lib/useTokenDetail'
 import { useWallet } from '../lib/useWallet'
 import { poolKeyFor } from '../lib/tradeTx'
-import { sepoliaClient, DEPLOYMENTS } from '../lib/chain'
+import { activeClient, activeDeployment } from '../lib/chain'
 import { walletClient, walletErrorMessage, isUserRejection } from '../lib/wallet'
 import { TradePanel } from '../components/TradePanel'
 import { LaunchCard } from '../components/LaunchCard'
@@ -91,7 +91,7 @@ export function Token() {
         chain: wallet.chain,
         account,
       })
-      const r = await sepoliaClient.waitForTransactionReceipt({ hash })
+      const r = await activeClient().waitForTransactionReceipt({ hash })
       if (r.status !== 'success') throw new Error('The claim reverted.')
       setClaimNonce((n) => n + 1)
     } catch (e) {
@@ -108,7 +108,7 @@ export function Token() {
    */
   async function sweep() {
     if (!account || !listing?.chainPair || !listing.address) return
-    const feeHook = DEPLOYMENTS.sepolia.feeHook
+    const feeHook = activeDeployment().feeHook
     if (!feeHook) return
     setSweepError(null)
     setSweeping(true)
@@ -123,7 +123,7 @@ export function Token() {
         chain: wallet.chain,
         account,
       })
-      const r = await sepoliaClient.waitForTransactionReceipt({ hash })
+      const r = await activeClient().waitForTransactionReceipt({ hash })
       if (r.status !== 'success') throw new Error('The sweep reverted.')
       setClaimNonce((n) => n + 1)
     } catch (e) {

@@ -72,14 +72,60 @@ export type NetworkInfo = {
   deployment: Deployment
 }
 
-/** Nothing is deployed on Robinhood Chain yet. Nulls, not placeholders. */
+/**
+ * LIVE on Robinhood Chain. Every address below was verified with `eth_getCode` after the deploy,
+ * and every pair with `PairRegistry.isApproved` read back from the chain - not taken from a deploy
+ * log, which only says a transaction was sent.
+ *
+ * `zapRouter` is null and stays null: the WETH on this chain is a bridged ERC-20 with no
+ * `deposit()`, so a router built against it would revert on every zap. Buyers source the pair
+ * currency directly here.
+ *
+ * `ethPoolFee` is null throughout for the same reason - there is no ETH-in route to price.
+ */
 const ROBINHOOD_DEPLOYMENT: Deployment = {
-  pairRegistry: null,
-  launcher: null,
-  feeHook: null,
-  referralVault: null,
+  pairRegistry: '0xDFf0A6FfD11Eb1494E8A57DD5eF92b23122BaeC0',
+  launcher: '0xCc491F9962CA5545163ac425210b69e24AC29a96',
+  feeHook: '0xdC0244274F0b4E60Ec4433bfA9d3Ff0632CAa0Cc',
+  referralVault: '0x6E87800BEDf09ddA439Ae78c820c58427Ca57947',
   zapRouter: null,
-  pairs: [],
+  pairs: [
+    // Core. Decimals read on-chain, never assumed: USDG is 6 and cbBTC is 8 where nearly
+    // everything else is 18, and a wrong value misprices every launch by a power of ten.
+    { symbol: 'WETH', address: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73', decimals: 18, ethPoolFee: null },
+    { symbol: 'USDG', address: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168', decimals: 6, ethPoolFee: null },
+    // Commodities.
+    { symbol: 'cbBTC', address: '0xCEC185eB182c47d1bA1EFc84e6959e18cd620Be4', decimals: 8, ethPoolFee: null },
+    { symbol: 'SLV', address: '0x411eFb0E7f985935DAec3D4C3ebaEa0d0AD7D89f', decimals: 18, ethPoolFee: null },
+    { symbol: 'GLD', address: '0xC9a981FEE1F9DEc688bb123ccDeCc63D0deBFC4e', decimals: 18, ethPoolFee: null },
+    { symbol: 'PAXG', address: '0xc700C81925D1d1C10F996fA7c0Dee83a54C4Bb8D', decimals: 18, ethPoolFee: null },
+    // RobinVista synths: USDG-collateralised, 1x perp-hedged on Hyperliquid.
+    { symbol: 'XMR', address: '0x38F728351fd9565087a4fF0ad5049739e0Ce235c', decimals: 18, ethPoolFee: null },
+    { symbol: 'ZEC', address: '0xEc127e99Da1a2eD3d6C0433227154a99B7B29221', decimals: 18, ethPoolFee: null },
+    { symbol: 'SOL', address: '0x49F98A382Ccbc05f13b3E3aB323D04aBA975642D', decimals: 18, ethPoolFee: null },
+    // Community pairs with real depth on this chain.
+    { symbol: 'PONS', address: '0x39dBED3a2bd333467115dE45665cC57F813C4571', decimals: 18, ethPoolFee: null },
+    { symbol: 'AI', address: '0x2E8c31162b855A2ffa90F6F8634643Ad6F111e18', decimals: 18, ethPoolFee: null },
+    { symbol: 'CASHCAT', address: '0x020bfC650A365f8BB26819deAAbF3E21291018b4', decimals: 18, ethPoolFee: null },
+    { symbol: 'FATCOIN', address: '0x12D5ee7917cA430073C3A638ee1e6f0648A98a01', decimals: 18, ethPoolFee: null },
+    { symbol: 'CME', address: '0xe2324FF2a59F8eCBa8c321c6466e59121C00e795', decimals: 18, ethPoolFee: null },
+    { symbol: 'MEME', address: '0x385F4f8ae47651ce5F58F5265395a669f8281e18', decimals: 18, ethPoolFee: null },
+    { symbol: 'BONER', address: '0x98096d17e191B3dA1d5f99a6D7b3584351b11E18', decimals: 18, ethPoolFee: null },
+    { symbol: 'MOO', address: '0xD9dB30BB0D2b8d2eae3826A1372117E058791e18', decimals: 18, ethPoolFee: null },
+    { symbol: 'STONKBROKER', address: '0xe934e36A439C94017B64a3FecE66AF12099aBF50', decimals: 18, ethPoolFee: null },
+    { symbol: 'SHROOM', address: '0xab093dEF657F15dF31b33922A95e047aDd645B29', decimals: 18, ethPoolFee: null },
+    { symbol: 'HOOKR', address: '0x18E674231A58c239Dc7DaeDcffE15Ec3A24cff5c', decimals: 18, ethPoolFee: null },
+    { symbol: 'NUDES', address: '0xbe98b75361935b18d688409424a869a4C3dC7401', decimals: 18, ethPoolFee: null },
+    { symbol: 'ZZZ', address: '0x7dbf38976f6D3b9c529e7D9484A71898B409eE6a', decimals: 18, ethPoolFee: null },
+    { symbol: 'DELTA', address: '0xe8ffd7e24187F72afB08d75B1bb13088A989a791', decimals: 18, ethPoolFee: null },
+    { symbol: 'TENDIES', address: '0x45242320DBB855EeA8Fd36804C6487E10E97FCF9', decimals: 18, ethPoolFee: null },
+    { symbol: 'YOLO', address: '0x62C71cd34a52c30d894419CBcc55Db2aFA8032eA', decimals: 18, ethPoolFee: null },
+    { symbol: 'ROBINCAT', address: '0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc', decimals: 18, ethPoolFee: null },
+    { symbol: 'microduck', address: '0xD5f1afEA47b1A9eab414D2ee740cF1d6d039E725', decimals: 18, ethPoolFee: null },
+    { symbol: 'PIPEDOG', address: '0x5Cb6F181081301b44905F3ae15419112ecaBd8A6', decimals: 18, ethPoolFee: null },
+    { symbol: 'PAIR', address: '0x6b1d42927B1a84eC28Fa88d4fC6FA7AF404966be', decimals: 18, ethPoolFee: null },
+    { symbol: 'IF', address: '0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1', decimals: 18, ethPoolFee: null },
+  ],
 }
 
 export const NETWORKS: Record<NetworkId, NetworkInfo> = {
@@ -145,16 +191,15 @@ export const ROBINHOOD_PAIR_CANDIDATES = [
 ] as const
 
 /**
- * The network the app is currently pointed at.
+ * The active network is RUNTIME state now, not a build-time constant - see `activeNetwork.ts`.
  *
- * Still Sepolia. This is the single place that changes when a deployment lands, and it is a
- * constant rather than a runtime toggle on purpose: a network picker that can select a chain with
- * no contracts deployed is a picker that offers transactions which cannot succeed. Wire the toggle
- * to `deployableNetworks()` when there is more than one entry in it.
+ * It was a constant while exactly one chain had contracts, and that stopped being true the moment
+ * Robinhood Chain went live: the user picks the chain, not the bundler. Re-exported here so there
+ * is still exactly one answer to "which network are we on".
  */
-export const ACTIVE_NETWORK: NetworkId = 'sepolia'
+export { activeNetworkId, activeNetwork, setActiveNetwork, selectableNetworks } from './activeNetwork'
 
-export function network(id: NetworkId = ACTIVE_NETWORK): NetworkInfo {
+export function network(id: NetworkId): NetworkInfo {
   return NETWORKS[id]
 }
 
@@ -166,7 +211,7 @@ export function deployableNetworks(): NetworkInfo[] {
 const CLIENTS = new Map<NetworkId, PublicClient>()
 
 /** One client per network, created on first use. */
-export function clientFor(id: NetworkId = ACTIVE_NETWORK): PublicClient {
+export function clientFor(id: NetworkId): PublicClient {
   const existing = CLIENTS.get(id)
   if (existing) return existing
   const info = NETWORKS[id]

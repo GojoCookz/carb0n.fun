@@ -22,6 +22,7 @@ import { submitTrade, quoteTrade, type TradePhase } from '../lib/tradeTx'
 import { submitZap, quoteZap, zapAvailable } from '../lib/zapTx'
 import { explorerTx, walletErrorMessage, isUserRejection } from '../lib/wallet'
 import { useWallet } from '../lib/useWallet'
+import { activeNetwork } from '../lib/activeNetwork'
 
 /** 1% default. High enough to clear a normal block, low enough that a sandwich is not free. */
 const DEFAULT_SLIPPAGE_BPS = 100
@@ -330,7 +331,7 @@ export function TradePanel({
             onClick={switchChain}
             className="w-full rounded-xl border border-ink-600 bg-ink-800 px-5 py-3 font-display text-[14px] font-bold text-bone-200 transition-colors duration-150 hover:bg-ink-700"
           >
-            Switch to Sepolia
+            Switch to {activeNetwork().label}
           </button>
         ) : (
           <button

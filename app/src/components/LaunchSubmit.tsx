@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Button, Card } from './Primitives'
-import { DEPLOYMENTS, launchablePairFor } from '../lib/chain'
+import { launchablePairFor } from '../lib/chain'
+import { activeNetwork } from '../lib/activeNetwork'
 import { useWallet } from '../lib/useWallet'
 import { submitLaunch, type LaunchPhase } from '../lib/launchTx'
 import { explorerAddress, explorerTx, shortAccount, walletErrorMessage } from '../lib/wallet'
@@ -28,7 +29,8 @@ export function LaunchSubmit({
   const w = useWallet()
   const [phase, setPhase] = useState<LaunchPhase>({ kind: 'idle' })
 
-  const launcher = DEPLOYMENTS.sepolia.launcher
+  const net = activeNetwork()
+  const launcher = net.deployment.launcher
   const pair = launchablePairFor(draft.pairSymbol)
   const busy = phase.kind === 'approving' || phase.kind === 'launching'
 
@@ -37,10 +39,10 @@ export function LaunchSubmit({
     return (
       <Card className="border-bone-400/40 p-5">
         <p className="font-display text-[15px] font-bold text-bone-50">
-          {draft.symbol.trim() || 'Your token'} is live on Sepolia
+          {draft.symbol.trim() || 'Your token'} is live on {net.label}
         </p>
         <p className="mt-1.5 text-[12px] leading-relaxed text-bone-400">
-          Confirmed in a mined block, not predicted. Sepolia is a test network — these are test
+          Confirmed in a mined block, not predicted. {net.label} — these are test
           tokens with no value.
         </p>
         <div className="mt-4 space-y-2">
@@ -71,7 +73,7 @@ export function LaunchSubmit({
   if (!pair) {
     return (
       <Blocked
-        reason={`${draft.pairSymbol} is not on Sepolia. The test registry allows ${DEPLOYMENTS.sepolia.pairs
+        reason={`${draft.pairSymbol} is not on ${net.label}. The registry allows ${net.deployment.pairs
           .map((p) => p.symbol)
           .join(' and ')} only, so pick WETH or WXMR to launch here. Nothing is substituted for you.`}
       />
@@ -102,9 +104,9 @@ export function LaunchSubmit({
   if (!w.onRightChain) {
     return (
       <div className="space-y-2">
-        <Button onClick={() => void w.switchChain()}>Switch to Sepolia</Button>
+        <Button onClick={() => void w.switchChain()}>Switch to {net.label}</Button>
         <p className="text-center text-[12px] leading-snug text-bone-500">
-          Launching is Sepolia-only until the contracts are audited. Your wallet is on another
+          Your wallet is on a different network. Your wallet is on another
           network.
         </p>
         {w.error && <ErrorNote message={w.error} />}
@@ -144,7 +146,7 @@ export function LaunchSubmit({
           <>
             Signing as{' '}
             <span className="font-mono text-bone-400">{shortAccount(w.account)}</span>, paired
-            against <span className="font-mono text-bone-400">{pair.symbol}</span> on Sepolia.
+            against <span className="font-mono text-bone-400">{pair.symbol}</span> on {net.label}.
             {draft.devBuyPairAmount > 0 && ' Two signatures: an approval, then the launch.'}
           </>
         )}

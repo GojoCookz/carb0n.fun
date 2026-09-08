@@ -20,12 +20,12 @@ import {
   ContractFunctionRevertedError,
   type Address,
 } from 'viem'
-import { sepoliaClient, DEPLOYMENTS, ethPoolFeeFor } from './chain'
+import { activeClient, activeDeployment, ethPoolFeeFor } from './chain'
 import { ERC20_ABI } from './abi'
 import { walletClient } from './wallet'
 import { poolKeyFor, type TradePhase } from './tradeTx'
 
-export const ZAP_ROUTER = DEPLOYMENTS.sepolia.zapRouter as Address
+export const ZAP_ROUTER = activeDeployment().zapRouter as Address
 
 /** Every launch opens with this spacing, and the ETH pool was seeded to match. */
 const TICK_SPACING = 60
@@ -255,7 +255,7 @@ export async function quoteZap(opts: ZapArgs): Promise<bigint | null> {
   if (amountIn === 0n) return null
 
   try {
-    await sepoliaClient.simulateContract({
+    await activeClient().simulateContract({
       address: ZAP_ROUTER,
       abi: ZAP_ROUTER_ABI,
       functionName: opts.isBuy ? 'quoteZapBuy' : 'quoteZapSell',
@@ -297,10 +297,10 @@ export async function submitZap(
   const wallet = walletClient(opts.account)
 
   if (opts.isBuy) {
-    const balance = await sepoliaClient.getBalance({ address: opts.account })
+    const balance = await activeClient().getBalance({ address: opts.account })
     if (balance < amountIn) throw new Error('You do not hold that much ETH.')
   } else {
-    const balance = await sepoliaClient.readContract({
+    const balance = await activeClient().readContract({
       address: opts.token,
       abi: ERC20_ABI,
       functionName: 'balanceOf',
@@ -310,7 +310,7 @@ export async function submitZap(
 
     // Only the sell side needs an approval. A buy pays in native ether, which is the whole reason
     // the ETH path is one click and the pair path is two.
-    const allowance = await sepoliaClient.readContract({
+    const allowance = await activeClient().readContract({
       address: opts.token,
       abi: ERC20_ABI,
       functionName: 'allowance',
@@ -327,7 +327,7 @@ export async function submitZap(
         account: opts.account,
       })
       onPhase({ kind: 'approving', hash: approveHash })
-      const r = await sepoliaClient.waitForTransactionReceipt({ hash: approveHash })
+      const r = await activeClient().waitForTransactionReceipt({ hash: approveHash })
       if (r.status !== 'success') throw new Error('The approval failed.')
     }
   }
@@ -347,7 +347,7 @@ export async function submitZap(
   const deadline = BigInt(Math.floor(Date.now() / 1000) + DEADLINE_SECONDS)
 
   onPhase({ kind: 'trading' })
-  const { request } = await sepoliaClient.simulateContract({
+  const { request } = await activeClient().simulateContract({
     address: ZAP_ROUTER,
     abi: ZAP_ROUTER_ABI,
     ...(opts.isBuy
@@ -365,7 +365,7 @@ export async function submitZap(
   const hash = await wallet.writeContract({ ...request, account: opts.account, chain: wallet.chain })
   onPhase({ kind: 'trading', hash })
 
-  const receipt = await sepoliaClient.waitForTransactionReceipt({ hash })
+  const receipt = await activeClient().waitForTransactionReceipt({ hash })
   if (receipt.status !== 'success') throw new Error('The zap reverted.')
 
   onPhase({ kind: 'done', amountOut: expected, hash })

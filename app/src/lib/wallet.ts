@@ -11,7 +11,7 @@
  * the form exactly as it was.
  */
 import { createWalletClient, custom, type Address, type WalletClient } from 'viem'
-import { sepolia } from 'viem/chains'
+import { activeNetwork } from './activeNetwork'
 
 /** The subset of EIP-1193 this app uses. */
 type Eip1193 = {
@@ -86,10 +86,11 @@ export async function currentChainId(): Promise<number | null> {
  * The 4902 branch is not optional. A wallet that does not know the chain rejects the switch with
  * that code, and without handling it the user gets "unrecognized chain" and no way forward.
  */
-export async function switchToSepolia(): Promise<void> {
+export async function switchToActiveChain(): Promise<void> {
   const p = getProvider()
   if (!p) throw new Error('No wallet found.')
-  const hexId = `0x${sepolia.id.toString(16)}`
+  const net = activeNetwork()
+  const hexId = `0x${net.chain.id.toString(16)}`
   try {
     await p.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: hexId }] })
   } catch (e) {
@@ -99,20 +100,28 @@ export async function switchToSepolia(): Promise<void> {
       params: [
         {
           chainId: hexId,
-          chainName: 'Sepolia',
-          nativeCurrency: { name: 'Sepolia Ether', symbol: 'ETH', decimals: 18 },
-          rpcUrls: ['https://ethereum-sepolia-rpc.publicnode.com'],
-          blockExplorerUrls: ['https://sepolia.etherscan.io'],
+          chainName: net.chain.name,
+          nativeCurrency: net.chain.nativeCurrency,
+          rpcUrls: [net.chain.rpcUrls.default.http[0]],
+          blockExplorerUrls: [net.explorer],
         },
       ],
     })
   }
 }
 
+/**
+ * Kept so existing imports keep working; it follows the active network like everything else now.
+ *
+ * The old name was the bug: hardcoded to Sepolia, so the button under a failed launch offered to
+ * move the user to a test network regardless of which chain the app was pointed at.
+ */
+export const switchToSepolia = switchToActiveChain
+
 export function walletClient(account: Address): WalletClient {
   const p = getProvider()
   if (!p) throw new Error('No wallet found.')
-  return createWalletClient({ account, chain: sepolia, transport: custom(p) })
+  return createWalletClient({ account, chain: activeNetwork().chain, transport: custom(p) })
 }
 
 export function shortAccount(a: string): string {
@@ -120,9 +129,9 @@ export function shortAccount(a: string): string {
 }
 
 export function explorerTx(hash: string): string {
-  return `https://sepolia.etherscan.io/tx/${hash}`
+  return `${activeNetwork().explorer}/tx/${hash}`
 }
 
 export function explorerAddress(a: string): string {
-  return `https://sepolia.etherscan.io/address/${a}`
+  return `${activeNetwork().explorer}/address/${a}`
 }
