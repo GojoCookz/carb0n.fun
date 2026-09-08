@@ -2,30 +2,31 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
 
   "//": [
-    "ROOT-LEVEL Vercel config, and it exists because of a specific 404.",
+    "ROOT-LEVEL config for a monorepo: app/ (Vite SPA) + contracts/ (Foundry).",
     "",
-    "This repo is a monorepo: `app/` (the Vite SPA) and `contracts/` (Foundry). Vercel builds",
-    "from the repository root unless told otherwise, and the root has no index.html - so the",
-    "first deploy returned 404 NOT_FOUND on every path including `/`. Nothing was broken in the",
-    "app; Vercel was looking at the wrong directory.",
+    "HISTORY, because both mistakes are easy to repeat:",
     "",
-    "Setting Root Directory to `app` in the dashboard fixes it too, but that is a click a human",
-    "has to remember on every new project and preview environment. This file makes the correct",
-    "layout a property of the repo instead, so a fresh import works with no dashboard state.",
+    "1. The very first deploy 404'd on every path. Vercel builds from the repo root unless told",
+    "   otherwise, and the root has no index.html.",
     "",
-    "Paths below are relative to the REPO ROOT, which is why they all start with `app/`."
+    "2. The first attempt at THIS file then broke a build that had started working. It declared",
+    "   `bun install` / `bun run build`, but Vercel only selects Bun when it sees a bun.lockb or",
+    "   a `packageManager` field in package.json - neither exists here - so it was calling a",
+    "   binary that was not provisioned. Worse, it also set installCommand to an `echo`, which",
+    "   meant nothing was installed at all. Commands below use npm, which Vercel always has.",
+    "",
+    "Everything is relative to the REPO ROOT, hence the app/ prefixes."
   ],
 
-  "buildCommand": "cd app && bun install && bun run build",
+  "buildCommand": "cd app && npm install && npm run build",
   "outputDirectory": "app/dist",
-  "installCommand": "echo 'install handled inside buildCommand'",
-  "framework": null,
+  "installCommand": "echo skip-root-install",
 
   "//rewrites": [
-    "The negative lookahead is load-bearing. An SPA needs every unknown path to fall through to",
-    "index.html, but the naive `/(.*)` rule swallows /api/* as well - the upload endpoint would",
-    "return the HTML shell and fail with a JSON parse error pointing nowhere near the cause.",
-    "Verified against /, /token/0x.., /create, /assets/* and /api/pin."
+    "The negative lookahead is load-bearing. An SPA needs unknown paths to fall through to",
+    "index.html, but a naive /(.*) swallows /api/* too: the upload endpoint would return the HTML",
+    "shell and fail with a JSON parse error pointing nowhere near the cause.",
+    "Checked against /, /token/0x.., /create, /assets/* and /api/pin."
   ],
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }],
 
