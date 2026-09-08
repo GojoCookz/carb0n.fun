@@ -1,35 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-
-  "//": [
-    "ROOT-LEVEL config for a monorepo: app/ (Vite SPA) + contracts/ (Foundry).",
-    "",
-    "HISTORY, because both mistakes are easy to repeat:",
-    "",
-    "1. The very first deploy 404'd on every path. Vercel builds from the repo root unless told",
-    "   otherwise, and the root has no index.html.",
-    "",
-    "2. The first attempt at THIS file then broke a build that had started working. It declared",
-    "   `bun install` / `bun run build`, but Vercel only selects Bun when it sees a bun.lockb or",
-    "   a `packageManager` field in package.json - neither exists here - so it was calling a",
-    "   binary that was not provisioned. Worse, it also set installCommand to an `echo`, which",
-    "   meant nothing was installed at all. Commands below use npm, which Vercel always has.",
-    "",
-    "Everything is relative to the REPO ROOT, hence the app/ prefixes."
-  ],
-
   "buildCommand": "cd app && npm install && npm run build",
   "outputDirectory": "app/dist",
   "installCommand": "echo skip-root-install",
-
-  "//rewrites": [
-    "The negative lookahead is load-bearing. An SPA needs unknown paths to fall through to",
-    "index.html, but a naive /(.*) swallows /api/* too: the upload endpoint would return the HTML",
-    "shell and fail with a JSON parse error pointing nowhere near the cause.",
-    "Checked against /, /token/0x.., /create, /assets/* and /api/pin."
-  ],
   "rewrites": [{ "source": "/((?!api/).*)", "destination": "/index.html" }],
-
   "headers": [
     {
       "source": "/(.*)",
