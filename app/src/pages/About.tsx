@@ -1,4 +1,5 @@
 import { Card, SectionTitle, Pill } from '../components/Primitives'
+import { TreasuryPanel } from '../components/TreasuryPanel'
 import { Source } from '../components/Form'
 import { ADDRESSES, USD_SOURCES } from '../lib/chain'
 import { PAIRS, riskCount, type Pair } from '../lib/pairs'
@@ -166,6 +167,14 @@ function Risk({ title, body }: { title: string; body: string }) {
     <div className="min-w-0">
       <p className="font-display text-[14px] font-bold text-bone-50">{title}</p>
       <p className="mt-1 text-[13px] leading-relaxed text-bone-400">{body}</p>
+    
+      {/*
+        Bottom of the page, and invisible to everybody except the treasury wallet. Placed here
+        rather than in the header because it is an operator control, not part of the product -
+        it should be findable when wanted and absent the rest of the time.
+      */}
+      <TreasuryPanel />
+
     </div>
   )
 }
