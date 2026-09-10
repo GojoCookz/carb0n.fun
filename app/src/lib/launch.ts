@@ -11,6 +11,7 @@
  *   LaunchToken.sol   maxWallet, initialize (supply / 1e6 distribution floor)
  */
 import type { Pair } from './pairs'
+import { tokenSymbolProblem } from './tokenSymbol'
 
 /** FeeHook.BPS / Launcher.BPS */
 export const BPS = 10_000
@@ -331,8 +332,9 @@ export function validate(d: LaunchDraft, pair: Pair | undefined): Issue[] {
   if (d.name.trim().length === 0) {
     out.push({ field: 'name', message: 'Give it a name.', revert: '' })
   }
-  if (d.symbol.trim().length < 2) {
-    out.push({ field: 'symbol', message: 'At least 2 characters.', revert: '' })
+  const symbolProblem = tokenSymbolProblem(d.symbol)
+  if (symbolProblem) {
+    out.push({ field: 'symbol', message: symbolProblem, revert: '' })
   }
   if (!pair) {
     out.push({ field: 'pairSymbol', message: 'Pick what it trades against.', revert: 'PairNotApproved' })
