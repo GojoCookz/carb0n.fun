@@ -13,6 +13,7 @@ import { activeNetwork, activePairs } from '../lib/activeNetwork'
 import { useDraft } from '../lib/draft-context'
 import { ethRouteFor, ETH_ROUTE_CHEAP_BPS } from '../lib/ethRoute'
 import { usePairUsd, usdOf } from '../lib/usePairUsd'
+import { TOKEN_SYMBOL_MAX_LENGTH } from '../lib/tokenSymbol'
 import {
   MAX_FEE_BPS,
   OPENING_USD,
@@ -118,7 +119,7 @@ export function Launch() {
             value={draft.symbol}
             onChange={(v) => set('symbol', v.toUpperCase())}
             placeholder="HORSE"
-            maxLength={8}
+            maxLength={TOKEN_SYMBOL_MAX_LENGTH}
             mono
             error={issueFor(issues, 'symbol')?.message}
           />
